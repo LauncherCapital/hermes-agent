@@ -1065,14 +1065,22 @@ async function applyUpdates(opts = {}) {
       // `hermes desktop`, never the Tauri installer that self-copies
       // hermes-setup.exe into HERMES_HOME). They DO have a working `hermes`
       // on PATH / in the venv, so the correct path is the one-liner in their
-      // native medium: `hermes update`. We surface that as an intentional
-      // "manual update" outcome — NOT an error with a dead retry button.
-      //
-      // We resolve the most copy-pasteable command we can: prefer the bare
-      // `hermes update` (works if hermes is on PATH, which install.sh/ps1
-      // both arrange), and include the resolved checkout dir as context.
-      const command = 'hermes update'
+      // native medium. We show the EXACT command, branch-pinned to the
+      // checkout they're on — bare `hermes update` defaults to main and would
+      // silently switch a bb/gui (or any non-main) install off-branch. Mirror
+      // the GUI button's contract: append --branch <current> for non-main
+      // checkouts, keep it bare for main so the card stays clean.
       const updateRoot = resolveUpdateRoot()
+      let command = 'hermes update'
+      try {
+        const head = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })
+        const branch = (head.stdout || '').trim()
+        if (head.code === 0 && branch && branch !== 'HEAD' && branch !== 'main') {
+          command = `hermes update --branch ${branch}`
+        }
+      } catch {
+        // Best-effort: fall back to bare `hermes update` if branch detection fails.
+      }
       rememberLog(`[updates] no staged updater; surfacing manual \`${command}\` for CLI install at ${updateRoot}`)
       emitUpdateProgress({ stage: 'manual', message: command, percent: null })
       return { ok: true, manual: true, command, hermesRoot: updateRoot }
