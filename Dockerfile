@@ -270,7 +270,7 @@ ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 # check. (A separate launcher hardening is tracked independently.)
 ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
 ENV HERMES_HOME=/opt/hermes/ringo-home
-RUN mkdir -p /opt/hermes/ringo-home
+RUN mkdir -p /opt/hermes/ringo-home && chown hermes:hermes /opt/hermes/ringo-home
 COPY --chown=hermes:hermes docker/ringo-api-server-config.yaml /opt/hermes/ringo-home/config.yaml
 
 # `docker exec` privilege-drop shim. When operators run
