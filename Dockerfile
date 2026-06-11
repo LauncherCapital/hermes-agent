@@ -269,7 +269,9 @@ ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 # 502 / "[session ended]". Pointing at the prebuilt bundle sidesteps the whole
 # check. (A separate launcher hardening is tracked independently.)
 ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
-ENV HERMES_HOME=/opt/data
+ENV HERMES_HOME=/opt/hermes/ringo-home
+RUN mkdir -p /opt/hermes/ringo-home
+COPY --chown=hermes:hermes docker/ringo-api-server-config.yaml /opt/hermes/ringo-home/config.yaml
 
 # `docker exec` privilege-drop shim. When operators run
 # `docker exec <c> hermes ...` they default to root, and any file the
@@ -295,7 +297,7 @@ COPY --chmod=0755 docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
 # shim wins PATH resolution. The shim's last act is to exec the venv
 # binary by absolute path, so this PATH ordering is transparent to
 # every other consumer.
-ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
+ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/hermes/ringo-home/.local/bin:${PATH}"
 RUN mkdir -p /opt/data
 
 # s6-overlay's /init is PID 1. It sets up the supervision tree, runs
