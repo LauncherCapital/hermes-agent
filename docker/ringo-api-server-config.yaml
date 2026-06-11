@@ -1,5 +1,8 @@
 model:
   provider: deepseek
   default: deepseek-chat
+fallback_providers:
+  - provider: openrouter
+    model: anthropic/claude-sonnet-4.6
 platform_toolsets:
   api_server: []
