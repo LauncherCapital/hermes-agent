@@ -12,6 +12,7 @@ the codebase were migrated to the helper; these tests pin that invariant.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sys
@@ -158,3 +159,119 @@ def test_atomic_replace_broken_symlink_creates_target(tmp_path: Path) -> None:
     assert link.is_symlink(), "symlink must be preserved"
     assert missing.exists(), "real target should now exist"
     assert missing.read_text(encoding="utf-8") == "created-through-link\n"
+
+
+# ─── EXDEV / EBUSY copy fallback (gemini-cli#21541 port) ────────────────────
+
+
+def _make_exdev_replace(real_replace, fail_errno: int):
+    """Return an os.replace stand-in that fails once with *fail_errno*."""
+    calls = {"n": 0}
+
+    def _fake_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(fail_errno, os.strerror(fail_errno), src, None, dst)
+        return real_replace(src, dst)
+
+    return _fake_replace, calls
+
+
+@pytest.mark.parametrize("fail_errno", [
+    pytest.param(errno.EXDEV, id="EXDEV"),
+    pytest.param(errno.EBUSY, id="EBUSY"),
+])
+def test_atomic_replace_cross_device_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_errno: int
+) -> None:
+    """EXDEV/EBUSY from os.replace falls back to copy + unlink instead of
+    crashing. Content lands, temp file is cleaned up."""
+    target = tmp_path / "config.yaml"
+    target.write_text("old\n", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "new\n")
+
+    fake, calls = _make_exdev_replace(os.replace, fail_errno)
+    monkeypatch.setattr("utils.os.replace", fake)
+
+    returned = atomic_replace(tmp, target)
+
+    assert Path(returned) == target
+    assert target.read_text(encoding="utf-8") == "new\n"
+    assert not tmp.exists(), "temp file must be cleaned up after fallback"
+    assert calls["n"] == 1, "fallback must not retry os.replace"
+
+
+def test_atomic_replace_cross_device_preserves_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The copy fallback writes through the resolved real path, so a
+    symlinked target survives a cross-device write (the #16743 invariant
+    holds on the EXDEV path too)."""
+    real = tmp_path / "real.yaml"
+    link = tmp_path / "link.yaml"
+    real.write_text("original\n", encoding="utf-8")
+    link.symlink_to(real)
+    tmp = _write_tmp(tmp_path, "updated\n")
+
+    fake, _ = _make_exdev_replace(os.replace, errno.EXDEV)
+    monkeypatch.setattr("utils.os.replace", fake)
+
+    returned = atomic_replace(tmp, link)
+
+    assert link.is_symlink(), "symlink must survive the copy fallback"
+    assert Path(returned) == real
+    assert real.read_text(encoding="utf-8") == "updated\n"
+    assert not tmp.exists()
+
+
+def test_atomic_replace_other_oserror_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Errors other than EXDEV/EBUSY (e.g. EACCES) must still raise — the
+    fallback is scoped to cross-device/busy rename failures only."""
+    target = tmp_path / "config.yaml"
+    target.write_text("old\n", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "new\n")
+
+    def _fake_replace(src, dst):
+        raise OSError(errno.EACCES, os.strerror(errno.EACCES), src, None, dst)
+
+    monkeypatch.setattr("utils.os.replace", _fake_replace)
+
+    with pytest.raises(OSError) as excinfo:
+        atomic_replace(tmp, target)
+    assert excinfo.value.errno == errno.EACCES
+    assert target.read_text(encoding="utf-8") == "old\n", "target untouched"
+
+
+def test_atomic_replace_real_cross_device(tmp_path: Path) -> None:
+    """Real-filesystem E2E: symlink whose real file lives on a different
+    filesystem (tmpfs /dev/shm vs the test tmp dir). Before the fallback,
+    this raised OSError(EXDEV) and detached managed symlinked configs."""
+    import shutil as _shutil
+    import uuid as _uuid
+
+    shm = Path("/dev/shm")
+    if os.name != "posix" or not shm.is_dir() or not os.access(shm, os.W_OK):
+        pytest.skip("requires writable /dev/shm (tmpfs)")
+
+    other_fs_dir = shm / f"hermes-exdev-test-{_uuid.uuid4().hex[:8]}"
+    other_fs_dir.mkdir()
+    try:
+        real = other_fs_dir / "config.yaml"
+        real.write_text("old\n", encoding="utf-8")
+        if os.stat(real).st_dev == os.stat(tmp_path).st_dev:
+            pytest.skip("/dev/shm is not a separate filesystem here")
+
+        link = tmp_path / "config.yaml"
+        link.symlink_to(real)
+        tmp = _write_tmp(tmp_path, "new\n")
+
+        returned = atomic_replace(tmp, link)
+
+        assert link.is_symlink()
+        assert Path(returned) == real
+        assert real.read_text(encoding="utf-8") == "new\n"
+        assert not tmp.exists()
+    finally:
+        _shutil.rmtree(other_fs_dir, ignore_errors=True)

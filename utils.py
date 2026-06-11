@@ -1,8 +1,10 @@
 """Shared utility functions for hermes-agent."""
 
+import errno
 import json
 import logging
 import os
+import shutil
 import stat
 import tempfile
 from pathlib import Path
@@ -73,12 +75,49 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     and non-existent paths the behavior is identical to a plain
     ``os.replace`` call.
 
+    When the rename fails with ``EXDEV`` (cross-device link) or ``EBUSY``
+    (target busy on some bind-mount/overlay configurations), fall back to
+    a copy + fsync + unlink.  This covers Docker bind mounts, NFS/SMB
+    shares, and symlinked configs whose real file lives on a different
+    filesystem than the temp file — common in managed deployments.  The
+    fallback is not atomic, but it is strictly better than crashing and
+    leaving the orphaned temp file behind.  (Pattern ported from
+    google-gemini/gemini-cli#21541.)
+
     Returns the resolved real path used for the replace, so callers that
     need to re-apply permissions can target it instead of the symlink.
     """
     target_str = str(target)
     real_path = os.path.realpath(target_str) if os.path.islink(target_str) else target_str
-    os.replace(str(tmp_path), real_path)
+    try:
+        os.replace(str(tmp_path), real_path)
+    except OSError as exc:
+        if exc.errno not in (errno.EXDEV, errno.EBUSY):
+            raise
+        logger.debug(
+            "atomic_replace: rename %s -> %s failed with %s; "
+            "falling back to copy + unlink",
+            tmp_path, real_path, errno.errorcode.get(exc.errno, exc.errno),
+        )
+        # Copy content + permissions onto the real file, then fsync so the
+        # data is durable before the temp file is removed.
+        shutil.copyfile(str(tmp_path), real_path)
+        try:
+            shutil.copymode(str(tmp_path), real_path)
+        except OSError:
+            pass
+        try:
+            fd = os.open(real_path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(str(tmp_path))
+        except OSError:
+            pass
     return real_path
 
 
