@@ -323,4 +323,7 @@ RUN mkdir -p /opt/data
 # exit code. Without the wrapper-as-ENTRYPOINT, leading-dash args
 # like `--version` would be intercepted by /init's POSIX shell.
 ENTRYPOINT [ "/init", "/opt/hermes/docker/main-wrapper.sh" ]
-CMD [ "gateway", "run" ]   # run the gateway server (API server + MCP) as the long-running main process
+# Run the gateway server (API server + MCP) as the long-running main process.
+# MUST be pure JSON exec-form on its own line: a trailing #comment makes Docker
+# fall back to shell-form, which routes through main-wrapper as `[ ... ]` and crashes.
+CMD ["gateway", "run"]
