@@ -304,9 +304,11 @@ _PROVIDERS_WITHOUT_VISION: frozenset = frozenset({
 # OpenRouter app attribution headers (base — always sent).
 # `X-Title` is the canonical attribution header OpenRouter's dashboard
 # reads; the previous `X-OpenRouter-Title` label was not recognized there.
+# Env-overridable so a host (e.g. RingoWork) can unify OpenRouter app attribution
+# across its own services + the agent. Defaults preserve upstream behavior.
 _OR_HEADERS_BASE = {
-    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-    "X-Title": "Hermes Agent",
+    "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", "https://hermes-agent.nousresearch.com"),
+    "X-Title": os.getenv("OPENROUTER_X_TITLE", "Hermes Agent"),
     "X-OpenRouter-Categories": "productivity,cli-agent",
 }
 
