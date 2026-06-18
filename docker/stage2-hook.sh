@@ -356,6 +356,48 @@ mcp_servers:
 EOF
 fi
 
+# --- Reconcile agent model from env (Ringo orchestrator) ---
+# config.yaml's model.default is authoritative for inference and is seeded ONCE
+# from the example (claude-opus-4.6). The orchestrator selects a model per agent;
+# it can't reach the volume's config.yaml, and env (HERMES_INFERENCE_MODEL) loses
+# to config.yaml. So reconcile model.default from RINGO_AGENT_MODEL on EVERY boot
+# (not just first) — that makes the picked model apply, and a model change applies
+# on the next restart (orchestrator updates the env + redeploys). Idempotent.
+if [ -n "${RINGO_AGENT_MODEL:-}" ] && [ -f "$HERMES_HOME/config.yaml" ]; then
+    s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" - <<'PYEOF' \
+        || echo "[stage2] Warning: model reconcile failed; continuing"
+import os, sys
+try:
+    import yaml
+except Exception:
+    sys.exit(0)
+path = os.path.join(os.environ["HERMES_HOME"], "config.yaml")
+model = (os.environ.get("RINGO_AGENT_MODEL") or "").strip()
+if not model:
+    sys.exit(0)
+provider = (os.environ.get("RINGO_AGENT_PROVIDER") or "openrouter").strip() or "openrouter"
+try:
+    with open(path) as f:
+        cfg = yaml.safe_load(f) or {}
+except Exception:
+    cfg = {}
+if not isinstance(cfg, dict):
+    cfg = {}
+m = cfg.get("model")
+if not isinstance(m, dict):
+    m = {}
+if m.get("default") == model and m.get("provider") == provider and not m.get("model"):
+    sys.exit(0)  # already current
+m["default"] = model
+m["provider"] = provider
+m.pop("model", None)  # avoid a stale 'model' key shadowing 'default'
+cfg["model"] = m
+with open(path, "w") as f:
+    yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+print("[stage2] reconciled model.default=%s provider=%s" % (model, provider))
+PYEOF
+fi
+
 # .env holds API keys and secrets — restrict to owner-only access. Applied
 # unconditionally (not only on first-seed) so a host-mounted .env that was
 # created with a permissive umask gets tightened on every container start.
