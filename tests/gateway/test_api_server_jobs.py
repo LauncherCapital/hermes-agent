@@ -169,6 +169,25 @@ class TestCreateJob:
                 assert call_kwargs["origin"]["user_agent"] == "cron-client"
 
     @pytest.mark.asyncio
+    async def test_create_job_with_model_and_provider(self, adapter):
+        """POST /api/jobs forwards per-job model/provider to create_job (Ringo task UI)."""
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(f"{_MOD}._cron_create", mock_create):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "heartbeat",
+                    "schedule": "0 9 * * *",
+                    "prompt": "check in",
+                    "model": "anthropic/claude-opus-4-8",
+                    "provider": "openrouter",
+                })
+                assert resp.status == 200
+                call_kwargs = mock_create.call_args[1]
+                assert call_kwargs["model"] == "anthropic/claude-opus-4-8"
+                assert call_kwargs["provider"] == "openrouter"
+
+    @pytest.mark.asyncio
     async def test_create_job_missing_name(self, adapter):
         """POST /api/jobs without name returns 400."""
         app = _create_app(adapter)
