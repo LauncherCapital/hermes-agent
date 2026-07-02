@@ -1104,6 +1104,31 @@ class SamplingHandler:
         return self._build_text_result(choice, response)
 
 
+def _tools_signature(tools) -> frozenset:
+    """Order-insensitive fingerprint of an MCP tool list.
+
+    Covers name, description AND input schema — description edits matter as
+    much as new tools (they steer the model), so all three participate.
+    Used by the keepalive to detect server-side tool changes on servers that
+    cannot push ``notifications/tools/list_changed`` (e.g. stateless
+    streamable-HTTP servers, where no server→client channel exists and a
+    redeployed server has no memory of old sessions to notify).
+    """
+    sig = set()
+    for tool in tools or []:
+        schema = getattr(tool, "inputSchema", None)
+        try:
+            schema_key = json.dumps(schema, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            schema_key = str(schema)
+        sig.add((
+            getattr(tool, "name", "") or "",
+            getattr(tool, "description", "") or "",
+            schema_key,
+        ))
+    return frozenset(sig)
+
+
 # ---------------------------------------------------------------------------
 # Server task -- each MCP server lives in one long-lived asyncio Task
 # ---------------------------------------------------------------------------
@@ -1289,6 +1314,29 @@ class MCPServerTask:
                     self.name, len(self._registered_tool_names),
                 )
 
+    def _keepalive_tools_check(self, keepalive_result) -> bool:
+        """Schedule a tool refresh when the keepalive's ``list_tools`` result
+        differs from what we have registered. Returns True if scheduled.
+
+        The keepalive doubles as drift detection: a stateless HTTP server can
+        never send ``tools/list_changed`` (each request is independent — there
+        is no notification channel, and after a redeploy the new process
+        doesn't know old sessions exist), so without this the tool set
+        registered at startup would stay stale forever. This runs the same
+        refresh path the notification would have triggered.
+        """
+        fresh_tools = (
+            keepalive_result.tools if hasattr(keepalive_result, "tools") else []
+        )
+        if _tools_signature(fresh_tools) == _tools_signature(self._tools):
+            return False
+        logger.info(
+            "MCP server '%s': keepalive detected tool changes, refreshing",
+            self.name,
+        )
+        self._schedule_tools_refresh()
+        return True
+
     async def _wait_for_lifecycle_event(self) -> str:
         """Block until either _shutdown_event or _reconnect_event fires.
 
@@ -1326,7 +1374,7 @@ class MCPServerTask:
                 # to exercise the connection and detect stale sockets.
                 if self.session:
                     try:
-                        await asyncio.wait_for(
+                        keepalive_result = await asyncio.wait_for(
                             self.session.list_tools(),
                             timeout=30.0,
                         )
@@ -1338,6 +1386,14 @@ class MCPServerTask:
                         )
                         self._reconnect_event.set()
                         break
+
+                    try:
+                        self._keepalive_tools_check(keepalive_result)
+                    except Exception:
+                        logger.exception(
+                            "MCP server '%s': keepalive tool-diff check failed",
+                            self.name,
+                        )
         finally:
             for t in (shutdown_task, reconnect_task):
                 if not t.done():

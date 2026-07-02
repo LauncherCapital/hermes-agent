@@ -1246,6 +1246,257 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     # ------------------------------------------------------------------
+    # MCP admin surface — lets an external orchestrator (the thing that
+    # provisioned this instance) observe and apply MCP/model/toolset state
+    # over HTTP instead of restarting the container.
+    # ------------------------------------------------------------------
+
+    async def _handle_mcp_servers(self, request: "web.Request") -> "web.Response":
+        """GET /v1/mcp/servers — installed ⨝ live MCP server inventory.
+
+        config.yaml is the "installed" truth and the live registry the
+        "connected" truth. The join matters: the live map only holds servers
+        whose connect succeeded, so an entry present in config but absent
+        from the live map is "installed but down" — a state an external
+        dashboard must be able to distinguish from "not installed".
+
+        Header values (credentials) are never returned.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.mcp_config import _get_mcp_servers
+            from tools.mcp_tool import _lock as _mcp_lock, _servers as _mcp_servers
+
+            installed = _get_mcp_servers(load_config())
+            with _mcp_lock:
+                live = dict(_mcp_servers)
+
+            data: List[Dict[str, Any]] = []
+            for name in sorted(set(installed) | set(live)):
+                cfg = installed.get(name) if isinstance(installed.get(name), dict) else {}
+                srv = live.get(name)
+                tools = sorted(
+                    getattr(t, "name", "") for t in getattr(srv, "_tools", []) or []
+                ) if srv else []
+                data.append({
+                    "name": name,
+                    "transport": "http" if ("url" in cfg or (srv and srv._is_http())) else "stdio",
+                    "url": cfg.get("url"),
+                    "installed": name in installed,
+                    "enabled": cfg.get("enabled", True) is not False,
+                    "connected": srv is not None,
+                    "tool_count": len(tools),
+                    "tools": tools,
+                })
+        except Exception:
+            logger.exception("GET /v1/mcp/servers failed")
+            return web.json_response(
+                _openai_error("Failed to enumerate MCP servers", err_type="server_error"),
+                status=500,
+            )
+        return web.json_response({"object": "list", "data": data})
+
+    async def _reload_mcp_servers(self) -> Dict[str, Any]:
+        """Disconnect all MCP servers, re-read config.yaml, reconnect.
+
+        Same core as the gateway's /reload-mcp chat command. No cached-agent
+        patching is needed on this platform: the api_server builds a fresh
+        AIAgent per request, so the next turn resolves tools from the
+        refreshed registry.
+        """
+        from tools.mcp_tool import (
+            _lock as _mcp_lock,
+            _servers as _mcp_servers,
+            discover_mcp_tools,
+            shutdown_mcp_servers,
+        )
+
+        loop = asyncio.get_running_loop()
+        with _mcp_lock:
+            old = set(_mcp_servers)
+        await loop.run_in_executor(None, shutdown_mcp_servers)
+        tools = await loop.run_in_executor(None, discover_mcp_tools)
+        with _mcp_lock:
+            new = set(_mcp_servers)
+        return {
+            "reconnected": sorted(new & old),
+            "added": sorted(new - old),
+            "removed": sorted(old - new),
+            "tool_count": len(tools),
+        }
+
+    async def _handle_admin_reload_mcp(self, request: "web.Request") -> "web.Response":
+        """POST /admin/reload-mcp — force a full MCP reconnect from config."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            summary = await self._reload_mcp_servers()
+        except Exception:
+            logger.exception("POST /admin/reload-mcp failed")
+            return web.json_response(
+                _openai_error("MCP reload failed", err_type="server_error"),
+                status=500,
+            )
+        return web.json_response(summary)
+
+    async def _handle_admin_config(self, request: "web.Request") -> "web.Response":
+        """POST /admin/config — declaratively apply the orchestrator-managed
+        config subset without a restart.
+
+        Body (all keys optional):
+          model:       {"default": str, "provider": str?} → config.yaml model.*
+                       (picked up per request — the next turn uses it)
+          mcp_servers: {name: {url, headers?, enabled?} | null} — upsert entries,
+                       null removes; additions connect via incremental discovery,
+                       removals/updates trigger a full reload
+          toolsets:    [names] → platform_toolsets.api_server (next turn)
+          web:         shallow-merged into config.yaml web.* (read per call)
+          env:         {KEY: value | null} → ~/.hermes/.env + in-process
+                       reload_env(); null blanks the value (deletion only
+                       propagates for vars hermes knows, blanking always works)
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON body"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(_openai_error("Body must be a JSON object"), status=400)
+
+        allowed = {"model", "mcp_servers", "toolsets", "web", "env"}
+        unknown = set(body) - allowed
+        if unknown:
+            return web.json_response(
+                _openai_error(f"Unknown keys: {', '.join(sorted(unknown))}"), status=400
+            )
+
+        applied: Dict[str, Any] = {}
+        try:
+            from hermes_cli.config import load_config, reload_env, save_config, save_env_value
+
+            config = load_config()
+            config_dirty = False
+            mcp_added: set = set()
+            mcp_changed = False
+
+            model_spec = body.get("model")
+            if isinstance(model_spec, dict) and (model_spec.get("default") or "").strip():
+                model_cfg = config.get("model")
+                if not isinstance(model_cfg, dict):
+                    model_cfg = {}
+                model_cfg["default"] = str(model_spec["default"]).strip()
+                if (model_spec.get("provider") or "").strip():
+                    model_cfg["provider"] = str(model_spec["provider"]).strip()
+                # A stale flat 'model' key would shadow 'default' downstream.
+                model_cfg.pop("model", None)
+                config["model"] = model_cfg
+                config_dirty = True
+                applied["model"] = model_cfg["default"]
+
+            mcp_spec = body.get("mcp_servers")
+            if isinstance(mcp_spec, dict):
+                servers = config.get("mcp_servers")
+                if not isinstance(servers, dict):
+                    servers = {}
+                for name, entry in mcp_spec.items():
+                    name = str(name).strip()
+                    if not name:
+                        continue
+                    if entry is None:
+                        # ringo_ie is this instance's memory backbone — a bad
+                        # payload must not be able to detach it.
+                        if name == "ringo_ie":
+                            continue
+                        if name in servers:
+                            servers.pop(name)
+                            mcp_changed = True
+                            applied.setdefault("mcp_removed", []).append(name)
+                    elif isinstance(entry, dict) and (entry.get("url") or "").strip():
+                        new_entry = {"url": str(entry["url"]).strip()}
+                        if isinstance(entry.get("headers"), dict):
+                            new_entry["headers"] = {
+                                str(k): str(v) for k, v in entry["headers"].items()
+                            }
+                        if entry.get("enabled") is False:
+                            new_entry["enabled"] = False
+                        if servers.get(name) != new_entry:
+                            is_new = name not in servers
+                            servers[name] = new_entry
+                            mcp_changed = True
+                            if is_new:
+                                mcp_added.add(name)
+                            applied.setdefault("mcp_upserted", []).append(name)
+                if mcp_changed:
+                    config["mcp_servers"] = servers
+                    config_dirty = True
+
+            toolsets_spec = body.get("toolsets")
+            if isinstance(toolsets_spec, list):
+                names = [str(t).strip() for t in toolsets_spec if str(t).strip()]
+                platform_toolsets = config.get("platform_toolsets")
+                if not isinstance(platform_toolsets, dict):
+                    platform_toolsets = {}
+                if platform_toolsets.get("api_server") != names:
+                    platform_toolsets["api_server"] = names
+                    config["platform_toolsets"] = platform_toolsets
+                    config_dirty = True
+                    applied["toolsets"] = names
+
+            web_spec = body.get("web")
+            if isinstance(web_spec, dict) and web_spec:
+                web_cfg = config.get("web")
+                if not isinstance(web_cfg, dict):
+                    web_cfg = {}
+                web_cfg.update(web_spec)
+                config["web"] = web_cfg
+                config_dirty = True
+                applied["web"] = sorted(web_spec.keys())
+
+            if config_dirty:
+                save_config(config)
+
+            env_spec = body.get("env")
+            if isinstance(env_spec, dict) and env_spec:
+                for key, value in env_spec.items():
+                    # Blank instead of delete: reload_env() only deletes vars
+                    # hermes knows about, an empty value works for any key.
+                    save_env_value(str(key), "" if value is None else str(value))
+                reload_env()
+                applied["env"] = sorted(env_spec.keys())
+
+            if mcp_changed:
+                removed_or_updated = mcp_changed and (
+                    set(applied.get("mcp_removed", []))
+                    or set(applied.get("mcp_upserted", [])) - mcp_added
+                )
+                if removed_or_updated:
+                    applied["mcp"] = await self._reload_mcp_servers()
+                else:
+                    # Pure additions: discover_mcp_tools() is idempotent for
+                    # connected servers and only dials the missing ones — no
+                    # need to drop live connections mid-turn.
+                    from tools.mcp_tool import discover_mcp_tools
+
+                    loop = asyncio.get_running_loop()
+                    tools = await loop.run_in_executor(None, discover_mcp_tools)
+                    applied["mcp"] = {"added": sorted(mcp_added), "tool_count": len(tools)}
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        except Exception:
+            logger.exception("POST /admin/config failed")
+            return web.json_response(
+                _openai_error("Config apply failed", err_type="server_error"),
+                status=500,
+            )
+        return web.json_response({"ok": True, "applied": applied})
+
+    # ------------------------------------------------------------------
     # /api/sessions — thin client/session resource API
     # ------------------------------------------------------------------
 
@@ -4114,6 +4365,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
+            # MCP admin surface (external orchestrator: observe + apply, no restart)
+            self._app.router.add_get("/v1/mcp/servers", self._handle_mcp_servers)
+            self._app.router.add_post("/admin/reload-mcp", self._handle_admin_reload_mcp)
+            self._app.router.add_post("/admin/config", self._handle_admin_config)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)
