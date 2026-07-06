@@ -1350,6 +1350,10 @@ class APIServerAdapter(BasePlatformAdapter):
         Body (all keys optional):
           model:       {"default": str, "provider": str?} → config.yaml model.*
                        (picked up per request — the next turn uses it)
+          agent:       {"reasoning_effort": str | null} → config.yaml
+                       agent.reasoning_effort (none|minimal|low|medium|high|xhigh;
+                       null clears back to the default). Read per request like
+                       model — the next turn uses it.
           mcp_servers: {name: {url, headers?, enabled?} | null} — upsert entries,
                        null removes; additions connect via incremental discovery,
                        removals/updates trigger a full reload
@@ -1369,7 +1373,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if not isinstance(body, dict):
             return web.json_response(_openai_error("Body must be a JSON object"), status=400)
 
-        allowed = {"model", "mcp_servers", "toolsets", "web", "env"}
+        allowed = {"model", "agent", "mcp_servers", "toolsets", "web", "env"}
         unknown = set(body) - allowed
         if unknown:
             return web.json_response(
@@ -1398,6 +1402,32 @@ class APIServerAdapter(BasePlatformAdapter):
                 config["model"] = model_cfg
                 config_dirty = True
                 applied["model"] = model_cfg["default"]
+
+            agent_spec = body.get("agent")
+            if isinstance(agent_spec, dict) and "reasoning_effort" in agent_spec:
+                from hermes_constants import parse_reasoning_effort
+
+                raw = agent_spec.get("reasoning_effort")
+                agent_cfg = config.get("agent")
+                if not isinstance(agent_cfg, dict):
+                    agent_cfg = {}
+                if raw is None or not str(raw).strip():
+                    if "reasoning_effort" in agent_cfg:
+                        agent_cfg.pop("reasoning_effort")
+                        config["agent"] = agent_cfg
+                        config_dirty = True
+                    applied["reasoning_effort"] = None
+                else:
+                    effort = str(raw).strip().lower()
+                    if parse_reasoning_effort(effort) is None:
+                        return web.json_response(
+                            _openai_error(f"Invalid reasoning_effort: {effort}"), status=400
+                        )
+                    if agent_cfg.get("reasoning_effort") != effort:
+                        agent_cfg["reasoning_effort"] = effort
+                        config["agent"] = agent_cfg
+                        config_dirty = True
+                    applied["reasoning_effort"] = effort
 
             mcp_spec = body.get("mcp_servers")
             if isinstance(mcp_spec, dict):

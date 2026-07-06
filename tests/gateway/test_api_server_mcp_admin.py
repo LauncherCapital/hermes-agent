@@ -165,6 +165,30 @@ class TestAdminConfig:
         assert "model" not in model_cfg  # stale flat key must not shadow 'default'
 
     @pytest.mark.asyncio
+    async def test_reasoning_effort_apply_clear_and_validate(self, adapter):
+        from hermes_cli.config import load_config
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/admin/config", json={"agent": {"reasoning_effort": "high"}})
+            assert resp.status == 200
+            assert (await resp.json())["applied"]["reasoning_effort"] == "high"
+            assert load_config()["agent"]["reasoning_effort"] == "high"
+
+            # "none" is a valid level (disables thinking), not a clear.
+            resp = await cli.post("/admin/config", json={"agent": {"reasoning_effort": "none"}})
+            assert resp.status == 200
+            assert load_config()["agent"]["reasoning_effort"] == "none"
+
+            resp = await cli.post("/admin/config", json={"agent": {"reasoning_effort": "bogus"}})
+            assert resp.status == 400
+
+            # null clears back to the default.
+            resp = await cli.post("/admin/config", json={"agent": {"reasoning_effort": None}})
+            assert resp.status == 200
+            assert "reasoning_effort" not in (load_config().get("agent") or {})
+
+    @pytest.mark.asyncio
     async def test_mcp_addition_uses_incremental_discovery(self, adapter):
         """Adding a server must not drop live connections (no full shutdown)."""
         from hermes_cli.config import load_config
