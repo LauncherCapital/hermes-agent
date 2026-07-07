@@ -156,6 +156,23 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
 
+# Wake signal for the gateway's cron ticker: set by request_tick() (e.g. the
+# POST /api/jobs/{id}/run handler after trigger_job) so a manually triggered
+# job runs immediately instead of waiting out the ticker interval.  The ticker
+# waits on this event with its interval as timeout and clears it after waking.
+_tick_wake = threading.Event()
+
+
+def request_tick() -> None:
+    """Wake the cron ticker so it re-checks due jobs now."""
+    _tick_wake.set()
+
+
+def wait_for_tick_wake(timeout: float) -> None:
+    """Sleep until the next tick is due or request_tick() wakes us early."""
+    _tick_wake.wait(timeout=timeout)
+    _tick_wake.clear()
+
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
 # The tick function submits jobs here and returns immediately so the ticker

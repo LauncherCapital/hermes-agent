@@ -664,6 +664,43 @@ class TestRunJob:
                 assert data["job"] == triggered_job
                 mock_trigger.assert_called_once_with(VALID_JOB_ID)
 
+    @pytest.mark.asyncio
+    async def test_run_job_wakes_ticker(self, adapter):
+        """POST /api/jobs/{id}/run wakes the cron ticker so the job runs now."""
+        from cron import scheduler
+
+        app = _create_app(adapter)
+        mock_trigger = MagicMock(return_value=dict(SAMPLE_JOB))
+        scheduler._tick_wake.clear()
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_trigger", mock_trigger
+            ):
+                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+                assert resp.status == 200
+                assert scheduler._tick_wake.is_set()
+        scheduler._tick_wake.clear()
+
+    @pytest.mark.asyncio
+    async def test_run_job_not_found_does_not_wake_ticker(self, adapter):
+        """A failed trigger (unknown job) must not wake the ticker."""
+        from cron import scheduler
+
+        app = _create_app(adapter)
+        mock_trigger = MagicMock(return_value=None)
+        scheduler._tick_wake.clear()
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_trigger", mock_trigger
+            ):
+                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+                assert resp.status == 404
+                assert not scheduler._tick_wake.is_set()
+
 
 # ---------------------------------------------------------------------------
 # 17. test_auth_required

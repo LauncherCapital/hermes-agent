@@ -3621,6 +3621,13 @@ class APIServerAdapter(BasePlatformAdapter):
             job = _cron_trigger(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
+            # trigger_job only marks the job due (next_run_at=now) — wake the
+            # gateway's cron ticker so "run now" means now, not next tick.
+            try:
+                from cron.scheduler import request_tick
+                request_tick()
+            except Exception:
+                pass  # ticker just picks it up on its regular interval
             return web.json_response({"job": job})
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
