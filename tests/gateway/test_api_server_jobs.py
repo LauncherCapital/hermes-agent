@@ -221,6 +221,46 @@ class TestCreateJob:
                     assert "enabled_toolsets" in data["error"]
 
     @pytest.mark.asyncio
+    async def test_create_job_with_context_from(self, adapter):
+        """POST /api/jobs forwards context_from to create_job (run-to-run continuity)."""
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(f"{_MOD}._cron_create", mock_create):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "heartbeat",
+                    "schedule": "0 9 * * *",
+                    "prompt": "check in",
+                    "context_from": ["aabbccddeeff"],
+                })
+                assert resp.status == 200
+                assert mock_create.call_args[1]["context_from"] == ["aabbccddeeff"]
+
+                resp = await cli.post("/api/jobs", json={
+                    "name": "heartbeat",
+                    "schedule": "0 9 * * *",
+                    "context_from": "aabbccddeeff",  # bare string form
+                })
+                assert resp.status == 200
+                assert mock_create.call_args[1]["context_from"] == ["aabbccddeeff"]
+
+    @pytest.mark.asyncio
+    async def test_create_job_invalid_context_from(self, adapter):
+        """POST /api/jobs with malformed context_from returns 400."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                for bad in ({"a": 1}, [1, 2], ["not-hex-12ch!"], ["aabbccddeeff11"], "../../etc"):
+                    resp = await cli.post("/api/jobs", json={
+                        "name": "test-job",
+                        "schedule": "*/5 * * * *",
+                        "context_from": bad,
+                    })
+                    assert resp.status == 400
+                    data = await resp.json()
+                    assert "context_from" in data["error"]
+
+    @pytest.mark.asyncio
     async def test_create_job_missing_name(self, adapter):
         """POST /api/jobs without name returns 400."""
         app = _create_app(adapter)
@@ -459,6 +499,45 @@ class TestUpdateJob:
                 assert resp.status == 400
                 data = await resp.json()
                 assert "enabled_toolsets" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_update_job_context_from(self, adapter):
+        """PATCH /api/jobs/{id} passes context_from through; empty list clears to None."""
+        app = _create_app(adapter)
+        mock_update = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"context_from": ["aabbccddeeff"]},
+                )
+                assert resp.status == 200
+                assert mock_update.call_args[0][1] == {"context_from": ["aabbccddeeff"]}
+
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"context_from": []},
+                )
+                assert resp.status == 200
+                assert mock_update.call_args[0][1] == {"context_from": None}
+
+    @pytest.mark.asyncio
+    async def test_update_job_invalid_context_from(self, adapter):
+        """PATCH /api/jobs/{id} with malformed context_from returns 400."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"context_from": ["../escape"]},
+                )
+                assert resp.status == 400
+                data = await resp.json()
+                assert "context_from" in data["error"]
 
     @pytest.mark.asyncio
     async def test_update_job_no_valid_fields(self, adapter):
