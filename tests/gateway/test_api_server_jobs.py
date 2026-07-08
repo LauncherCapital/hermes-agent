@@ -290,18 +290,18 @@ class TestCreateJob:
 
     @pytest.mark.asyncio
     async def test_create_job_prompt_too_long(self, adapter):
-        """POST /api/jobs with prompt > 5000 chars returns 400."""
+        """POST /api/jobs with prompt > 20000 chars returns 400."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch(f"{_MOD}._CRON_AVAILABLE", True):
                 resp = await cli.post("/api/jobs", json={
                     "name": "test-job",
                     "schedule": "*/5 * * * *",
-                    "prompt": "x" * 5001,
+                    "prompt": "x" * 20001,
                 })
                 assert resp.status == 400
                 data = await resp.json()
-                assert "5000" in data["error"] or "Prompt" in data["error"]
+                assert "20000" in data["error"] or "Prompt" in data["error"]
 
     @pytest.mark.asyncio
     async def test_create_job_invalid_repeat(self, adapter):

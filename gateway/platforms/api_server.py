@@ -3352,7 +3352,7 @@ class APIServerAdapter(BasePlatformAdapter):
     # Allowed fields for update — prevents clients injecting arbitrary keys
     _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled", "model", "provider", "enabled_toolsets", "context_from"}
     _MAX_NAME_LENGTH = 200
-    _MAX_PROMPT_LENGTH = 5000
+    _MAX_PROMPT_LENGTH = 20000
 
     @staticmethod
     def _validate_context_from(value):
