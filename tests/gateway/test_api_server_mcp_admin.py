@@ -217,6 +217,30 @@ class TestAdminConfig:
         assert entry["headers"]["Authorization"] == "Bearer tok"
 
     @pytest.mark.asyncio
+    async def test_mcp_tools_filter_passthrough(self, adapter):
+        """tools.include/exclude ride the entry into config.yaml so an
+        orchestrator can hide individual tools live (selective loading)."""
+        from hermes_cli.config import load_config
+
+        app = _create_app(adapter)
+        discover = MagicMock(return_value=[])
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MCP_MOD}.shutdown_mcp_servers", MagicMock()), \
+                 patch(f"{_MCP_MOD}.discover_mcp_tools", discover):
+                resp = await cli.post(
+                    "/admin/config",
+                    json={"mcp_servers": {"pd_google_sheets": {
+                        "url": "https://mcp.example/pd/google_sheets/",
+                        "tools": {"exclude": ["delete-rows", "  ", 42], "include": []},
+                    }}},
+                )
+                assert resp.status == 200
+
+        entry = load_config()["mcp_servers"]["pd_google_sheets"]
+        # junk entries dropped, empty lists omitted
+        assert entry["tools"] == {"exclude": ["delete-rows", "42"]}
+
+    @pytest.mark.asyncio
     async def test_mcp_removal_triggers_full_reload(self, adapter):
         from hermes_cli.config import load_config
 

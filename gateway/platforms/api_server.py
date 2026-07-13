@@ -1354,9 +1354,10 @@ class APIServerAdapter(BasePlatformAdapter):
                        agent.reasoning_effort (none|minimal|low|medium|high|xhigh;
                        null clears back to the default). Read per request like
                        model — the next turn uses it.
-          mcp_servers: {name: {url, headers?, enabled?} | null} — upsert entries,
-                       null removes; additions connect via incremental discovery,
-                       removals/updates trigger a full reload
+          mcp_servers: {name: {url, headers?, enabled?, tools?} | null} — upsert
+                       entries, null removes; tools = {include?/exclude?: [names]}
+                       (selective tool loading); additions connect via incremental
+                       discovery, removals/updates trigger a full reload
           toolsets:    [names] → platform_toolsets.api_server (next turn)
           web:         shallow-merged into config.yaml web.* (read per call)
           env:         {KEY: value | null} → ~/.hermes/.env + in-process
@@ -1455,6 +1456,22 @@ class APIServerAdapter(BasePlatformAdapter):
                             }
                         if entry.get("enabled") is False:
                             new_entry["enabled"] = False
+                        # Selective tool loading (issue #690 config shape):
+                        # tools.include / tools.exclude ride the entry so an
+                        # orchestrator can hide individual tools live — the
+                        # update path below triggers a full MCP reload, which
+                        # re-registers tools through the filter.
+                        tools_spec = entry.get("tools")
+                        if isinstance(tools_spec, dict):
+                            tools_entry = {}
+                            for key in ("include", "exclude"):
+                                vals = tools_spec.get(key)
+                                if isinstance(vals, list):
+                                    cleaned = [str(v).strip() for v in vals if str(v).strip()]
+                                    if cleaned:
+                                        tools_entry[key] = cleaned
+                            if tools_entry:
+                                new_entry["tools"] = tools_entry
                         if servers.get(name) != new_entry:
                             is_new = name not in servers
                             servers[name] = new_entry
