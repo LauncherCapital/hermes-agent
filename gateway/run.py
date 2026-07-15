@@ -9069,7 +9069,22 @@ class GatewayRunner:
 
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
-        
+
+        # Seed a cold thread session with the Slack thread's prior messages as
+        # role-tagged turns (bot→assistant, others→user), captured by the
+        # adapter on the first turn. Only when the transcript is empty (first
+        # turn in the thread) — persisted here so later turns replay it natively
+        # instead of re-fetching or flattening it into user text. This is what
+        # lets the agent recognize its own proactive/cron root post when a human
+        # replies to it.
+        _thread_bootstrap = getattr(event, "thread_bootstrap", None)
+        if _thread_bootstrap and not history:
+            for _seed_msg in _thread_bootstrap:
+                self.session_store.append_to_transcript(
+                    session_entry.session_id, _seed_msg
+                )
+            history = self.session_store.load_transcript(session_entry.session_id)
+
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
         #

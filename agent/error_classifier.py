@@ -59,6 +59,7 @@ class FailoverReason(enum.Enum):
     long_context_tier = "long_context_tier"    # Anthropic "extra usage" tier gate
     oauth_long_context_beta_forbidden = "oauth_long_context_beta_forbidden"  # Anthropic OAuth subscription rejects 1M context beta — disable beta and retry
     llama_cpp_grammar_pattern = "llama_cpp_grammar_pattern"  # llama.cpp json-schema-to-grammar rejects regex escapes in `pattern` / `format` — strip from tools and retry
+    invalid_tool_schema = "invalid_tool_schema"  # provider rejected ONE tool's input_schema (e.g. Anthropic "tools.N.custom.input_schema: JSON schema is invalid") — drop that tool and retry so one bad tool doesn't fail the whole request
 
     # Catch-all
     unknown = "unknown"                  # Unclassifiable — retry with backoff
@@ -616,6 +617,29 @@ def classify_api_error(
     ):
         return _result(
             FailoverReason.llama_cpp_grammar_pattern,
+            retryable=True,
+            should_compress=False,
+        )
+
+    # Invalid tool input_schema — a SINGLE tool's schema is rejected by the
+    # provider's tool-schema validator, which 400s the ENTIRE request (so
+    # every tool turn fails, not just calls to the bad tool). Anthropic phrases
+    # it "tools.N.custom.input_schema: JSON schema is invalid. It must match
+    # JSON Schema draft 2020-12"; the field path carries the offending index.
+    # Recovery: parse the index, drop that one tool, quarantine it, and retry —
+    # one malformed MCP tool must not take the whole agent offline. Match on the
+    # stable fragments so it works across providers/relays that echo Anthropic's
+    # message. See conversation_loop.py's recovery branch.
+    if (
+        status_code == 400
+        and "input_schema" in error_msg
+        and (
+            "json schema is invalid" in error_msg
+            or "must match json schema" in error_msg
+        )
+    ):
+        return _result(
+            FailoverReason.invalid_tool_schema,
             retryable=True,
             should_compress=False,
         )

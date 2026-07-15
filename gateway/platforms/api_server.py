@@ -1299,6 +1299,31 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return web.json_response({"object": "list", "data": data})
 
+    async def _handle_quarantined_tools(self, request: "web.Request") -> "web.Response":
+        """GET /api/tools/quarantined — tools the provider rejected as
+        schema-invalid and that the conversation loop dropped so one bad tool
+        wouldn't 400 the whole request (see FailoverReason.invalid_tool_schema).
+
+        The dashboard reads this to badge the offending MCP integration
+        ("search_issues — disabled, invalid schema") instead of leaving the
+        tool silently missing. Each entry carries the attributed server (None
+        for built-in/plugin tools), the provider's reason, and first/last-seen.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from tools import tool_quarantine
+
+            data = tool_quarantine.list_quarantined()
+        except Exception:
+            logger.exception("GET /api/tools/quarantined failed")
+            return web.json_response(
+                _openai_error("Failed to list quarantined tools", err_type="server_error"),
+                status=500,
+            )
+        return web.json_response({"object": "list", "data": data})
+
     async def _reload_mcp_servers(self) -> Dict[str, Any]:
         """Disconnect all MCP servers, re-read config.yaml, reconnect.
 
@@ -2284,6 +2309,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        # Tools dropped this run because the provider rejected their schema —
+        # a non-standard field OpenAI clients ignore but the dashboard reads to
+        # show which tool was skipped (and why) on the run.
+        _dropped_tools = result.get("dropped_tools")
+        if _dropped_tools:
+            response_data["dropped_tools"] = _dropped_tools
         if is_partial or is_failed or not completed:
             response_data["hermes"] = {
                 "completed": completed,
@@ -3851,6 +3882,13 @@ class APIServerAdapter(BasePlatformAdapter):
             _eff_sid = getattr(agent, "session_id", session_id)
             if isinstance(_eff_sid, str) and _eff_sid:
                 result["session_id"] = _eff_sid
+            # Tools the run had to drop because the provider rejected their
+            # schema (see FailoverReason.invalid_tool_schema). A fresh agent is
+            # built per request, so this list is scoped to THIS run — surface it
+            # so the dashboard activity feed can show "skipped tool X".
+            _dropped = getattr(agent, "_dropped_tools_run", None)
+            if _dropped:
+                result["dropped_tools"] = _dropped
             return result, usage
 
         return await loop.run_in_executor(None, _run)
@@ -4471,6 +4509,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
             # MCP admin surface (external orchestrator: observe + apply, no restart)
             self._app.router.add_get("/v1/mcp/servers", self._handle_mcp_servers)
+            self._app.router.add_get("/api/tools/quarantined", self._handle_quarantined_tools)
             self._app.router.add_post("/admin/reload-mcp", self._handle_admin_reload_mcp)
             self._app.router.add_post("/admin/config", self._handle_admin_config)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)

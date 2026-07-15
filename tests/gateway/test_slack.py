@@ -3423,6 +3423,55 @@ class TestSlackReplyToText:
         assert "メール要約" in msg_event.reply_to_text
 
     @pytest.mark.asyncio
+    async def test_slack_thread_bootstrap_is_role_tagged(self, adapter):
+        """A first thread reply must carry the thread's prior messages as
+        role-tagged turns on the MessageEvent: the bot-posted parent (e.g. a
+        cron/proactive post) as ``assistant``, humans as ``user`` (speaker-
+        prefixed), and the current triggering message excluded. This is what
+        lets the agent recognize its own root post when a human replies to it,
+        instead of the old flattened-into-user-text prepend."""
+        adapter._channel_team = {}  # primary workspace only
+        adapter._team_bot_user_ids = {}
+
+        adapter._app.client.conversations_replies = AsyncMock(
+            return_value={
+                "messages": [
+                    {"ts": "1000.0", "bot_id": "B_CRON", "text": "무사고 5일차 🎉"},
+                    {"ts": "1000.3", "user": "U_HUMAN", "text": "어제 삭제돼서 0일차야"},
+                    {"ts": "1000.5", "user": "U_USER", "text": "링고 눈치없어?"},
+                ]
+            }
+        )
+
+        # DM so mention-gating doesn't short-circuit the handler.
+        event = {
+            "text": "링고 눈치없어?",
+            "user": "U_USER",
+            "channel": "D123",
+            "channel_type": "im",
+            "ts": "1000.5",
+            "thread_ts": "1000.0",  # thread reply
+        }
+
+        with patch.object(
+            adapter, "_resolve_user_name", new=AsyncMock(return_value="Alice")
+        ), patch.object(
+            adapter, "_has_active_session_for_thread", return_value=False
+        ):
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        bootstrap = msg_event.thread_bootstrap
+        assert bootstrap is not None, "thread_bootstrap must be set on first thread reply"
+        # Current triggering message (1000.5) excluded; bot parent → assistant,
+        # prior human → user, oldest first.
+        assert [m["role"] for m in bootstrap] == ["assistant", "user"]
+        assert bootstrap[0]["content"] == "무사고 5일차 🎉"
+        assert "0일차" in bootstrap[1]["content"]
+        # Human turns are speaker-prefixed so multiple participants stay distinct.
+        assert bootstrap[1]["content"].startswith("Alice:")
+
+    @pytest.mark.asyncio
     async def test_slack_reply_to_text_none_for_top_level_message(self, adapter):
         """Top-level messages (no thread_ts) must not set reply_to_text."""
         event = {

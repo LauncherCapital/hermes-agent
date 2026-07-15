@@ -74,6 +74,10 @@ class _ThreadContextCache:
     fetched_at: float = field(default_factory=time.monotonic)
     message_count: int = 0
     parent_text: str = ""  # Raw text of the thread parent (for reply_to_text injection)
+    # Role-tagged version of the prior thread messages (bot→assistant,
+    # everyone else→user), oldest first. Used to seed session history natively
+    # on the first turn instead of flattening the thread into user text.
+    role_messages: List[Dict[str, str]] = field(default_factory=list)
 
 
 def check_slack_requirements() -> bool:
@@ -2357,20 +2361,23 @@ class SlackAdapter(BasePlatformAdapter):
                         self._mentioned_threads.discard(t)
 
         # When entering a thread for the first time (no existing session),
-        # fetch thread context so the agent understands the conversation.
+        # fetch the thread's prior messages as role-tagged turns so the agent
+        # understands the conversation it is replying to — including its own
+        # proactive/cron root post. These are seeded into the session transcript
+        # in gateway.run (once, on the cold turn) so they replay natively on
+        # later turns, instead of being flattened into the user message text.
+        thread_bootstrap: List[Dict[str, str]] = []
         if is_thread_reply and not self._has_active_session_for_thread(
             channel_id=channel_id,
             thread_ts=event_thread_ts,
             user_id=user_id,
         ):
-            thread_context = await self._fetch_thread_context(
+            thread_bootstrap = await self._fetch_thread_bootstrap(
                 channel_id=channel_id,
                 thread_ts=event_thread_ts,
                 current_ts=ts,
                 team_id=team_id,
             )
-            if thread_context:
-                text = thread_context + text
 
         # Determine message type
         msg_type = MessageType.TEXT
@@ -2630,6 +2637,7 @@ class SlackAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             reply_to_text=reply_to_text,
             auto_skill=_auto_skill,
+            thread_bootstrap=thread_bootstrap or None,
         )
 
         # Only react when bot is directly addressed (DM or @mention).
@@ -3078,6 +3086,7 @@ class SlackAdapter(BasePlatformAdapter):
 
             bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
             context_parts = []
+            role_messages: List[Dict[str, str]] = []
             parent_text = ""
             for msg in messages:
                 msg_ts = msg.get("ts", "")
@@ -3124,6 +3133,20 @@ class SlackAdapter(BasePlatformAdapter):
                     display_user = msg.get("username") or "bot"
                 name = await self._resolve_user_name(display_user, chat_id=channel_id)
                 context_parts.append(f"{prefix}{name}: {msg_text}")
+                # Role-tagged form for seeding session history. The thread
+                # parent posted by our own bot (e.g. a cron/proactive message we
+                # are now replying to) becomes an `assistant` turn so the agent
+                # recognizes it as its own prior words; everyone else is a
+                # `user` turn, name-prefixed so multiple speakers stay distinct.
+                is_own_bot_parent = is_parent and is_bot and (
+                    (bool(self_bot_uid) and msg_user == self_bot_uid) or not msg_user
+                )
+                if is_own_bot_parent:
+                    role_messages.append({"role": "assistant", "content": msg_text})
+                else:
+                    role_messages.append(
+                        {"role": "user", "content": f"{name}: {msg_text}"}
+                    )
                 if is_parent:
                     parent_text = msg_text
 
@@ -3140,12 +3163,40 @@ class SlackAdapter(BasePlatformAdapter):
                 fetched_at=now,
                 message_count=len(context_parts),
                 parent_text=parent_text,
+                role_messages=role_messages,
             )
             return content
 
         except Exception as e:
             logger.warning("[Slack] Failed to fetch thread context: %s", e)
             return ""
+
+    async def _fetch_thread_bootstrap(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        current_ts: str,
+        team_id: str = "",
+    ) -> List[Dict[str, str]]:
+        """Return the thread's prior messages as role-tagged turns.
+
+        Delegates to :meth:`_fetch_thread_context` (which also warms the cache
+        used by :meth:`_fetch_thread_parent_text`) and returns the role-tagged
+        form (bot→assistant, others→user), oldest first. These are seeded into
+        the session transcript once, on the first turn in the thread, so the
+        agent replies with full awareness of the conversation — including its
+        own proactive/cron root post — without flattening the thread into the
+        user message text. Returns an empty list on failure or an empty thread.
+        """
+        await self._fetch_thread_context(
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            current_ts=current_ts,
+            team_id=team_id,
+        )
+        cache_key = f"{channel_id}:{thread_ts}:{team_id}"
+        cached = self._thread_context_cache.get(cache_key)
+        return list(cached.role_messages) if cached else []
 
     async def _fetch_thread_parent_text(
         self,

@@ -1151,6 +1151,9 @@ def run_conversation(
         multimodal_tool_content_retry_attempted = False
         oauth_1m_beta_retry_attempted = False
         llama_cpp_grammar_retry_attempted = False
+        # Counter, not a one-shot flag: the provider reports the FIRST invalid
+        # tool per request, so several bad tools need several drop+retry cycles.
+        invalid_tool_schema_drops = 0
         has_retried_429 = False
         restart_with_compressed_messages = False
         restart_with_length_continuation = False
@@ -2645,6 +2648,70 @@ def run_conversation(
                         "%sllama.cpp grammar error but no pattern/format "
                         "keywords to strip — falling through to normal retry",
                         agent.log_prefix,
+                    )
+
+                # ── Invalid tool schema recovery ──────────────────────
+                # The provider rejected ONE tool's input_schema (Anthropic:
+                # "tools.N.custom.input_schema: JSON schema is invalid"), which
+                # 400s the WHOLE request — so every tool turn fails, not just
+                # calls to that tool. Drop the one offending tool and retry, so
+                # a single malformed MCP tool can't take the entire agent
+                # offline. The error's field path carries the index into the
+                # tools array we sent (which is ``agent.tools`` verbatim on the
+                # OpenAI-compatible path). Counter-bounded because the provider
+                # reports one bad tool at a time.
+                if (
+                    classified.reason == FailoverReason.invalid_tool_schema
+                    and agent.tools
+                    and invalid_tool_schema_drops < min(len(agent.tools), 12)
+                ):
+                    _m = re.search(r"tools\.(\d+)\b", str(api_error) or "")
+                    _idx = int(_m.group(1)) if _m else None
+                    if _idx is not None and 0 <= _idx < len(agent.tools):
+                        _dropped = agent.tools.pop(_idx)
+                        _dname = (
+                            (_dropped.get("function") or {}).get("name")
+                            if isinstance(_dropped, dict) else None
+                        )
+                        invalid_tool_schema_drops += 1
+                        _server = None
+                        try:
+                            from tools.mcp_tool import mcp_tool_server_name
+                            from tools import tool_quarantine
+                            _server = mcp_tool_server_name(_dname) if _dname else None
+                            _reason = agent._summarize_api_error(api_error)
+                            if _dname:
+                                tool_quarantine.quarantine(
+                                    _dname, server=_server, reason=_reason
+                                )
+                                if getattr(agent, "_dropped_tools_run", None) is None:
+                                    agent._dropped_tools_run = []
+                                agent._dropped_tools_run.append({
+                                    "tool": _dname,
+                                    "server": _server,
+                                    "reason": (_reason or "")[:200],
+                                })
+                        except Exception as _q_exc:  # pragma: no cover — defensive
+                            logger.warning(
+                                "%sinvalid_tool_schema: quarantine bookkeeping failed: %s",
+                                agent.log_prefix, _q_exc,
+                            )
+                        agent._vprint(
+                            f"{agent.log_prefix}⚠️  Provider rejected tool "
+                            f"'{_dname}' schema — dropped it and retrying (one "
+                            f"bad tool won't stop the agent)...",
+                            force=True,
+                        )
+                        logger.warning(
+                            "%sinvalid_tool_schema recovery: dropped tool '%s' "
+                            "(server=%s) at index %s, retrying",
+                            agent.log_prefix, _dname, _server, _idx,
+                        )
+                        continue
+                    logger.warning(
+                        "%sinvalid_tool_schema error but could not map index to "
+                        "a tool (idx=%s, tools=%d) — falling through to normal retry",
+                        agent.log_prefix, _idx, len(agent.tools),
                     )
 
                 retry_count += 1
