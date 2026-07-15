@@ -675,3 +675,31 @@ def test_dependent_schemas_still_recurses():
         "type": "object",
         "properties": {},
     }
+
+
+def test_default_list_of_strings_not_mangled():
+    """``default`` holds a literal INSTANCE value, not a schema. A list-valued
+    default (``["web","image"]``) must pass through — recursing turned each
+    string into ``{"type":"object"}``, corrupting the schema Anthropic-side."""
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "searchType": {"type": "string", "default": ["web", "image"]},
+        },
+    })]
+    out = sanitize_tool_schemas(tools)
+    assert out[0]["function"]["parameters"]["properties"]["searchType"]["default"] == ["web", "image"]
+
+
+def test_const_list_and_nested_default_not_mangled():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "k": {"const": ["a", "b"]},
+            "cfg": {"type": "object", "default": {"tags": ["x", "y"]}},
+        },
+    })]
+    out = sanitize_tool_schemas(tools)
+    props = out[0]["function"]["parameters"]["properties"]
+    assert props["k"]["const"] == ["a", "b"]
+    assert props["cfg"]["default"] == {"tags": ["x", "y"]}

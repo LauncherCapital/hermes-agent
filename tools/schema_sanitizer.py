@@ -267,8 +267,9 @@ def _sanitize_node(node: Any, path: str) -> Any:
                 _sanitize_node(item, f"{path}.{key}[{i}]")
                 for i, item in enumerate(value)
             ]
-        elif key in {"required", "enum", "examples", "dependentRequired"}:
-            # Schema "sibling" keywords whose values are NOT schemas:
+        elif key in {"required", "enum", "examples", "dependentRequired", "const", "default"}:
+            # Keywords whose values are literal INSTANCE DATA, not schemas.
+            # This is every data-valued keyword in standard JSON Schema:
             #  - ``required``: list of property-name strings
             #  - ``enum``: list of literal values (any JSON type)
             #  - ``examples``: list of example values (any JSON type)
@@ -276,13 +277,19 @@ def _sanitize_node(node: Any, path: str) -> Any:
             #    array of property-name strings (draft 2019-09/2020-12). Its
             #    inner arrays are property names, NOT schemas — e.g. GitHub's
             #    MCP ``search_issues`` ships ``{"owner": ["repo"], "repo":
-            #    ["owner"]}``. (``dependentSchemas``/``propertyNames`` DO hold
-            #    schemas and must keep recursing — they fall through below.)
-            # Recursing into these with _sanitize_node() would mis-interpret
-            # literal strings like "path"/"repo" as bare-string schemas and
-            # replace them with {"type": "object"} dicts, corrupting the
-            # schema into one Anthropic rejects ("must match JSON Schema draft
-            # 2020-12"). Pass through unchanged.
+            #    ["owner"]}``.
+            #  - ``const`` / ``default``: a single literal value of any JSON
+            #    type. When that value is a list/dict (e.g. ``default:
+            #    ["web","image"]`` or ``const: {...}``) it is DATA, not a
+            #    schema.
+            # (``dependentSchemas``/``propertyNames``/``patternProperties`` DO
+            # hold schemas and must keep recursing — they fall through below.)
+            # Recursing into any of these with _sanitize_node() would
+            # mis-interpret literal strings ("path"/"repo"/"web") as
+            # bare-string schemas and replace them with {"type": "object"}
+            # dicts, corrupting the schema into one Anthropic rejects ("must
+            # match JSON Schema draft 2020-12") — which 400s the WHOLE request.
+            # Pass through unchanged.
             out[key] = copy.deepcopy(value) if isinstance(value, (list, dict)) else value
         else:
             out[key] = _sanitize_node(value, f"{path}.{key}") if isinstance(value, (dict, list)) else value
