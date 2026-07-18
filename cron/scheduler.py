@@ -149,7 +149,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import get_due_jobs, get_job, mark_job_run, save_job_output, advance_next_run
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -695,6 +695,54 @@ def _send_media_via_adapter(
                 )
         except Exception as e:
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+
+
+def _push_completion_to_ie(job_id: str, output_summary: Optional[str] = None) -> None:
+    """Best-effort: PUSH a finished cron run to ie so it need not poll /api/jobs.
+
+    ie authenticates us by the project-scoped RINGO_IE_MCP_KEY this instance
+    already holds, and dedups on (agent, job, last_run_at) — so a re-send or ie's
+    slow reconcile backstop re-detecting the same run is a harmless no-op. We read
+    the just-persisted job so last_run_at matches exactly what /api/jobs reports
+    (aligning push and backstop dedup). Never raises: a delivery failure must not
+    affect the job — the backstop catches a dropped push."""
+    url = os.environ.get("RINGO_IE_TASK_WEBHOOK_URL")
+    key = os.environ.get("RINGO_IE_MCP_KEY")
+    if not url or not key:
+        return  # feature not provisioned (older/standalone instance)
+    try:
+        job = get_job(job_id)
+    except Exception:
+        job = None
+    if not job or not job.get("last_run_at"):
+        return
+    payload = {
+        "job_id": job_id,
+        "name": job.get("name"),
+        "last_run_at": job.get("last_run_at"),
+        "last_status": job.get("last_status"),
+        "last_error": job.get("last_error"),
+        "last_delivery_error": job.get("last_delivery_error"),
+        "schedule_display": job.get("schedule_display"),
+        "model": job.get("model"),
+    }
+    if output_summary and output_summary.strip():
+        payload["output_summary"] = output_summary.strip()[:2000]
+    try:
+        import httpx
+    except Exception:
+        return
+    headers = {"Authorization": f"Bearer {key}"}
+    for _attempt in range(3):
+        try:
+            r = httpx.post(url, json=payload, headers=headers, timeout=10.0)
+            if r.status_code < 500:
+                return  # 2xx delivered; 4xx won't be fixed by a retry
+        except Exception:
+            pass
+    logger.warning(
+        "ie completion push failed for job %s (non-fatal; ie backstop will catch it)", job_id
+    )
 
 
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
@@ -2091,11 +2139,13 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                _push_completion_to_ie(job["id"], output_summary=final_response if success else None)
                 return True
 
             except Exception as e:
                 logger.error("Error processing job %s: %s", job['id'], e)
                 mark_job_run(job["id"], False, str(e))
+                _push_completion_to_ie(job["id"])
                 return False
 
         # Partition due jobs: jobs with a per-job workdir and/or profile touch
