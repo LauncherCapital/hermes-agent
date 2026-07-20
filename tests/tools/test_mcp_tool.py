@@ -1685,6 +1685,103 @@ class TestReconnection:
 
         asyncio.run(_test())
 
+    def test_retry_budget_resets_after_stable_connection(self):
+        """A session that lived past _RECONNECT_RESET_AFTER_SEC gets a fresh
+        retry budget on its next drop.
+
+        Before the fix, `retries` accumulated over the process lifetime, so a
+        handful of remote-server redeploys spread over days permanently
+        exhausted the budget and killed the server task.
+        """
+        import time as _time
+        from tools.mcp_tool import MCPServerTask, _MAX_RECONNECT_RETRIES
+
+        run_count = 0
+        target_server = None
+
+        original_run_stdio = MCPServerTask._run_stdio
+
+        async def patched_run_stdio(self_srv, config):
+            nonlocal run_count, target_server
+            if target_server is not self_srv:
+                return await original_run_stdio(self_srv, config)
+            run_count += 1
+            if run_count <= _MAX_RECONNECT_RETRIES + 2:
+                # Each cycle: connect "successfully", live long enough to
+                # count as stable, then drop. More drops than the per-outage
+                # budget — only survivable if the budget resets each time.
+                self_srv.session = MagicMock()
+                self_srv._ready.set()
+                self_srv._connected_at = _time.monotonic() - 31.0
+                raise ConnectionError("connection dropped")
+            self_srv._shutdown_event.set()
+
+        async def _test():
+            nonlocal target_server
+            server = MCPServerTask("test_srv")
+            target_server = server
+
+            with patch.object(MCPServerTask, "_run_stdio", patched_run_stdio), \
+                 patch("asyncio.sleep", new_callable=AsyncMock):
+                await server.run({"command": "test"})
+
+            # Old behavior: run() returned for good after
+            # _MAX_RECONNECT_RETRIES + 1 drops. New behavior: every stable
+            # session resets the budget, so all drops are retried and the
+            # loop only exits on shutdown.
+            assert run_count == _MAX_RECONNECT_RETRIES + 3
+
+        asyncio.run(_test())
+
+    def test_never_gives_up_after_max_retries(self):
+        """Exhausting the fast-retry budget degrades to slow probing instead
+        of permanently killing the server task.
+
+        A dead task can never be revived (the circuit breaker's half-open
+        probe only re-asks the dead task), so before the fix the only
+        recovery from a long outage was a full process restart.
+        """
+        from tools.mcp_tool import MCPServerTask, _MAX_RECONNECT_RETRIES
+
+        run_count = 0
+        target_server = None
+        total_cycles = _MAX_RECONNECT_RETRIES + 5  # well past the old give-up
+
+        original_run_stdio = MCPServerTask._run_stdio
+
+        async def patched_run_stdio(self_srv, config):
+            nonlocal run_count, target_server
+            if target_server is not self_srv:
+                return await original_run_stdio(self_srv, config)
+            run_count += 1
+            if run_count == 1:
+                # Establish once so subsequent failures take the
+                # reconnect path, not the initial-connect path.
+                self_srv.session = MagicMock()
+                self_srv._ready.set()
+                raise ConnectionError("connection dropped")
+            if run_count < total_cycles:
+                # Flapping fast (no stable session in between) — burns
+                # through the fast-retry budget into slow probing.
+                raise ConnectionError("still down")
+            self_srv._shutdown_event.set()
+
+        async def _test():
+            nonlocal target_server
+            server = MCPServerTask("test_srv")
+            target_server = server
+
+            with patch.object(MCPServerTask, "_run_stdio", patched_run_stdio), \
+                 patch("asyncio.sleep", new_callable=AsyncMock):
+                await server.run({"command": "test"})
+
+            # Old behavior: gave up after _MAX_RECONNECT_RETRIES + 1 failures
+            # (run_count stuck below total_cycles). New behavior: keeps
+            # probing until the server comes back (here: until shutdown).
+            assert run_count == total_cycles
+
+        asyncio.run(_test())
+
     def test_initial_oauth_failure_does_not_retry(self):
         """Initial OAuth failures stop immediately to avoid repeated browser prompts."""
         from tools.mcp_tool import MCPServerTask

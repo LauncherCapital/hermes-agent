@@ -50,7 +50,9 @@ Example config::
 Features:
     - Stdio transport (command + args) and HTTP/StreamableHTTP transport (url)
     - SSE transport (transport: sse) for MCP servers using the SSE protocol
-    - Automatic reconnection with exponential backoff (up to 5 retries)
+    - Automatic reconnection with exponential backoff (5 fast retries per
+      outage, then indefinite probing at the capped interval — never gives
+      up permanently)
     - Environment variable filtering for stdio subprocesses (security)
     - Credential stripping in error messages returned to the LLM
     - Configurable per-server timeouts for tool calls and connections
@@ -262,6 +264,12 @@ _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 _MAX_RECONNECT_RETRIES = 5
 _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
+# A session that survived at least this long before dropping means the previous
+# outage actually ended — the next drop is a NEW outage and gets a fresh retry
+# budget. Without this the reconnect counter accumulated over the process
+# lifetime, so the 6th drop ever (e.g. the 6th redeploy of a remote MCP
+# service) killed the server permanently.
+_RECONNECT_RESET_AFTER_SEC = 30.0
 
 # Environment variables that are safe to pass to stdio subprocesses
 _SAFE_ENV_KEYS = frozenset({
@@ -1148,7 +1156,7 @@ class MCPServerTask:
         "_task", "_ready", "_shutdown_event", "_reconnect_event",
         "_tools", "_error", "_config",
         "_sampling", "_registered_tool_names", "_auth_type", "_refresh_lock",
-        "_rpc_lock", "_pending_refresh_tasks",
+        "_rpc_lock", "_pending_refresh_tasks", "_connected_at",
         "initialize_result",
     )
 
@@ -1180,6 +1188,10 @@ class MCPServerTask:
         # transports for conservative per-server ordering.
         self._rpc_lock = asyncio.Lock()
         self._pending_refresh_tasks: set[asyncio.Task] = set()
+        # Monotonic timestamp of the most recent successful session
+        # establishment (stamped in _discover_tools). Used by run()'s
+        # reconnect loop to tell a fresh outage from a flapping one.
+        self._connected_at: float = 0.0
         # Captures the ``InitializeResult`` returned by
         # ``await session.initialize()`` so downstream code can inspect the
         # server's real advertised capabilities (``.capabilities.resources``,
@@ -1808,6 +1820,10 @@ class MCPServerTask:
             if hasattr(tools_result, "tools")
             else []
         )
+        # The session answered a real RPC — the connection is genuinely up.
+        # Every transport branch calls this right after initialize, so this
+        # is the single choke point for stamping connection success.
+        self._connected_at = time.monotonic()
 
     async def run(self, config: dict):
         """Long-lived coroutine: connect, discover tools, wait, disconnect.
@@ -1965,14 +1981,41 @@ class MCPServerTask:
                     )
                     return
 
+                # If the session that just dropped had been up long enough,
+                # this is a new outage, not a continuation of the last one —
+                # start the retry budget fresh. Without this, `retries`
+                # accumulated across the whole process lifetime and a handful
+                # of remote-server redeploys spread over days permanently
+                # exhausted it.
+                if (
+                    self._connected_at
+                    and time.monotonic() - self._connected_at
+                    >= _RECONNECT_RESET_AFTER_SEC
+                ):
+                    retries = 0
+                    backoff = 1.0
+                self._connected_at = 0.0
+
                 retries += 1
                 if retries > _MAX_RECONNECT_RETRIES:
-                    logger.warning(
-                        "MCP server '%s' failed after %d reconnection attempts, "
-                        "giving up: %s",
-                        self.name, _MAX_RECONNECT_RETRIES, exc,
+                    # Past the fast-backoff window the server is likely mid-
+                    # redeploy or in a real outage. Do NOT give up permanently:
+                    # a dead server task can never be revived (the breaker's
+                    # half-open probe only re-asks the dead task, and manual
+                    # /mcp refresh events are waited on inside a live session),
+                    # so giving up used to mean "dead until full process
+                    # restart". Keep probing at the capped interval instead —
+                    # one connect attempt per minute — so the server heals
+                    # itself within ~one interval of coming back.
+                    logger.info(
+                        "MCP server '%s' still unreachable (attempt %d), "
+                        "retrying in %.0fs: %s",
+                        self.name, retries, float(_MAX_BACKOFF_SECONDS), exc,
                     )
-                    return
+                    await asyncio.sleep(_MAX_BACKOFF_SECONDS)
+                    if self._shutdown_event.is_set():
+                        return
+                    continue
 
                 logger.warning(
                     "MCP server '%s' connection lost (attempt %d/%d), "
