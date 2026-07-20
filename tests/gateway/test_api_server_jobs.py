@@ -169,6 +169,98 @@ class TestCreateJob:
                 assert call_kwargs["origin"]["user_agent"] == "cron-client"
 
     @pytest.mark.asyncio
+    async def test_create_job_with_model_and_provider(self, adapter):
+        """POST /api/jobs forwards per-job model/provider to create_job (Ringo task UI)."""
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(f"{_MOD}._cron_create", mock_create):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "heartbeat",
+                    "schedule": "0 9 * * *",
+                    "prompt": "check in",
+                    "model": "anthropic/claude-opus-4-8",
+                    "provider": "openrouter",
+                })
+                assert resp.status == 200
+                call_kwargs = mock_create.call_args[1]
+                assert call_kwargs["model"] == "anthropic/claude-opus-4-8"
+                assert call_kwargs["provider"] == "openrouter"
+
+    @pytest.mark.asyncio
+    async def test_create_job_with_enabled_toolsets(self, adapter):
+        """POST /api/jobs forwards enabled_toolsets to create_job (proactive cron seeding)."""
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(f"{_MOD}._cron_create", mock_create):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "heartbeat",
+                    "schedule": "0 9 * * *",
+                    "prompt": "check in",
+                    "enabled_toolsets": ["messaging", "todo"],
+                })
+                assert resp.status == 200
+                call_kwargs = mock_create.call_args[1]
+                assert call_kwargs["enabled_toolsets"] == ["messaging", "todo"]
+
+    @pytest.mark.asyncio
+    async def test_create_job_invalid_enabled_toolsets(self, adapter):
+        """POST /api/jobs with a non-list enabled_toolsets returns 400."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                for bad in ("messaging", {"a": 1}, [1, 2], ["ok", None]):
+                    resp = await cli.post("/api/jobs", json={
+                        "name": "test-job",
+                        "schedule": "*/5 * * * *",
+                        "enabled_toolsets": bad,
+                    })
+                    assert resp.status == 400
+                    data = await resp.json()
+                    assert "enabled_toolsets" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_create_job_with_context_from(self, adapter):
+        """POST /api/jobs forwards context_from to create_job (run-to-run continuity)."""
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(f"{_MOD}._cron_create", mock_create):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "heartbeat",
+                    "schedule": "0 9 * * *",
+                    "prompt": "check in",
+                    "context_from": ["aabbccddeeff"],
+                })
+                assert resp.status == 200
+                assert mock_create.call_args[1]["context_from"] == ["aabbccddeeff"]
+
+                resp = await cli.post("/api/jobs", json={
+                    "name": "heartbeat",
+                    "schedule": "0 9 * * *",
+                    "context_from": "aabbccddeeff",  # bare string form
+                })
+                assert resp.status == 200
+                assert mock_create.call_args[1]["context_from"] == ["aabbccddeeff"]
+
+    @pytest.mark.asyncio
+    async def test_create_job_invalid_context_from(self, adapter):
+        """POST /api/jobs with malformed context_from returns 400."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                for bad in ({"a": 1}, [1, 2], ["not-hex-12ch!"], ["aabbccddeeff11"], "../../etc"):
+                    resp = await cli.post("/api/jobs", json={
+                        "name": "test-job",
+                        "schedule": "*/5 * * * *",
+                        "context_from": bad,
+                    })
+                    assert resp.status == 400
+                    data = await resp.json()
+                    assert "context_from" in data["error"]
+
+    @pytest.mark.asyncio
     async def test_create_job_missing_name(self, adapter):
         """POST /api/jobs without name returns 400."""
         app = _create_app(adapter)
@@ -198,18 +290,18 @@ class TestCreateJob:
 
     @pytest.mark.asyncio
     async def test_create_job_prompt_too_long(self, adapter):
-        """POST /api/jobs with prompt > 5000 chars returns 400."""
+        """POST /api/jobs with prompt > 20000 chars returns 400."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch(f"{_MOD}._CRON_AVAILABLE", True):
                 resp = await cli.post("/api/jobs", json={
                     "name": "test-job",
                     "schedule": "*/5 * * * *",
-                    "prompt": "x" * 5001,
+                    "prompt": "x" * 20001,
                 })
                 assert resp.status == 400
                 data = await resp.json()
-                assert "5000" in data["error"] or "Prompt" in data["error"]
+                assert "20000" in data["error"] or "Prompt" in data["error"]
 
     @pytest.mark.asyncio
     async def test_create_job_invalid_repeat(self, adapter):
@@ -370,6 +462,84 @@ class TestUpdateJob:
                 assert "__proto__" not in sanitized
 
     @pytest.mark.asyncio
+    async def test_update_job_enabled_toolsets(self, adapter):
+        """PATCH /api/jobs/{id} passes enabled_toolsets through; empty list clears to None."""
+        app = _create_app(adapter)
+        mock_update = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"enabled_toolsets": ["messaging", "todo"]},
+                )
+                assert resp.status == 200
+                assert mock_update.call_args[0][1] == {"enabled_toolsets": ["messaging", "todo"]}
+
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"enabled_toolsets": []},
+                )
+                assert resp.status == 200
+                assert mock_update.call_args[0][1] == {"enabled_toolsets": None}
+
+    @pytest.mark.asyncio
+    async def test_update_job_invalid_enabled_toolsets(self, adapter):
+        """PATCH /api/jobs/{id} with a non-list enabled_toolsets returns 400."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"enabled_toolsets": "messaging"},
+                )
+                assert resp.status == 400
+                data = await resp.json()
+                assert "enabled_toolsets" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_update_job_context_from(self, adapter):
+        """PATCH /api/jobs/{id} passes context_from through; empty list clears to None."""
+        app = _create_app(adapter)
+        mock_update = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"context_from": ["aabbccddeeff"]},
+                )
+                assert resp.status == 200
+                assert mock_update.call_args[0][1] == {"context_from": ["aabbccddeeff"]}
+
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"context_from": []},
+                )
+                assert resp.status == 200
+                assert mock_update.call_args[0][1] == {"context_from": None}
+
+    @pytest.mark.asyncio
+    async def test_update_job_invalid_context_from(self, adapter):
+        """PATCH /api/jobs/{id} with malformed context_from returns 400."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"context_from": ["../escape"]},
+                )
+                assert resp.status == 400
+                data = await resp.json()
+                assert "context_from" in data["error"]
+
+    @pytest.mark.asyncio
     async def test_update_job_no_valid_fields(self, adapter):
         """PATCH /api/jobs/{id} with only unknown fields returns 400."""
         app = _create_app(adapter)
@@ -493,6 +663,43 @@ class TestRunJob:
                 data = await resp.json()
                 assert data["job"] == triggered_job
                 mock_trigger.assert_called_once_with(VALID_JOB_ID)
+
+    @pytest.mark.asyncio
+    async def test_run_job_wakes_ticker(self, adapter):
+        """POST /api/jobs/{id}/run wakes the cron ticker so the job runs now."""
+        from cron import scheduler
+
+        app = _create_app(adapter)
+        mock_trigger = MagicMock(return_value=dict(SAMPLE_JOB))
+        scheduler._tick_wake.clear()
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_trigger", mock_trigger
+            ):
+                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+                assert resp.status == 200
+                assert scheduler._tick_wake.is_set()
+        scheduler._tick_wake.clear()
+
+    @pytest.mark.asyncio
+    async def test_run_job_not_found_does_not_wake_ticker(self, adapter):
+        """A failed trigger (unknown job) must not wake the ticker."""
+        from cron import scheduler
+
+        app = _create_app(adapter)
+        mock_trigger = MagicMock(return_value=None)
+        scheduler._tick_wake.clear()
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_trigger", mock_trigger
+            ):
+                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+                assert resp.status == 404
+                assert not scheduler._tick_wake.is_set()
 
 
 # ---------------------------------------------------------------------------

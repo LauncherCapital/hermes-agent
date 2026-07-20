@@ -19396,7 +19396,7 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     image/audio/document cache + expired ``hermes debug share`` pastes
     once per hour.
     """
-    from cron.scheduler import tick as cron_tick
+    from cron.scheduler import tick as cron_tick, wait_for_tick_wake
     from gateway.platforms.base import cleanup_image_cache, cleanup_document_cache
     from hermes_cli.debug import _sweep_expired_pastes
 
@@ -19473,7 +19473,12 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
             except Exception as e:
                 logger.debug("Curator tick error: %s", e)
 
-        stop_event.wait(timeout=interval)
+        # Wake early when request_tick() fires (manual job run) — stop_event
+        # is re-checked by the while condition, and shutdown also sets the
+        # wake event so stopping stays prompt.
+        if stop_event.is_set():
+            break
+        wait_for_tick_wake(timeout=interval)
     logger.info("Cron ticker stopped")
 
 
@@ -19854,8 +19859,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
         return False
     
-    # Stop cron ticker cleanly
+    # Stop cron ticker cleanly (wake it so it notices stop_event promptly)
     cron_stop.set()
+    from cron.scheduler import request_tick as _wake_cron_ticker
+    _wake_cron_ticker()
     cron_thread.join(timeout=5)
 
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).

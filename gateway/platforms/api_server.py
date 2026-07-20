@@ -3069,9 +3069,27 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled", "model", "provider", "enabled_toolsets", "context_from"}
     _MAX_NAME_LENGTH = 200
-    _MAX_PROMPT_LENGTH = 5000
+    _MAX_PROMPT_LENGTH = 20000
+
+    @staticmethod
+    def _validate_context_from(value):
+        """Normalize a context_from payload to a list of job ids (or None).
+
+        Returns (normalized, error). Job ids are 12-char lowercase hex; reject
+        anything else here so a typo fails the API call loudly instead of being
+        silently skipped by _build_job_prompt's runtime guard.
+        """
+        if value is None:
+            return None, None
+        ids = [value] if isinstance(value, str) else value
+        if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+            return None, "context_from must be a job id string or a list of job ids"
+        ids = [i.strip() for i in ids if i.strip()]
+        if any(len(i) != 12 or not all(c in "0123456789abcdef" for c in i) for i in ids):
+            return None, "context_from entries must be 12-char hex job ids"
+        return (ids or None), None
 
     @staticmethod
     def _check_jobs_available() -> Optional["web.Response"]:
@@ -3127,6 +3145,12 @@ class APIServerAdapter(BasePlatformAdapter):
             deliver = body.get("deliver", "local")
             skills = body.get("skills")
             repeat = body.get("repeat")
+            model = (body.get("model") or "").strip() or None
+            provider = (body.get("provider") or "").strip() or None
+            enabled_toolsets = body.get("enabled_toolsets")
+            context_from, ctx_err = self._validate_context_from(body.get("context_from"))
+            if ctx_err:
+                return web.json_response({"error": ctx_err}, status=400)
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -3142,6 +3166,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
+            if enabled_toolsets is not None and (
+                not isinstance(enabled_toolsets, list)
+                or not all(isinstance(t, str) for t in enabled_toolsets)
+            ):
+                return web.json_response(
+                    {"error": "enabled_toolsets must be a list of toolset names"}, status=400,
+                )
 
             kwargs = {
                 "prompt": prompt,
@@ -3154,6 +3185,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            if model:
+                kwargs["model"] = model
+            if provider:
+                kwargs["provider"] = provider
+            if enabled_toolsets:
+                kwargs["enabled_toolsets"] = enabled_toolsets
+            if context_from:
+                kwargs["context_from"] = context_from
 
             job = _cron_create(**kwargs)
             return web.json_response({"job": job})
@@ -3205,6 +3244,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(
                     {"error": f"Prompt must be ≤ {self._MAX_PROMPT_LENGTH} characters"}, status=400,
                 )
+            if "enabled_toolsets" in sanitized:
+                _toolsets = sanitized["enabled_toolsets"]
+                if _toolsets is not None and (
+                    not isinstance(_toolsets, list)
+                    or not all(isinstance(t, str) for t in _toolsets)
+                ):
+                    return web.json_response(
+                        {"error": "enabled_toolsets must be a list of toolset names"}, status=400,
+                    )
+                # Empty list clears the restriction (full default toolset resolution)
+                sanitized["enabled_toolsets"] = _toolsets or None
+            if "context_from" in sanitized:
+                _ctx, ctx_err = self._validate_context_from(sanitized["context_from"])
+                if ctx_err:
+                    return web.json_response({"error": ctx_err}, status=400)
+                # Empty list / empty string clears the reference
+                sanitized["context_from"] = _ctx
             job = _cron_update(job_id, sanitized)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
@@ -3284,6 +3340,13 @@ class APIServerAdapter(BasePlatformAdapter):
             job = _cron_trigger(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
+            # trigger_job only marks the job due (next_run_at=now) — wake the
+            # gateway's cron ticker so "run now" means now, not next tick.
+            try:
+                from cron.scheduler import request_tick
+                request_tick()
+            except Exception:
+                pass  # ticker just picks it up on its regular interval
             return web.json_response({"job": job})
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
