@@ -298,7 +298,7 @@ COPY --chmod=0755 docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
 # every other consumer.
 ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
 RUN mkdir -p /opt/data
-VOLUME [ "/opt/data" ]
+# VOLUME [ "/opt/data" ]   # Railway uses managed Volumes; Dockerfile VOLUME is rejected by the builder
 
 # s6-overlay's /init is PID 1. It sets up the supervision tree, runs
 # /etc/cont-init.d/* (our stage2 hook), starts s6-rc services
@@ -323,4 +323,7 @@ VOLUME [ "/opt/data" ]
 # exit code. Without the wrapper-as-ENTRYPOINT, leading-dash args
 # like `--version` would be intercepted by /init's POSIX shell.
 ENTRYPOINT [ "/init", "/opt/hermes/docker/main-wrapper.sh" ]
-CMD [ ]
+# Run the gateway server (API server + MCP) as the long-running main process.
+# MUST be pure JSON exec-form on its own line: a trailing #comment makes Docker
+# fall back to shell-form, which routes through main-wrapper as `[ ... ]` and crashes.
+CMD ["gateway", "run"]

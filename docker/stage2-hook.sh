@@ -338,6 +338,24 @@ seed_one ".env" ".env.example"
 seed_one "config.yaml" "cli-config.yaml.example"
 seed_one "SOUL.md" "docker/SOUL.md"
 
+# --- Seed Ringo ie-MCP server into config.yaml (first boot / when absent) ---
+# Mirrors the HERMES_AUTH_JSON_BOOTSTRAP pattern: an orchestrator passes the
+# ie-MCP endpoint + a project-scoped key as env, and we register it as an MCP
+# server so the agent can query ie memory. Idempotent: skipped if config.yaml
+# already declares a top-level mcp_servers block.
+if [ -n "${RINGO_IE_MCP_URL:-}" ] && [ -n "${RINGO_IE_MCP_KEY:-}" ] &&         [ -f "$HERMES_HOME/config.yaml" ] &&         ! grep -qE '^mcp_servers:' "$HERMES_HOME/config.yaml" 2>/dev/null; then
+    echo "[stage2] Registering Ringo ie-MCP server in config.yaml"
+    as_hermes sh -c "cat >> '$HERMES_HOME/config.yaml'" <<EOF
+
+# Auto-registered by the orchestrator (Ringo ie-MCP). Controlled by RINGO_IE_MCP_* env.
+mcp_servers:
+  ringo_ie:
+    url: "${RINGO_IE_MCP_URL}"
+    headers:
+      Authorization: "Bearer ${RINGO_IE_MCP_KEY}"
+EOF
+fi
+
 # .env holds API keys and secrets — restrict to owner-only access. Applied
 # unconditionally (not only on first-seed) so a host-mounted .env that was
 # created with a permissive umask gets tightened on every container start.
