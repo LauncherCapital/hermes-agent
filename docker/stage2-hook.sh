@@ -338,22 +338,17 @@ seed_one ".env" ".env.example"
 seed_one "config.yaml" "cli-config.yaml.example"
 seed_one "SOUL.md" "docker/SOUL.md"
 
-# --- Seed Ringo ie-MCP server into config.yaml (first boot / when absent) ---
-# Mirrors the HERMES_AUTH_JSON_BOOTSTRAP pattern: an orchestrator passes the
-# ie-MCP endpoint + a project-scoped key as env, and we register it as an MCP
-# server so the agent can query ie memory. Idempotent: skipped if config.yaml
-# already declares a top-level mcp_servers block.
-if [ -n "${RINGO_IE_MCP_URL:-}" ] && [ -n "${RINGO_IE_MCP_KEY:-}" ] &&         [ -f "$HERMES_HOME/config.yaml" ] &&         ! grep -qE '^mcp_servers:' "$HERMES_HOME/config.yaml" 2>/dev/null; then
-    echo "[stage2] Registering Ringo ie-MCP server in config.yaml"
-    as_hermes sh -c "cat >> '$HERMES_HOME/config.yaml'" <<EOF
-
-# Auto-registered by the orchestrator (Ringo ie-MCP). Controlled by RINGO_IE_MCP_* env.
-mcp_servers:
-  ringo_ie:
-    url: "${RINGO_IE_MCP_URL}"
-    headers:
-      Authorization: "Bearer ${RINGO_IE_MCP_KEY}"
-EOF
+# --- Ringo bootstrap (ie-centralized: register ie-MCP + sync ie skills) ---
+# ALL ringo boot logic lives in the orchestrator (ie); we fetch and run it here, so
+# this fork carries only a generic shim and never needs ringo-specific changes again.
+# No agent loop, idempotent, best-effort (a failure never blocks boot). ie is already
+# the TCB that provisions this instance, so running its boot script adds no trust.
+if [ -n "${RINGO_IE_MCP_URL:-}" ] && [ -n "${RINGO_IE_MCP_KEY:-}" ]; then
+    echo "[stage2] Running Ringo ie bootstrap (ie-MCP + skills)"
+    curl -fsS "${RINGO_IE_MCP_URL%/mcp}/api/v1/agent/bootstrap" \
+        -H "Authorization: Bearer ${RINGO_IE_MCP_KEY}" \
+        | as_hermes "$INSTALL_DIR/.venv/bin/python" - \
+        || echo "[stage2] Warning: ringo bootstrap skipped; continuing"
 fi
 
 # .env holds API keys and secrets — restrict to owner-only access. Applied
