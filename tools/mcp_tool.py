@@ -3333,6 +3333,14 @@ def _forget_mcp_tool_server(tool_name: str) -> None:
         _mcp_tool_server_names.pop(tool_name, None)
 
 
+def mcp_tool_server_name(tool_name: str) -> Optional[str]:
+    """Return the MCP server that registered *tool_name*, or None for built-in
+    / plugin tools. Used to attribute a schema-quarantined tool to its server
+    so the dashboard can flag the right integration."""
+    with _lock:
+        return _mcp_tool_server_names.get(tool_name)
+
+
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
     """Select utility schemas based on config and server capabilities."""
     tools_filter = config.get("tools") or {}

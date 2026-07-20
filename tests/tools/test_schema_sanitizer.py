@@ -634,3 +634,72 @@ def test_strip_slash_enum_ignores_non_string_enum_values():
     props = tools[0]["function"]["parameters"]["properties"]
     assert props["level"]["enum"] == [1, 2, 3]
     assert props["flag"]["enum"] == [True, False]
+
+
+def test_dependent_required_property_names_preserved():
+    """``dependentRequired`` maps a property to an ARRAY OF PROPERTY-NAME
+    STRINGS (draft 2019-09/2020-12), not schemas. GitHub's MCP
+    ``search_issues`` ships ``{"owner": ["repo"], "repo": ["owner"]}``.
+    Recursing into it mis-read the strings as bare-string schemas and
+    replaced them with ``{"type": "object"}`` — corrupting the schema into
+    one Anthropic rejects ("must match JSON Schema draft 2020-12"). The
+    keyword must pass through untouched.
+    """
+    tools = [_tool("search_issues", {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "owner": {"type": "string"},
+            "repo": {"type": "string"},
+        },
+        "required": ["query"],
+        "dependentRequired": {"owner": ["repo"], "repo": ["owner"]},
+    })]
+    out = sanitize_tool_schemas(tools)
+    assert out[0]["function"]["parameters"]["dependentRequired"] == {
+        "owner": ["repo"],
+        "repo": ["owner"],
+    }
+
+
+def test_dependent_schemas_still_recurses():
+    """Sibling keyword ``dependentSchemas`` DOES hold schemas — a bare
+    ``{"type": "object"}`` inside it must still gain ``properties: {}``."""
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {"a": {"type": "string"}},
+        "dependentSchemas": {"a": {"type": "object"}},
+    })]
+    out = sanitize_tool_schemas(tools)
+    assert out[0]["function"]["parameters"]["dependentSchemas"]["a"] == {
+        "type": "object",
+        "properties": {},
+    }
+
+
+def test_default_list_of_strings_not_mangled():
+    """``default`` holds a literal INSTANCE value, not a schema. A list-valued
+    default (``["web","image"]``) must pass through — recursing turned each
+    string into ``{"type":"object"}``, corrupting the schema Anthropic-side."""
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "searchType": {"type": "string", "default": ["web", "image"]},
+        },
+    })]
+    out = sanitize_tool_schemas(tools)
+    assert out[0]["function"]["parameters"]["properties"]["searchType"]["default"] == ["web", "image"]
+
+
+def test_const_list_and_nested_default_not_mangled():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "k": {"const": ["a", "b"]},
+            "cfg": {"type": "object", "default": {"tags": ["x", "y"]}},
+        },
+    })]
+    out = sanitize_tool_schemas(tools)
+    props = out[0]["function"]["parameters"]["properties"]
+    assert props["k"]["const"] == ["a", "b"]
+    assert props["cfg"]["default"] == {"tags": ["x", "y"]}

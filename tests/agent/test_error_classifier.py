@@ -63,6 +63,7 @@ class TestFailoverReason:
             "thinking_signature", "long_context_tier",
             "oauth_long_context_beta_forbidden",
             "llama_cpp_grammar_pattern",
+            "invalid_tool_schema",
             "unknown",
         }
         actual = {r.value for r in FailoverReason}
@@ -742,6 +743,35 @@ class TestClassifyApiError:
         e = MockAPIError("error parsing grammar", status_code=500)
         result = classify_api_error(e, provider="openai-compatible")
         assert result.reason != FailoverReason.llama_cpp_grammar_pattern
+
+    # ── Provider-specific: invalid tool input_schema ──
+
+    def test_invalid_tool_schema_anthropic(self):
+        """Anthropic rejects one tool's input_schema — drop it and retry."""
+        e = MockAPIError(
+            "tools.53.custom.input_schema: JSON schema is invalid. It must "
+            "match JSON Schema draft 2020-12 (https://json-schema.org/draft/2020-12).",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="openai-compatible")
+        assert result.reason == FailoverReason.invalid_tool_schema
+        assert result.retryable is True
+        assert result.should_compress is False
+
+    def test_invalid_tool_schema_requires_400(self):
+        """Same phrase at 500 isn't the invalid-tool-schema case."""
+        e = MockAPIError(
+            "tools.0.custom.input_schema: JSON schema is invalid", status_code=500
+        )
+        result = classify_api_error(e, provider="openai-compatible")
+        assert result.reason != FailoverReason.invalid_tool_schema
+
+    def test_invalid_tool_schema_not_matched_without_schema_phrase(self):
+        """A generic 400 mentioning tools but not a schema-invalid verdict
+        must not be misrouted to the drop-a-tool path."""
+        e = MockAPIError("tools: Tool names must be unique.", status_code=400)
+        result = classify_api_error(e, provider="openai-compatible")
+        assert result.reason != FailoverReason.invalid_tool_schema
 
     # ── Provider-specific: Anthropic long-context tier ──
 

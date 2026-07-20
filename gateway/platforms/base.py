@@ -1443,6 +1443,14 @@ class MessageEvent:
     # Reply context
     reply_to_message_id: Optional[str] = None
     reply_to_text: Optional[str] = None  # Text of the replied-to message (for context injection)
+
+    # Prior thread messages as role-tagged turns ({"role","content"}: bot→
+    # assistant, others→user), oldest first. Set by adapters on the first turn
+    # in a thread; gateway.run seeds them into the session transcript once (when
+    # history is empty) so the agent replies with full thread awareness —
+    # including its own proactive/cron root post — and replays them natively on
+    # later turns instead of relying on a flattened text prepend.
+    thread_bootstrap: Optional[List[Dict[str, str]]] = None
     
     # Auto-loaded skill(s) for topic/channel bindings (e.g., Telegram DM Topics,
     # Discord channel_skill_bindings).  A single name or ordered list.
