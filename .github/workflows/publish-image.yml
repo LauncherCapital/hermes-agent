@@ -21,7 +21,7 @@ jobs:
           uv python install 3.11
           uv venv .venv --python 3.11
           source .venv/bin/activate
-          uv pip install -e ".[dev]"
+          uv pip install -e ".[dev,slack]"
       - name: Verify message-gateway release contracts
         env:
           OPENROUTER_API_KEY: ""
