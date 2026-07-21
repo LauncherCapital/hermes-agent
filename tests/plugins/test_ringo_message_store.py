@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import time
 import uuid
@@ -14,6 +15,15 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from gateway.event_ingress import write_project_marker
 from hermes_cli.plugins import PluginManager
+
+
+@pytest.fixture(autouse=True)
+def _database_keyring(monkeypatch):
+    monkeypatch.setenv(
+        "RINGO_MESSAGE_STORE_DB_KEYS",
+        json.dumps({"1": "11" * 32}),
+    )
+    monkeypatch.setenv("RINGO_MESSAGE_STORE_DB_KEY_VERSION", "1")
 
 
 def _load_service() -> tuple[PluginManager, object]:
@@ -90,7 +100,13 @@ async def test_claim_initializes_schema_key_and_idempotent_delivery(tmp_path, mo
     private_path = tmp_path / "state/keys/message-store-v1.pem"
     assert db_path.exists()
     assert private_path.exists()
-    with sqlite3.connect(db_path) as conn:
+    assert db_path.read_bytes()[:16] != b"SQLite format 3\x00"
+    with pytest.raises(sqlite3.DatabaseError):
+        with sqlite3.connect(db_path) as plain:
+            plain.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    store = module._store()
+    assert store is not None
+    with store._connect() as conn:
         tables = {
             row[0]
             for row in conn.execute(
@@ -122,6 +138,10 @@ async def test_claim_initializes_schema_key_and_idempotent_delivery(tmp_path, mo
     assert {
         "schema_version",
         "key_version",
+        "storage_encryption",
+        "database_key_version",
+        "encryption_integrity",
+        "cipher_version",
         "journal_mode",
         "db_bytes",
         "wal_bytes",
@@ -130,6 +150,9 @@ async def test_claim_initializes_schema_key_and_idempotent_delivery(tmp_path, mo
         "coverage_states",
         "collection_states",
     } <= set(health)
+    assert health["storage_encryption"] == "sqlcipher"
+    assert health["database_key_version"] == 1
+    assert health["encryption_integrity"] == "ok"
 
 
 def test_retention_removes_expired_messages_reactions_and_deliveries(
@@ -143,7 +166,7 @@ def test_retention_removes_expired_messages_reactions_and_deliveries(
     now = datetime.now(timezone.utc)
     expired_message_at = (now - timedelta(days=31)).isoformat()
     expired_delivery_at = (now - timedelta(days=8)).isoformat()
-    with sqlite3.connect(store.path) as conn:
+    with store._connect() as conn:
         conn.execute(
             "INSERT INTO deliveries VALUES (?, ?, NULL, ?, ?, ?)",
             ("old-delivery", 1, "hash", expired_delivery_at, expired_delivery_at),
@@ -181,6 +204,76 @@ def test_newer_sqlite_schema_fails_closed(tmp_path, monkeypatch):
     loaded = manager._plugins["ringo-message-store"]
     assert loaded.enabled is False
     assert "newer than supported" in (loaded.error or "")
+
+
+def test_plaintext_store_is_migrated_without_data_loss(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    db_path = tmp_path / "state/message_store.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE legacy_fixture(value TEXT NOT NULL)")
+        conn.execute("INSERT INTO legacy_fixture VALUES ('preserved')")
+
+    _manager, module = _load_service()
+    store = module._store()
+    assert store is not None
+
+    assert db_path.read_bytes()[:16] != b"SQLite format 3\x00"
+    assert not db_path.with_name(db_path.name + "-wal").exists()
+    assert not db_path.with_name(db_path.name + "-shm").exists()
+    with store._connect() as conn:
+        assert conn.execute("SELECT value FROM legacy_fixture").fetchone()[0] == "preserved"
+    assert store.health()["encryption_migration"] == "migrated"
+
+
+def test_encrypted_store_fails_closed_without_matching_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    db_path = tmp_path / "state/message_store.db"
+    module.MessageStore(project_id, path=db_path)
+
+    monkeypatch.setenv("RINGO_MESSAGE_STORE_DB_KEYS", json.dumps({"2": "22" * 32}))
+    monkeypatch.setenv("RINGO_MESSAGE_STORE_DB_KEY_VERSION", "2")
+    with pytest.raises(RuntimeError, match="cannot be opened"):
+        module.MessageStore(project_id, path=db_path)
+
+
+def test_database_key_rotation_and_old_volume_restore(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    db_path = tmp_path / "state/message_store.db"
+    original = module.MessageStore(project_id, path=db_path)
+    original.record_envelope(
+        {"project_id": project_id, "delivery_id": "d1", "sequence": 1},
+        "hash-1",
+    )
+    with original._connect() as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+    restored_path = tmp_path / "state/restored-message-store.db"
+    shutil.copy2(db_path, restored_path)
+
+    keyring = {"1": "11" * 32, "2": "22" * 32}
+    monkeypatch.setenv("RINGO_MESSAGE_STORE_DB_KEYS", json.dumps(keyring))
+    monkeypatch.setenv("RINGO_MESSAGE_STORE_DB_KEY_VERSION", "2")
+    rotated = module.MessageStore(project_id, path=db_path)
+    restored = module.MessageStore(project_id, path=restored_path)
+
+    assert rotated.health()["encryption_migration"] == "rekeyed"
+    assert restored.health()["encryption_migration"] == "rekeyed"
+    assert rotated.health()["last_sequence"] == 1
+    assert restored.health()["last_sequence"] == 1
+
+    monkeypatch.setenv("RINGO_MESSAGE_STORE_DB_KEYS", json.dumps({"1": "11" * 32}))
+    monkeypatch.setenv("RINGO_MESSAGE_STORE_DB_KEY_VERSION", "1")
+    with pytest.raises(RuntimeError, match="cannot be opened"):
+        module.MessageStore(project_id, path=db_path)
 
 
 def test_private_key_recovery_copy_is_hybrid_encrypted_locally(tmp_path, monkeypatch):
@@ -463,7 +556,7 @@ def test_normalized_events_share_one_apply_path_and_tombstone_wins(
             f"hash-{sequence}",
         )
 
-    with sqlite3.connect(store.path) as conn:
+    with store._connect() as conn:
         message = conn.execute(
             "SELECT text, deleted_at, provider_version FROM messages"
         ).fetchone()
@@ -522,11 +615,11 @@ def test_reaction_tombstone_rejects_stale_add(tmp_path, monkeypatch):
             f"hash-{sequence}",
         )
 
-    with sqlite3.connect(store.path) as conn:
+    with store._connect() as conn:
         reaction = conn.execute(
             "SELECT occurred_at, deleted_at FROM reactions WHERE reaction_name = 'eyes'"
         ).fetchone()
-    assert reaction == (
+    assert tuple(reaction) == (
         "2026-07-21T00:00:05+00:00",
         "2026-07-21T00:00:05+00:00",
     )
@@ -572,7 +665,7 @@ def test_workspace_purge_removes_only_target_partition(tmp_path, monkeypatch):
         "hash-purge-T1",
     )
 
-    with sqlite3.connect(store.path) as conn:
+    with store._connect() as conn:
         rows = conn.execute(
             "SELECT workspace_id, text FROM messages ORDER BY workspace_id"
         ).fetchall()
@@ -580,8 +673,8 @@ def test_workspace_purge_removes_only_target_partition(tmp_path, monkeypatch):
             "SELECT workspace_id FROM coverage ORDER BY workspace_id"
         ).fetchall()
     assert result["status"] == "accepted"
-    assert rows == [("T2", "T2")]
-    assert coverage == [("T2",)]
+    assert [tuple(row) for row in rows] == [("T2", "T2")]
+    assert [tuple(row) for row in coverage] == [("T2",)]
 
 
 def test_reconciliation_repairs_delete_and_reaction_drift(tmp_path, monkeypatch):
@@ -657,7 +750,7 @@ def test_reconciliation_repairs_delete_and_reaction_drift(tmp_path, monkeypatch)
             f"hash-r{sequence}",
         )
 
-    with sqlite3.connect(store.path) as conn:
+    with store._connect() as conn:
         messages = dict(
             conn.execute(
                 "SELECT provider_message_id, deleted_at FROM messages"
@@ -791,7 +884,7 @@ def test_ingest_window_uses_stable_changed_at_cursor(tmp_path, monkeypatch):
     write_project_marker(project_id)
     _manager, module = _load_service()
     store = module.MessageStore(project_id)
-    with sqlite3.connect(store.path) as conn:
+    with store._connect() as conn:
         for index, changed_at in enumerate(
             (
                 "2026-07-21T00:03:00+00:00",
@@ -858,7 +951,7 @@ def test_reaction_advances_message_change_feed_time(tmp_path, monkeypatch):
         },
         "hash-message",
     )
-    with sqlite3.connect(store.path) as conn:
+    with store._connect() as conn:
         before = conn.execute(
             "SELECT updated_at FROM messages WHERE provider_message_id='M1'"
         ).fetchone()[0]
@@ -877,7 +970,7 @@ def test_reaction_advances_message_change_feed_time(tmp_path, monkeypatch):
         },
         "hash-reaction",
     )
-    with sqlite3.connect(store.path) as conn:
+    with store._connect() as conn:
         after = conn.execute(
             "SELECT updated_at FROM messages WHERE provider_message_id='M1'"
         ).fetchone()[0]
@@ -929,7 +1022,7 @@ def test_project_local_query_p95_is_below_200ms_on_pilot_fixture(
                 occurred_at,
             )
         )
-    with sqlite3.connect(store.path) as conn:
+    with store._connect() as conn:
         conn.executemany(
             "INSERT INTO messages(project_id, provider, workspace_id, "
             "conversation_id, provider_message_id, sender_id, text, "
