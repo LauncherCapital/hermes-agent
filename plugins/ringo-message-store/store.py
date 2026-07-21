@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import json
 import os
-import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -15,6 +14,7 @@ from typing import Any
 from hermes_constants import get_hermes_home
 
 from .crypto import KEY_VERSION, ensure_project_encryption_key
+from .database import EncryptedDatabase
 
 
 logger = logging.getLogger(__name__)
@@ -184,23 +184,20 @@ class MessageStore:
         self._writer_lock = threading.RLock()
         self._last_retention_at = 0.0
         self.journal_mode = "unknown"
+        self.database = EncryptedDatabase(self.path)
+        self.database.prepare()
         ensure_project_encryption_key(self.project_id, self.key_version)
         self._migrate()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=5.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        return conn
+    def _connect(self):
+        return self.database.connect()
 
     def _migrate(self) -> None:
         with self._writer_lock, self._connect() as conn:
             try:
                 mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
                 self.journal_mode = str(mode).lower()
-            except sqlite3.DatabaseError:
+            except Exception:
                 self.journal_mode = "delete"
                 conn.execute("PRAGMA journal_mode=DELETE")
             current_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
@@ -227,6 +224,11 @@ class MessageStore:
                 "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (str(SCHEMA_VERSION),),
+            )
+            conn.execute(
+                "INSERT INTO schema_meta(key, value) VALUES ('database_key_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(self.database.active_key_version),),
             )
         try:
             os.chmod(self.path, 0o600)
@@ -320,7 +322,7 @@ class MessageStore:
 
     def _apply_normalized_event(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         event: dict[str, Any],
         applied_at: str,
     ) -> None:
@@ -372,7 +374,7 @@ class MessageStore:
 
     def _apply_workspace_purge(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         provider: str,
         workspace_id: str,
     ) -> None:
@@ -403,7 +405,7 @@ class MessageStore:
 
     def _apply_message(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         event: dict[str, Any],
         applied_at: str,
     ) -> None:
@@ -474,7 +476,7 @@ class MessageStore:
 
     def _sync_snapshot_reactions(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         event: dict[str, Any],
     ) -> None:
         snapshot_at = str(event.get("reconciled_at") or event.get("occurred_at") or "")
@@ -546,7 +548,7 @@ class MessageStore:
 
     def _apply_reconciliation_started(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         event: dict[str, Any],
         applied_at: str,
     ) -> None:
@@ -571,7 +573,7 @@ class MessageStore:
 
     def _apply_reconciliation_completed(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         event: dict[str, Any],
         applied_at: str,
     ) -> None:
@@ -639,7 +641,7 @@ class MessageStore:
 
     def _apply_coverage_completed(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         event: dict[str, Any],
         applied_at: str,
     ) -> None:
@@ -848,30 +850,64 @@ class MessageStore:
             )
             params.append(limit * 10 if operation == "recent_activity" else limit)
             rows = conn.execute(sql, params).fetchall()
-            messages: list[dict[str, Any]] = []
+            selected_rows = []
             per_counts: dict[str, int] = {}
             for row in rows:
                 conversation_id = str(row["conversation_id"])
                 count = per_counts.get(conversation_id, 0)
                 if operation == "recent_activity" and count >= per_conversation:
                     continue
-                reactions = conn.execute(
-                    "SELECT reaction_name, actor_id FROM reactions WHERE project_id=? "
-                    "AND provider=? AND workspace_id=? AND conversation_id=? AND "
-                    "provider_message_id=? AND deleted_at IS NULL",
-                    (
-                        self.project_id,
-                        row["provider"],
-                        row["workspace_id"],
-                        conversation_id,
-                        row["provider_message_id"],
-                    ),
+                selected_rows.append(row)
+                per_counts[conversation_id] = count + 1
+                if len(selected_rows) >= limit:
+                    break
+
+            selected_keys = {
+                (
+                    str(row["provider"]),
+                    str(row["workspace_id"]),
+                    str(row["conversation_id"]),
+                    str(row["provider_message_id"]),
+                )
+                for row in selected_rows
+            }
+            reactions_by_message: dict[
+                tuple[str, str, str, str], dict[str, list[str]]
+            ] = {}
+            message_ids = sorted({key[3] for key in selected_keys})
+            if message_ids:
+                reaction_rows = conn.execute(
+                    "SELECT provider, workspace_id, conversation_id, "
+                    "provider_message_id, reaction_name, actor_id FROM reactions "
+                    "WHERE project_id=? AND deleted_at IS NULL AND "
+                    f"provider_message_id IN ({','.join('?' for _ in message_ids)})",
+                    [self.project_id, *message_ids],
                 ).fetchall()
-                reaction_map: dict[str, list[str]] = {}
-                for reaction in reactions:
-                    reaction_map.setdefault(reaction["reaction_name"], []).append(
-                        reaction["actor_id"]
+                for reaction in reaction_rows:
+                    key = (
+                        str(reaction["provider"]),
+                        str(reaction["workspace_id"]),
+                        str(reaction["conversation_id"]),
+                        str(reaction["provider_message_id"]),
                     )
+                    if key not in selected_keys:
+                        continue
+                    reactions_by_message.setdefault(key, {}).setdefault(
+                        str(reaction["reaction_name"]), []
+                    ).append(str(reaction["actor_id"]))
+
+            messages: list[dict[str, Any]] = []
+            for row in selected_rows:
+                conversation_id = str(row["conversation_id"])
+                reaction_map = reactions_by_message.get(
+                    (
+                        str(row["provider"]),
+                        str(row["workspace_id"]),
+                        conversation_id,
+                        str(row["provider_message_id"]),
+                    ),
+                    {},
+                )
                 try:
                     provider_payload = json.loads(row["provider_payload_json"] or "{}")
                 except json.JSONDecodeError:
@@ -897,9 +933,6 @@ class MessageStore:
                         ],
                     }
                 )
-                per_counts[conversation_id] = count + 1
-                if len(messages) >= limit:
-                    break
             floor = max(str(row["contiguous_since"]) for row in coverage_rows)
             result = {
                 "messages": messages,
@@ -957,7 +990,7 @@ class MessageStore:
 
     def _apply_reaction(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         event: dict[str, Any],
         applied_at: str,
     ) -> None:
@@ -1010,7 +1043,7 @@ class MessageStore:
         )
 
     def _apply_conversation(
-        self, conn: sqlite3.Connection, event: dict[str, Any], applied_at: str
+        self, conn: Any, event: dict[str, Any], applied_at: str
     ) -> None:
         conversation_id = str(event.get("conversation_id") or "")
         if not conversation_id:
@@ -1060,7 +1093,7 @@ class MessageStore:
         )
 
     def _apply_identity(
-        self, conn: sqlite3.Connection, event: dict[str, Any], applied_at: str
+        self, conn: Any, event: dict[str, Any], applied_at: str
     ) -> None:
         external_user_id = str(event.get("external_user_id") or "")
         if not external_user_id:
@@ -1090,7 +1123,7 @@ class MessageStore:
         )
 
     def _apply_membership(
-        self, conn: sqlite3.Connection, event: dict[str, Any], applied_at: str
+        self, conn: Any, event: dict[str, Any], applied_at: str
     ) -> None:
         conversation_id = str(event.get("conversation_id") or "")
         external_user_id = str(event.get("external_user_id") or "")
@@ -1182,6 +1215,12 @@ class MessageStore:
             "project_id": self.project_id,
             "schema_version": SCHEMA_VERSION,
             "key_version": self.key_version,
+            "storage_encryption": "sqlcipher",
+            "database_key_version": self.database.active_key_version,
+            "database_key_opened_version": self.database.opened_key_version,
+            "encryption_migration": self.database.migration_status,
+            "encryption_integrity": self.database.integrity_status,
+            "cipher_version": self.database.cipher_version,
             "journal_mode": self.journal_mode,
             "db_bytes": self.path.stat().st_size if self.path.exists() else 0,
             "wal_bytes": wal.stat().st_size if wal.exists() else 0,
