@@ -411,6 +411,18 @@ class ResponseStore:
                     exc_info=True,
                 )
 
+    def _next_access_time(self) -> float:
+        """Return an LRU timestamp that is strictly newer than stored rows.
+
+        Some Windows clocks return the same ``time.time()`` value for several
+        adjacent SQLite operations.  A strict increment keeps eviction order
+        deterministic without changing the persisted schema.
+        """
+        latest = self._conn.execute(
+            "SELECT COALESCE(MAX(accessed_at), 0) FROM responses"
+        ).fetchone()[0]
+        return max(time.time(), float(latest) + 0.000001)
+
     def get(self, response_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a stored response by ID (updates access time for LRU)."""
         row = self._conn.execute(
@@ -420,7 +432,7 @@ class ResponseStore:
             return None
         self._conn.execute(
             "UPDATE responses SET accessed_at = ? WHERE response_id = ?",
-            (time.time(), response_id),
+            (self._next_access_time(), response_id),
         )
         self._conn.commit()
         try:
@@ -441,7 +453,7 @@ class ResponseStore:
         """Store a response, evicting the oldest if at capacity."""
         self._conn.execute(
             "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
-            (response_id, json.dumps(data, default=str), time.time()),
+            (response_id, json.dumps(data, default=str), self._next_access_time()),
         )
         # Evict oldest entries beyond max_size
         count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
@@ -730,6 +742,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._event_replay_guard: Optional[Any] = None
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -1046,6 +1059,17 @@ class APIServerAdapter(BasePlatformAdapter):
         from gateway.status import read_runtime_status
 
         runtime = read_runtime_status() or {}
+        plugin_health = []
+        try:
+            from hermes_cli.plugins import invoke_hook
+
+            plugin_health = [
+                result
+                for result in invoke_hook("health_report")
+                if isinstance(result, dict)
+            ]
+        except Exception:
+            logger.debug("plugin health collection failed", exc_info=True)
         return web.json_response({
             "status": "ok",
             "platform": "hermes-agent",
@@ -1055,7 +1079,178 @@ class APIServerAdapter(BasePlatformAdapter):
             "exit_reason": runtime.get("exit_reason"),
             "updated_at": runtime.get("updated_at"),
             "pid": os.getpid(),
+            "components": plugin_health,
         })
+
+    async def _handle_events(self, request: "web.Request") -> "web.Response":
+        """POST /v1/events — signed, project-bound plugin event dispatch."""
+        from gateway.event_ingress import (
+            EventIngressError,
+            EventReplayGuard,
+            verify_event_request,
+        )
+
+        try:
+            verified = verify_event_request(await request.read(), request.headers)
+        except EventIngressError as exc:
+            return web.json_response(
+                {"error": {"code": exc.code, "message": str(exc)}},
+                status=exc.status,
+            )
+        if self._event_replay_guard is None:
+            self._event_replay_guard = EventReplayGuard()
+        guard = self._event_replay_guard
+        replay_status = guard.reserve(verified.delivery_id, verified.body_sha256)
+        if replay_status == "duplicate":
+            return web.json_response(
+                {
+                    "ok": True,
+                    "delivery_id": verified.delivery_id,
+                    "replayed": True,
+                }
+            )
+        if replay_status == "conflict":
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "replay_conflict",
+                        "message": "delivery_id was already used for different content",
+                    }
+                },
+                status=409,
+            )
+        try:
+            from hermes_cli.plugins import invoke_hook_async
+
+            results = await invoke_hook_async(
+                "ingress_event",
+                event=verified.envelope,
+                delivery_id=verified.delivery_id,
+                project_id=verified.project_id,
+                body_sha256=verified.body_sha256,
+            )
+            accepted = [result for result in results if isinstance(result, dict)]
+            if not accepted:
+                guard.release(verified.delivery_id, verified.body_sha256)
+                return web.json_response(
+                    {
+                        "error": {
+                            "code": "event_handler_unavailable",
+                            "message": "no plugin accepted the event",
+                        }
+                    },
+                    status=503,
+                )
+            gap = next(
+                (result for result in accepted if result.get("status") == "gap_detected"),
+                None,
+            )
+            if gap is not None:
+                guard.release(verified.delivery_id, verified.body_sha256)
+                return web.json_response(
+                    {
+                        "error": {
+                            "code": "delivery_gap",
+                            "message": "an earlier delivery sequence is missing",
+                            "expected_sequence": gap.get("expected_sequence"),
+                        }
+                    },
+                    status=409,
+                )
+            conflict = next(
+                (result for result in accepted if result.get("status") == "conflict"),
+                None,
+            )
+            if conflict is not None:
+                return web.json_response(
+                    {
+                        "error": {
+                            "code": conflict.get("code") or "delivery_conflict",
+                            "message": "delivery could not be applied safely",
+                        }
+                    },
+                    status=409,
+                )
+            return web.json_response(
+                {
+                    "ok": True,
+                    "delivery_id": verified.delivery_id,
+                    "results": accepted,
+                }
+            )
+        except Exception:
+            guard.release(verified.delivery_id, verified.body_sha256)
+            logger.exception("signed event dispatch failed")
+            return web.json_response(
+                {"error": {"code": "event_dispatch_failed", "message": "event dispatch failed"}},
+                status=500,
+            )
+
+    async def _handle_message_store_query(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /v1/message-store/query -- authenticated project-local read.
+
+        The caller is the control plane, which has already resolved the current
+        principal ACL.  Plugins may only narrow the supplied source set.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "invalid_json",
+                        "message": "request body must be a JSON object",
+                    }
+                },
+                status=400,
+            )
+        if not isinstance(body, dict):
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "invalid_request",
+                        "message": "request body must be a JSON object",
+                    }
+                },
+                status=400,
+            )
+        try:
+            from hermes_cli.plugins import invoke_hook_async
+
+            results = await invoke_hook_async("message_store_query", request=body)
+            accepted = [result for result in results if isinstance(result, dict)]
+            if not accepted:
+                return web.json_response(
+                    {
+                        "error": {
+                            "code": "message_store_unavailable",
+                            "message": "project message store is unavailable",
+                        }
+                    },
+                    status=503,
+                )
+            return web.json_response(accepted[0])
+        except ValueError as exc:
+            return web.json_response(
+                {"error": {"code": "invalid_query", "message": str(exc)}},
+                status=400,
+            )
+        except Exception:
+            logger.exception("project message store query failed")
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "message_store_query_failed",
+                        "message": "project message store query failed",
+                    }
+                },
+                status=500,
+            )
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
@@ -1399,7 +1594,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if not isinstance(body, dict):
             return web.json_response(_openai_error("Body must be a JSON object"), status=400)
 
-        allowed = {"model", "agent", "mcp_servers", "toolsets", "web", "env"}
+        allowed = {"model", "agent", "mcp_servers", "toolsets", "web", "env", "project"}
         unknown = set(body) - allowed
         if unknown:
             return web.json_response(
@@ -1542,6 +1737,32 @@ class APIServerAdapter(BasePlatformAdapter):
                 reload_env()
                 applied["env"] = sorted(env_spec.keys())
 
+            project_spec = body.get("project")
+            if isinstance(project_spec, dict):
+                from gateway.event_ingress import write_project_marker
+                from hermes_cli.plugins import invoke_hook_async
+
+                marker = write_project_marker(
+                    str(project_spec.get("id") or ""),
+                    event_verifiers=(
+                        project_spec.get("event_verifiers")
+                        if isinstance(project_spec.get("event_verifiers"), dict)
+                        else None
+                    ),
+                    recovery_public_keys=(
+                        project_spec.get("recovery_public_keys")
+                        if isinstance(project_spec.get("recovery_public_keys"), dict)
+                        else None
+                    ),
+                    active_key_version=project_spec.get("active_key_version"),
+                )
+                await invoke_hook_async(
+                    "project_claimed",
+                    project_id=marker["project_id"],
+                    active_key_version=marker.get("active_key_version", 1),
+                )
+                applied["project"] = marker["project_id"]
+
             if mcp_changed:
                 removed_or_updated = mcp_changed and (
                     set(applied.get("mcp_removed", []))
@@ -1559,6 +1780,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     tools = await loop.run_in_executor(None, discover_mcp_tools)
                     applied["mcp"] = {"added": sorted(mcp_added), "tool_count": len(tools)}
         except ValueError as exc:
+            try:
+                from gateway.event_ingress import EventIngressError
+
+                if isinstance(exc, EventIngressError):
+                    return web.json_response(
+                        {"error": {"code": exc.code, "message": str(exc)}},
+                        status=exc.status,
+                    )
+            except ImportError:
+                pass
             return web.json_response(_openai_error(str(exc)), status=400)
         except Exception:
             logger.exception("POST /admin/config failed")
@@ -3887,7 +4118,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # built per request, so this list is scoped to THIS run — surface it
             # so the dashboard activity feed can show "skipped tool X".
             _dropped = getattr(agent, "_dropped_tools_run", None)
-            if _dropped:
+            if isinstance(_dropped, list) and _dropped:
                 result["dropped_tools"] = _dropped
             return result, usage
 
@@ -4505,6 +4736,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_post("/v1/events", self._handle_events)
+            self._app.router.add_post(
+                "/v1/message-store/query", self._handle_message_store_query
+            )
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
             # MCP admin surface (external orchestrator: observe + apply, no restart)

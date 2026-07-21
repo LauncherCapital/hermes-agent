@@ -199,7 +199,7 @@ if [ "$needs_chown" = true ]; then
     # Hermes-owned subdirs: recursive chown is safe here because these are
     # created and managed exclusively by hermes (see the s6-setuidgid mkdir
     # -p block below for the canonical list).
-    for sub in cron sessions logs hooks memories skills skins plans workspace home profiles pairing platforms/pairing; do
+    for sub in cron sessions logs hooks memories skills skins plans state workspace home profiles pairing platforms/pairing; do
         if [ -e "$HERMES_HOME/$sub" ]; then
             chown -R hermes:hermes "$HERMES_HOME/$sub" 2>/dev/null || \
                 echo "[stage2] Warning: chown $HERMES_HOME/$sub failed (rootless container?) — continuing"
@@ -313,6 +313,7 @@ as_hermes mkdir -p \
     "$HERMES_HOME/skills" \
     "$HERMES_HOME/skins" \
     "$HERMES_HOME/plans" \
+    "$HERMES_HOME/state" \
     "$HERMES_HOME/workspace" \
     "$HERMES_HOME/home" \
     "$HERMES_HOME/pairing" \
