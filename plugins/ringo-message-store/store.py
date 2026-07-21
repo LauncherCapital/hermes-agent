@@ -411,11 +411,22 @@ class MessageStore:
     ) -> None:
         conversation_id = str(event.get("conversation_id") or "")
         message_id = str(event.get("message_id") or "")
-        occurred_at = str(event.get("occurred_at") or "")
-        provider_version = str(event.get("provider_version") or occurred_at)
-        if not conversation_id or not message_id or not occurred_at or not provider_version:
+        event_occurred_at = str(event.get("occurred_at") or "")
+        message_occurred_at = str(
+            event.get("message_occurred_at") or event_occurred_at
+        )
+        provider_version = str(event.get("provider_version") or event_occurred_at)
+        if (
+            not conversation_id
+            or not message_id
+            or not event_occurred_at
+            or not message_occurred_at
+            or not provider_version
+        ):
             raise ValueError("normalized message identifiers and timestamps are required")
-        deleted_at = occurred_at if event["event_type"] == "message.deleted" else None
+        deleted_at = (
+            event_occurred_at if event["event_type"] == "message.deleted" else None
+        )
         text_value = None if deleted_at else event.get("text")
         provider_payload = event.get("provider_payload")
         conn.execute(
@@ -446,7 +457,7 @@ class MessageStore:
                 if provider_payload is not None
                 else None,
                 provider_version,
-                occurred_at,
+                message_occurred_at,
                 str(event.get("edited_at") or "") or None,
                 deleted_at,
                 applied_at,
