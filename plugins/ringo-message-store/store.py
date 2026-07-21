@@ -850,30 +850,64 @@ class MessageStore:
             )
             params.append(limit * 10 if operation == "recent_activity" else limit)
             rows = conn.execute(sql, params).fetchall()
-            messages: list[dict[str, Any]] = []
+            selected_rows = []
             per_counts: dict[str, int] = {}
             for row in rows:
                 conversation_id = str(row["conversation_id"])
                 count = per_counts.get(conversation_id, 0)
                 if operation == "recent_activity" and count >= per_conversation:
                     continue
-                reactions = conn.execute(
-                    "SELECT reaction_name, actor_id FROM reactions WHERE project_id=? "
-                    "AND provider=? AND workspace_id=? AND conversation_id=? AND "
-                    "provider_message_id=? AND deleted_at IS NULL",
-                    (
-                        self.project_id,
-                        row["provider"],
-                        row["workspace_id"],
-                        conversation_id,
-                        row["provider_message_id"],
-                    ),
+                selected_rows.append(row)
+                per_counts[conversation_id] = count + 1
+                if len(selected_rows) >= limit:
+                    break
+
+            selected_keys = {
+                (
+                    str(row["provider"]),
+                    str(row["workspace_id"]),
+                    str(row["conversation_id"]),
+                    str(row["provider_message_id"]),
+                )
+                for row in selected_rows
+            }
+            reactions_by_message: dict[
+                tuple[str, str, str, str], dict[str, list[str]]
+            ] = {}
+            message_ids = sorted({key[3] for key in selected_keys})
+            if message_ids:
+                reaction_rows = conn.execute(
+                    "SELECT provider, workspace_id, conversation_id, "
+                    "provider_message_id, reaction_name, actor_id FROM reactions "
+                    "WHERE project_id=? AND deleted_at IS NULL AND "
+                    f"provider_message_id IN ({','.join('?' for _ in message_ids)})",
+                    [self.project_id, *message_ids],
                 ).fetchall()
-                reaction_map: dict[str, list[str]] = {}
-                for reaction in reactions:
-                    reaction_map.setdefault(reaction["reaction_name"], []).append(
-                        reaction["actor_id"]
+                for reaction in reaction_rows:
+                    key = (
+                        str(reaction["provider"]),
+                        str(reaction["workspace_id"]),
+                        str(reaction["conversation_id"]),
+                        str(reaction["provider_message_id"]),
                     )
+                    if key not in selected_keys:
+                        continue
+                    reactions_by_message.setdefault(key, {}).setdefault(
+                        str(reaction["reaction_name"]), []
+                    ).append(str(reaction["actor_id"]))
+
+            messages: list[dict[str, Any]] = []
+            for row in selected_rows:
+                conversation_id = str(row["conversation_id"])
+                reaction_map = reactions_by_message.get(
+                    (
+                        str(row["provider"]),
+                        str(row["workspace_id"]),
+                        conversation_id,
+                        str(row["provider_message_id"]),
+                    ),
+                    {},
+                )
                 try:
                     provider_payload = json.loads(row["provider_payload_json"] or "{}")
                 except json.JSONDecodeError:
@@ -899,9 +933,6 @@ class MessageStore:
                         ],
                     }
                 )
-                per_counts[conversation_id] = count + 1
-                if len(messages) >= limit:
-                    break
             floor = max(str(row["contiguous_since"]) for row in coverage_rows)
             result = {
                 "messages": messages,
