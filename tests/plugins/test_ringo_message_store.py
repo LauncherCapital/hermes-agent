@@ -839,6 +839,98 @@ def test_bounded_query_enforces_exact_acl_tuples_and_complete_coverage(
     }
 
 
+def test_message_edit_preserves_history_time_and_order(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+
+    def apply(sequence, event):
+        store.record_envelope(
+            {
+                **event,
+                "project_id": project_id,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "conversation_id": "C1",
+                "delivery_id": f"edit-time-{sequence}",
+                "sequence": sequence,
+            },
+            f"edit-time-hash-{sequence}",
+        )
+
+    apply(
+        1,
+        {
+            "event_type": "message.created",
+            "message_id": "M1",
+            "text": "before",
+            "occurred_at": "2026-07-21T00:10:00+00:00",
+            "message_occurred_at": "2026-07-21T00:10:00+00:00",
+            "provider_version": "0001",
+        },
+    )
+    apply(
+        2,
+        {
+            "event_type": "message.created",
+            "message_id": "M2",
+            "text": "newer",
+            "occurred_at": "2026-07-21T00:20:00+00:00",
+            "message_occurred_at": "2026-07-21T00:20:00+00:00",
+            "provider_version": "0001",
+        },
+    )
+    apply(
+        3,
+        {
+            "event_type": "message.updated",
+            "message_id": "M1",
+            "text": "after",
+            "occurred_at": "2026-07-21T00:30:00+00:00",
+            "message_occurred_at": "2026-07-21T00:10:00+00:00",
+            "edited_at": "2026-07-21T00:30:00+00:00",
+            "provider_version": "0002",
+        },
+    )
+    apply(
+        4,
+        {
+            "event_type": "coverage.completed",
+            "contiguous_since": "2026-07-21T00:00:00+00:00",
+            "occurred_at": "2026-07-21T00:40:00+00:00",
+        },
+    )
+
+    recent = store.query(
+        {
+            "operation": "recent_activity",
+            "start": "2026-07-21T00:25:00+00:00",
+            "end": "2026-07-21T01:00:00+00:00",
+            "allowed_source_ids": ["slack:T1:C1"],
+        }
+    )
+    history = store.query(
+        {
+            "operation": "fetch_history",
+            "start": "2026-07-21T00:00:00+00:00",
+            "end": "2026-07-21T01:00:00+00:00",
+            "allowed_source_ids": ["slack:T1:C1"],
+        }
+    )
+
+    assert recent["coverage_complete"] is True
+    assert recent["messages"] == []
+    assert [row["provider_message_id"] for row in history["messages"]] == [
+        "M2",
+        "M1",
+    ]
+    assert history["messages"][1]["text"] == "after"
+    assert history["messages"][1]["occurred_at"] == "2026-07-21T00:10:00+00:00"
+    assert history["messages"][1]["edited_at"] == "2026-07-21T00:30:00+00:00"
+
+
 def test_bounded_query_falls_back_when_coverage_does_not_reach_requested_start(
     tmp_path, monkeypatch
 ):
