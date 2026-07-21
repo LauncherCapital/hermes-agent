@@ -153,6 +153,20 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Authenticated, provider-neutral event ingress. The API server validates
+    # request authenticity/project/replay before invoking this hook. Plugins
+    # own event schemas and durable application. Async callbacks are supported
+    # through invoke_hook_async().
+    "ingress_event",
+    # Authenticated, project-local structured reads. The caller supplies an
+    # already resolved ACL scope; the plugin must still bind it to its immutable
+    # project marker before returning data.
+    "message_store_query",
+    # A tenant runtime may be manufactured before it belongs to a project.
+    # Fired only when the control plane durably claims it.
+    "project_claimed",
+    # Optional structured component health merged into /health/detailed.
+    "health_report",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs user approval -- fires BOTH for CLI-interactive prompts
     # and for gateway/ACP approvals (Telegram, Discord, Slack, TUI, etc.).
@@ -229,7 +243,14 @@ def _get_enabled_plugins() -> Optional[set]:
 # Data classes
 # ---------------------------------------------------------------------------
 
-_VALID_PLUGIN_KINDS: Set[str] = {"standalone", "backend", "exclusive", "platform", "model-provider"}
+_VALID_PLUGIN_KINDS: Set[str] = {
+    "standalone",
+    "backend",
+    "exclusive",
+    "platform",
+    "model-provider",
+    "service",
+}
 
 
 @dataclass
@@ -1163,7 +1184,11 @@ class PluginManager:
             # Bundled platform plugins (gateway adapters like IRC) auto-load
             # for the same reason: every platform Hermes ships must be
             # available out of the box without the user having to opt in.
-            if manifest.source == "bundled" and manifest.kind in {"backend", "platform"}:
+            if manifest.source == "bundled" and manifest.kind in {
+                "backend",
+                "platform",
+                "service",
+            }:
                 self._load_plugin(manifest)
                 continue
 
@@ -1571,6 +1596,32 @@ class PluginManager:
                 )
         return results
 
+    async def invoke_hook_async(self, hook_name: str, **kwargs: Any) -> List[Any]:
+        """Invoke sync or async callbacks without blocking the gateway loop.
+
+        Synchronous hooks retain their existing direct-call semantics. An
+        awaitable return is awaited. One plugin failure is isolated from the
+        rest, matching invoke_hook().
+        """
+        kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        callbacks = self._hooks.get(hook_name, [])
+        results: List[Any] = []
+        for cb in callbacks:
+            try:
+                ret = cb(**kwargs)
+                if inspect.isawaitable(ret):
+                    ret = await ret
+                if ret is not None:
+                    results.append(ret)
+            except Exception as exc:
+                logger.warning(
+                    "Async hook '%s' callback %s raised: %s",
+                    hook_name,
+                    getattr(cb, "__name__", repr(cb)),
+                    exc,
+                )
+        return results
+
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
@@ -1653,6 +1704,11 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+
+
+async def invoke_hook_async(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Invoke sync/async callbacks registered for a plugin lifecycle hook."""
+    return await get_plugin_manager().invoke_hook_async(hook_name, **kwargs)
 
 
 def has_hook(hook_name: str) -> bool:

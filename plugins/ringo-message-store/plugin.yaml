@@ -1,0 +1,10 @@
+name: ringo-message-store
+version: "0.1.0"
+kind: service
+description: "Stores authenticated project messages behind local tools."
+author: "LauncherCapital"
+hooks:
+  - ingress_event
+  - project_claimed
+  - health_report
+  - message_store_query

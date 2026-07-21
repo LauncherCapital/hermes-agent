@@ -15,6 +15,33 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install focused release-test dependencies
+        run: |
+          uv python install 3.11
+          uv venv .venv --python 3.11
+          source .venv/bin/activate
+          uv pip install -e ".[dev,slack]"
+      - name: Verify message-gateway release contracts
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          source .venv/bin/activate
+          python -m pytest \
+            tests/gateway/test_event_ingress.py \
+            tests/hermes_cli/test_plugin_async_hooks.py \
+            tests/plugins/test_ringo_message_store.py \
+            -q
+          ruff check \
+            gateway/event_ingress.py \
+            gateway/platforms/api_server.py \
+            hermes_cli/plugins.py \
+            plugins/ringo-message-store \
+            tests/gateway/test_event_ingress.py \
+            tests/hermes_cli/test_plugin_async_hooks.py \
+            tests/plugins/test_ringo_message_store.py
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -33,5 +60,9 @@ jobs:
           # = build a SHA → e2e → re-pin.
           tags: |
             ghcr.io/${{ steps.meta.outputs.repo }}:${{ github.sha }}
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
