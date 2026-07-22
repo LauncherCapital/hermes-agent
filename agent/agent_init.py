@@ -470,20 +470,26 @@ def init_agent(
     agent._use_prompt_caching, agent._use_native_cache_layout = (
         agent._anthropic_prompt_cache_policy()
     )
-    # Anthropic supports "5m" (default) and "1h" cache TTL tiers. Read from
-    # config.yaml under prompt_caching.cache_ttl; unknown values keep "5m".
+    # Anthropic supports "5m" (default) and "1h" cache TTL tiers. Resolved from
+    # the HERMES_CACHE_TTL env var (takes precedence) then config.yaml under
+    # prompt_caching.cache_ttl; unknown values keep "5m". The env path lets
+    # Railway pods flip the tier without an image rebuild — e.g. Slack threads
+    # whose turns are >5 minutes apart otherwise expire the 5m cache and re-
+    # prefill the whole accumulated context each turn.
     # 1h tier costs 2x on write vs 1.25x for 5m, but amortizes across long
     # sessions with >5-minute pauses between turns (#14971).
     agent._cache_ttl = "5m"
-    try:
-        from hermes_cli.config import load_config as _load_pc_cfg
+    _ttl = (os.getenv("HERMES_CACHE_TTL") or "").strip()
+    if not _ttl:
+        try:
+            from hermes_cli.config import load_config as _load_pc_cfg
 
-        _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
-        _ttl = _pc_cfg.get("cache_ttl", "5m")
-        if _ttl in {"5m", "1h"}:
-            agent._cache_ttl = _ttl
-    except Exception:
-        pass
+            _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
+            _ttl = _pc_cfg.get("cache_ttl", "5m")
+        except Exception:
+            _ttl = "5m"
+    if _ttl in {"5m", "1h"}:
+        agent._cache_ttl = _ttl
 
     # Iteration budget: the LLM is only notified when it actually exhausts
     # the iteration budget (api_call_count >= max_iterations).  At that
