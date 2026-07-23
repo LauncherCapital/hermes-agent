@@ -1,0 +1,11 @@
+name: ringo-skill-sync
+version: "0.1.0"
+kind: service
+description: "Reconciles IE-owned skills with the local Hermes skill library."
+author: "LauncherCapital"
+actions:
+  - ringo.skill.reconcile
+hooks:
+  - post_tool_call
+  - project_claimed
+  - health_report

@@ -35,14 +35,22 @@ def _load_service() -> tuple[PluginManager, object]:
     return manager, loaded.module
 
 
+def _message_store_health(manager: PluginManager) -> dict:
+    return next(
+        item
+        for item in manager.invoke_hook("health_report")
+        if item["name"] == "ringo_message_store"
+    )
+
+
 @pytest.mark.asyncio
 async def test_unclaimed_pool_instance_has_no_store_or_project_key(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     manager, _module = _load_service()
 
-    health = manager.invoke_hook("health_report")
+    health = _message_store_health(manager)
 
-    assert health == [{"name": "ringo_message_store", "status": "unclaimed"}]
+    assert health == {"name": "ringo_message_store", "status": "unclaimed"}
     assert not (tmp_path / "state/message_store.db").exists()
     assert not (tmp_path / "state/keys/message-store-v1.pem").exists()
 
@@ -57,7 +65,7 @@ async def test_cold_claim_initializes_store_during_plugin_load(tmp_path, monkeyp
 
     assert (tmp_path / "state/message_store.db").exists()
     assert (tmp_path / "state/keys/message-store-v1.pem").exists()
-    health = manager.invoke_hook("health_report")[0]
+    health = _message_store_health(manager)
     assert health["project_id"] == project_id
     assert health["schema_version"] == 3
 
@@ -460,7 +468,7 @@ async def test_key_rotation_keeps_retired_version_decrypt_only(tmp_path, monkeyp
     assert (tmp_path / "state/keys/message-store-v2.pem").exists()
     assert module.decrypt_delivery_envelope(envelope_v1)["key_version"] == 1
     assert module.decrypt_delivery_envelope(envelope_v2)["key_version"] == 2
-    assert manager.invoke_hook("health_report")[0]["key_version"] == 2
+    assert _message_store_health(manager)["key_version"] == 2
 
 
 def test_normalized_events_share_one_apply_path_and_tombstone_wins(

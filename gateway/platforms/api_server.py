@@ -8,6 +8,7 @@ Exposes an HTTP server with endpoints:
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent as an available model
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
+- POST /v1/plugin-actions          — authenticated project-bound plugin control
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
@@ -391,6 +392,123 @@ def _session_chat_context_messages(
             message["message_id"] = message_id.strip()
         messages.append(message)
     return messages, None
+
+
+def _session_chat_standard_messages(
+    body: Dict[str, Any],
+) -> tuple[
+    Any,
+    List[Dict[str, Any]],
+    Optional[str],
+    bool,
+    Optional["web.Response"],
+]:
+    """Parse one canonical OpenAI-style messages[] request for session chat."""
+    raw_messages = body.get("messages")
+    if raw_messages is None:
+        return None, [], None, False, None
+    if not isinstance(raw_messages, list) or not 1 <= len(raw_messages) <= 200:
+        return None, [], None, True, web.json_response(
+            _openai_error(
+                "messages must be a non-empty array with at most 200 entries",
+                code="invalid_messages",
+            ),
+            status=400,
+        )
+
+    system_parts: List[str] = []
+    conversation: List[Dict[str, Any]] = []
+    for idx, raw in enumerate(raw_messages):
+        if not isinstance(raw, dict):
+            return None, [], None, True, web.json_response(
+                _openai_error(
+                    f"messages[{idx}] must be an object",
+                    code="invalid_message",
+                ),
+                status=400,
+            )
+        role = raw.get("role")
+        if role == "system":
+            content = raw.get("content")
+            if conversation or not isinstance(content, str) or not content.strip():
+                return None, [], None, True, web.json_response(
+                    _openai_error(
+                        "system messages must be non-empty and precede conversation turns",
+                        code="invalid_message",
+                    ),
+                    status=400,
+                )
+            system_parts.append(content)
+            continue
+        if role not in {"developer", "user", "assistant", "tool"}:
+            return None, [], None, True, web.json_response(
+                _openai_error(
+                    f"messages[{idx}] has unsupported role",
+                    code="invalid_message",
+                ),
+                status=400,
+            )
+
+        content = raw.get("content", "")
+        if role == "user":
+            try:
+                content = _normalize_multimodal_content(content)
+            except ValueError as exc:
+                return None, [], None, True, _multimodal_validation_error(
+                    exc,
+                    param=f"messages[{idx}].content",
+                )
+        elif not isinstance(content, str):
+            return None, [], None, True, web.json_response(
+                _openai_error(
+                    f"messages[{idx}].content must be a string",
+                    code="invalid_message",
+                ),
+                status=400,
+            )
+
+        message: Dict[str, Any] = {"role": role, "content": content}
+        if role == "assistant" and raw.get("tool_calls") is not None:
+            if not isinstance(raw["tool_calls"], list):
+                return None, [], None, True, web.json_response(
+                    _openai_error(
+                        f"messages[{idx}].tool_calls must be an array",
+                        code="invalid_message",
+                    ),
+                    status=400,
+                )
+            message["tool_calls"] = raw["tool_calls"]
+        if role == "tool":
+            tool_call_id = raw.get("tool_call_id")
+            if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+                return None, [], None, True, web.json_response(
+                    _openai_error(
+                        f"messages[{idx}].tool_call_id is required",
+                        code="invalid_message",
+                    ),
+                    status=400,
+                )
+            message["tool_call_id"] = tool_call_id.strip()
+            name = raw.get("name") or raw.get("tool_name")
+            if isinstance(name, str) and name.strip():
+                message["name"] = name.strip()
+        conversation.append(message)
+
+    if not conversation or conversation[-1]["role"] != "user":
+        return None, [], None, True, web.json_response(
+            _openai_error(
+                "messages must end with the current user turn",
+                code="invalid_messages",
+            ),
+            status=400,
+        )
+    return (
+        conversation[-1]["content"],
+        conversation[:-1],
+        "\n\n".join(system_parts) or None,
+        True,
+        None,
+    )
 
 
 def _session_chat_persist_user_message_id(
@@ -1267,6 +1385,180 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=500,
             )
 
+    async def _handle_plugin_action(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /v1/plugin-actions -- authenticated project-bound control.
+
+        Request shape:
+        ``{action, project_id, request_id, payload}``.
+        Action names are lowercase and namespaced. Exactly one plugin owns each
+        action, so unknown actions cannot invoke unrelated plugin code.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "invalid_json",
+                        "message": "request body must be a JSON object",
+                    }
+                },
+                status=400,
+            )
+        if not isinstance(body, dict):
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "invalid_request",
+                        "message": "request body must be a JSON object",
+                    }
+                },
+                status=400,
+            )
+
+        action_value = body.get("action")
+        action = action_value.strip() if isinstance(action_value, str) else ""
+        if (
+            len(action) > 200
+            or re.fullmatch(
+                r"[a-z][a-z0-9]*(?:[._:-][a-z0-9]+)+",
+                action,
+            )
+            is None
+        ):
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "invalid_action",
+                        "message": "action must be a lowercase namespaced identifier",
+                    }
+                },
+                status=400,
+            )
+
+        request_id_value = body.get("request_id")
+        request_id = (
+            request_id_value.strip()
+            if isinstance(request_id_value, str)
+            else ""
+        )
+        if not request_id or len(request_id) > 128:
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "invalid_request_id",
+                        "message": "request_id is required and must be at most 128 characters",
+                    }
+                },
+                status=400,
+            )
+        payload = body.get("payload", {})
+        if not isinstance(payload, dict):
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "invalid_payload",
+                        "message": "payload must be a JSON object",
+                    }
+                },
+                status=400,
+            )
+
+        from gateway.event_ingress import read_project_marker
+
+        marker = read_project_marker()
+        if marker is None:
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "project_unclaimed",
+                        "message": "runtime is not claimed",
+                    }
+                },
+                status=503,
+            )
+        try:
+            project_id = str(uuid.UUID(str(body.get("project_id") or "")))
+        except (TypeError, ValueError):
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "invalid_project",
+                        "message": "project_id must be a UUID",
+                    }
+                },
+                status=400,
+            )
+        if project_id != marker["project_id"]:
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "project_mismatch",
+                        "message": "action targets another project",
+                    }
+                },
+                status=403,
+            )
+
+        canonical = {
+            "action": action,
+            "project_id": project_id,
+            "request_id": request_id,
+            "payload": payload,
+        }
+        try:
+            from hermes_cli.plugins import (
+                PluginActionUnavailable,
+                invoke_plugin_action,
+            )
+
+            result = await invoke_plugin_action(action, request=canonical)
+        except PluginActionUnavailable:
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "plugin_action_unavailable",
+                        "message": "no plugin owns the requested action",
+                    }
+                },
+                status=503,
+            )
+        except Exception:
+            logger.exception("plugin action failed: %s", action)
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "plugin_action_failed",
+                        "message": "plugin action failed",
+                    }
+                },
+                status=500,
+            )
+        if not isinstance(result, dict):
+            logger.error("plugin action returned a non-object result: %s", action)
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "invalid_plugin_action_result",
+                        "message": "plugin action returned an invalid result",
+                    }
+                },
+                status=500,
+            )
+        return web.json_response(
+            {
+                "ok": True,
+                "action": action,
+                "request_id": request_id,
+                "result": result,
+            }
+        )
+
     async def _handle_message_store_query(
         self, request: "web.Request"
     ) -> "web.Response":
@@ -1399,7 +1691,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_context_messages": True,
+                "standard_session_messages": True,
                 "session_fork": True,
+                "plugin_actions": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -1423,6 +1717,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
+                "plugin_actions": {
+                    "method": "POST",
+                    "path": "/v1/plugin-actions",
+                },
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
@@ -2216,19 +2514,40 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        user_message, err = _session_chat_user_message(body)
+        (
+            standard_user,
+            standard_history,
+            standard_system,
+            has_standard_messages,
+            err,
+        ) = _session_chat_standard_messages(body)
         if err is not None:
             return err
-        context_messages, err = _session_chat_context_messages(body)
-        if err is not None:
-            return err
+        if has_standard_messages:
+            user_message = standard_user
+            context_messages = []
+        else:
+            user_message, err = _session_chat_user_message(body)
+            if err is not None:
+                return err
+            context_messages, err = _session_chat_context_messages(body)
+            if err is not None:
+                return err
         persist_user_message_id, err = _session_chat_persist_user_message_id(body)
         if err is not None:
             return err
-        system_prompt = body.get("system_message") or body.get("instructions")
+        system_prompt = (
+            standard_system
+            if has_standard_messages
+            else body.get("system_message") or body.get("instructions")
+        )
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
-        history = self._conversation_history_with_context(session_id, context_messages)
+        history = (
+            standard_history
+            if has_standard_messages
+            else self._conversation_history_with_context(session_id, context_messages)
+        )
         result, usage = await self._run_agent(
             user_message=user_message,
             conversation_history=history,
@@ -2267,16 +2586,33 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        user_message, err = _session_chat_user_message(body)
+        (
+            standard_user,
+            standard_history,
+            standard_system,
+            has_standard_messages,
+            err,
+        ) = _session_chat_standard_messages(body)
         if err is not None:
             return err
-        context_messages, err = _session_chat_context_messages(body)
-        if err is not None:
-            return err
+        if has_standard_messages:
+            user_message = standard_user
+            context_messages = []
+        else:
+            user_message, err = _session_chat_user_message(body)
+            if err is not None:
+                return err
+            context_messages, err = _session_chat_context_messages(body)
+            if err is not None:
+                return err
         persist_user_message_id, err = _session_chat_persist_user_message_id(body)
         if err is not None:
             return err
-        system_prompt = body.get("system_message") or body.get("instructions")
+        system_prompt = (
+            standard_system
+            if has_standard_messages
+            else body.get("system_message") or body.get("instructions")
+        )
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
 
@@ -2324,8 +2660,12 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
-                history = self._conversation_history_with_context(
-                    session_id, context_messages
+                history = (
+                    standard_history
+                    if has_standard_messages
+                    else self._conversation_history_with_context(
+                        session_id, context_messages
+                    )
                 )
                 result, usage = await self._run_agent(
                     user_message=user_message,
@@ -2433,7 +2773,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
-        conversation_messages: List[Dict[str, str]] = []
+        conversation_messages: List[Dict[str, Any]] = []
 
         for idx, msg in enumerate(messages):
             role = msg.get("role", "")
@@ -2451,12 +2791,58 @@ class APIServerAdapter(BasePlatformAdapter):
                     content = _normalize_multimodal_content(raw_content)
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
-                conversation_messages.append({"role": role, "content": content})
+                message: Dict[str, Any] = {"role": role, "content": content}
+                if role == "assistant" and msg.get("tool_calls") is not None:
+                    if not isinstance(msg["tool_calls"], list):
+                        return web.json_response(
+                            _openai_error(
+                                f"messages[{idx}].tool_calls must be an array",
+                                code="invalid_message",
+                            ),
+                            status=400,
+                        )
+                    message["tool_calls"] = msg["tool_calls"]
+                conversation_messages.append(message)
+            elif role == "developer":
+                if not isinstance(raw_content, str):
+                    return web.json_response(
+                        _openai_error(
+                            f"messages[{idx}].content must be a string",
+                            code="invalid_message",
+                        ),
+                        status=400,
+                    )
+                conversation_messages.append(
+                    {"role": "developer", "content": raw_content}
+                )
+            elif role == "tool":
+                tool_call_id = msg.get("tool_call_id")
+                if (
+                    not isinstance(raw_content, str)
+                    or not isinstance(tool_call_id, str)
+                    or not tool_call_id.strip()
+                ):
+                    return web.json_response(
+                        _openai_error(
+                            f"messages[{idx}] is an invalid tool result",
+                            code="invalid_message",
+                        ),
+                        status=400,
+                    )
+                tool_message: Dict[str, Any] = {
+                    "role": "tool",
+                    "content": raw_content,
+                    "tool_call_id": tool_call_id.strip(),
+                }
+                name = msg.get("name") or msg.get("tool_name")
+                if isinstance(name, str) and name.strip():
+                    tool_message["name"] = name.strip()
+                conversation_messages.append(tool_message)
 
         # Extract the last user message as the primary input
         user_message: Any = ""
         history = []
-        if conversation_messages:
+        if conversation_messages and conversation_messages[-1].get("role") == "user":
             user_message = conversation_messages[-1].get("content", "")
             history = conversation_messages[:-1]
 
@@ -2739,6 +3125,13 @@ class APIServerAdapter(BasePlatformAdapter):
         _dropped_tools = result.get("dropped_tools")
         if _dropped_tools:
             response_data["dropped_tools"] = _dropped_tools
+        turn_messages = self._turn_transcript_messages(
+            history,
+            user_message,
+            result,
+        )
+        if turn_messages:
+            response_data["messages"] = turn_messages
         if is_partial or is_failed or not completed:
             response_data["hermes"] = {
                 "completed": completed,
@@ -4938,6 +5331,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_post("/v1/events", self._handle_events)
+            self._app.router.add_post(
+                "/v1/plugin-actions", self._handle_plugin_action
+            )
             self._app.router.add_post(
                 "/v1/message-store/query", self._handle_message_store_query
             )

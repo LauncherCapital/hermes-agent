@@ -339,17 +339,27 @@ seed_one ".env" ".env.example"
 seed_one "config.yaml" "cli-config.yaml.example"
 seed_one "SOUL.md" "docker/SOUL.md"
 
-# --- Ringo bootstrap (ie-centralized: register ie-MCP + sync ie skills) ---
-# ALL ringo boot logic lives in the orchestrator (ie); we fetch and run it here, so
-# this fork carries only a generic shim and never needs ringo-specific changes again.
-# No agent loop, idempotent, best-effort (a failure never blocks boot). ie is already
-# the TCB that provisions this instance, so running its boot script adds no trust.
+# --- Ringo bootstrap (IE config + project marker; plugin owns skill files) ---
+# New provisioned instances carry RINGO_AGENT_ID and request plugin mode, so the
+# bootstrap does not write skills. ringo-skill-sync reconciles them after plugin
+# registration. Existing instances without that env retain the legacy bootstrap
+# behavior during rollout. Both paths are deterministic and best-effort.
 if [ -n "${RINGO_IE_MCP_URL:-}" ] && [ -n "${RINGO_IE_MCP_KEY:-}" ]; then
-    echo "[stage2] Running Ringo ie bootstrap (ie-MCP + skills)"
-    curl -fsS "${RINGO_IE_MCP_URL%/mcp}/api/v1/agent/bootstrap" \
-        -H "Authorization: Bearer ${RINGO_IE_MCP_KEY}" \
-        | as_hermes "$INSTALL_DIR/.venv/bin/python" - \
-        || echo "[stage2] Warning: ringo bootstrap skipped; continuing"
+    if [ -n "${RINGO_AGENT_ID:-}" ]; then
+        echo "[stage2] Running Ringo ie bootstrap (plugin skill sync)"
+        curl -fsS -G "${RINGO_IE_MCP_URL%/mcp}/api/v1/agent/bootstrap" \
+            -H "Authorization: Bearer ${RINGO_IE_MCP_KEY}" \
+            --data-urlencode "agent_id=${RINGO_AGENT_ID}" \
+            --data-urlencode "skill_sync=plugin" \
+            | as_hermes "$INSTALL_DIR/.venv/bin/python" - \
+            || echo "[stage2] Warning: ringo bootstrap skipped; continuing"
+    else
+        echo "[stage2] Running legacy Ringo ie bootstrap"
+        curl -fsS "${RINGO_IE_MCP_URL%/mcp}/api/v1/agent/bootstrap" \
+            -H "Authorization: Bearer ${RINGO_IE_MCP_KEY}" \
+            | as_hermes "$INSTALL_DIR/.venv/bin/python" - \
+            || echo "[stage2] Warning: ringo bootstrap skipped; continuing"
+    fi
 fi
 
 # .env holds API keys and secrets — restrict to owner-only access. Applied

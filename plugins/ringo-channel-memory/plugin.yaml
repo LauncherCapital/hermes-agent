@@ -1,0 +1,11 @@
+name: ringo-channel-memory
+version: "0.1.0"
+kind: service
+description: "Materializes and silently synchronizes exact public-channel memory files."
+author: "LauncherCapital"
+actions:
+  - ringo.channel_memory.prepare
+hooks:
+  - pre_tool_call
+  - post_tool_call
+  - health_report

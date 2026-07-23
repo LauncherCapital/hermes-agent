@@ -39,6 +39,7 @@ import importlib.util
 import inspect
 import logging
 import os
+import re
 import sys
 import threading
 import types
@@ -50,6 +51,17 @@ from hermes_constants import get_hermes_home
 from utils import env_var_enabled
 from hermes_cli.config import cfg_get
 OBSERVER_SCHEMA_VERSION = "hermes.observer.v1"
+_PLUGIN_ACTION_NAME_RE = re.compile(
+    r"^[a-z][a-z0-9]*(?:[._:-][a-z0-9]+)+$"
+)
+
+
+class PluginActionUnavailable(LookupError):
+    """Raised when no plugin owns a requested control-plane action."""
+
+    def __init__(self, action: str):
+        self.action = action
+        super().__init__(f"no plugin registered action {action!r}")
 
 
 def get_bundled_plugins_dir() -> Path:
@@ -264,6 +276,7 @@ class PluginManifest:
     requires_env: List[Union[str, Dict[str, Any]]] = field(default_factory=list)
     provides_tools: List[str] = field(default_factory=list)
     provides_hooks: List[str] = field(default_factory=list)
+    provides_actions: List[str] = field(default_factory=list)
     source: str = ""        # "user", "project", or "entrypoint"
     path: Optional[str] = None
     # Plugin kind — see plugins.py module docstring for semantics.
@@ -298,6 +311,7 @@ class LoadedPlugin:
     module: Optional[types.ModuleType] = None
     tools_registered: List[str] = field(default_factory=list)
     hooks_registered: List[str] = field(default_factory=list)
+    actions_registered: List[str] = field(default_factory=list)
     commands_registered: List[str] = field(default_factory=list)
     enabled: bool = False
     error: Optional[str] = None
@@ -973,6 +987,37 @@ class PluginContext:
         self._manager._hooks.setdefault(hook_name, []).append(callback)
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
 
+    def register_action(self, action: str, callback: Callable) -> None:
+        """Register one namespaced control-plane action.
+
+        Actions have a single owner. Unlike broadcast lifecycle hooks, an
+        unknown action never invokes unrelated plugins, and synchronous
+        handlers are dispatched off the gateway event-loop thread.
+        """
+        clean = action.strip() if isinstance(action, str) else ""
+        if (
+            len(clean) > 200
+            or _PLUGIN_ACTION_NAME_RE.fullmatch(clean) is None
+        ):
+            raise ValueError(f"invalid plugin action name: {action!r}")
+        if not callable(callback):
+            raise ValueError(f"plugin action handler is not callable: {clean}")
+        existing = self._manager._plugin_actions.get(clean)
+        if existing is not None:
+            raise ValueError(
+                "plugin action already registered: "
+                f"{clean} by {existing['plugin']}"
+            )
+        self._manager._plugin_actions[clean] = {
+            "callback": callback,
+            "plugin": self.manifest.name,
+        }
+        logger.debug(
+            "Plugin %s registered action: %s",
+            self.manifest.name,
+            clean,
+        )
+
     # -- skill registration -------------------------------------------------
 
     def register_skill(
@@ -1031,6 +1076,7 @@ class PluginManager:
     def __init__(self) -> None:
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
+        self._plugin_actions: Dict[str, Dict[str, Any]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
         self._cli_commands: Dict[str, dict] = {}
@@ -1060,6 +1106,7 @@ class PluginManager:
         if force:
             self._plugins.clear()
             self._hooks.clear()
+            self._plugin_actions.clear()
             self._plugin_tool_names.clear()
             self._cli_commands.clear()
             self._plugin_commands.clear()
@@ -1385,6 +1432,7 @@ class PluginManager:
                 requires_env=data.get("requires_env", []),
                 provides_tools=data.get("provides_tools", []),
                 provides_hooks=data.get("provides_hooks", []),
+                provides_actions=data.get("actions", []),
                 source=source,
                 path=str(plugin_dir),
                 kind=kind,
@@ -1474,15 +1522,22 @@ class PluginManager:
                         for h in p.hooks_registered
                     }
                 )
+                loaded.actions_registered = sorted(
+                    action
+                    for action, entry in self._plugin_actions.items()
+                    if entry["plugin"] == manifest.name
+                )
                 loaded.commands_registered = [
                     c for c in self._plugin_commands
                     if self._plugin_commands[c].get("plugin") == manifest.name
                 ]
                 loaded.enabled = True
                 logger.debug(
-                    "  registered: %d tool(s), %d hook(s), %d slash command(s), %d CLI command(s)",
+                    "  registered: %d tool(s), %d hook(s), %d action(s), "
+                    "%d slash command(s), %d CLI command(s)",
                     len(loaded.tools_registered),
                     len(loaded.hooks_registered),
+                    len(loaded.actions_registered),
                     len(loaded.commands_registered),
                     sum(
                         1 for c in self._cli_commands
@@ -1626,6 +1681,25 @@ class PluginManager:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
 
+    async def invoke_action(self, action: str, **kwargs: Any) -> Any:
+        """Invoke the single plugin handler registered for *action*.
+
+        Async callbacks run on the current loop. Synchronous callbacks run in
+        the default worker pool so filesystem reconciliation cannot block the
+        API server's event loop.
+        """
+        entry = self._plugin_actions.get(action)
+        if entry is None:
+            raise PluginActionUnavailable(action)
+        callback = entry["callback"]
+        if inspect.iscoroutinefunction(callback):
+            result = await callback(**kwargs)
+        else:
+            result = await asyncio.to_thread(callback, **kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
     # -----------------------------------------------------------------------
     # Introspection
     # -----------------------------------------------------------------------
@@ -1645,6 +1719,7 @@ class PluginManager:
                     "enabled": loaded.enabled,
                     "tools": len(loaded.tools_registered),
                     "hooks": len(loaded.hooks_registered),
+                    "actions": len(loaded.actions_registered),
                     "commands": len(loaded.commands_registered),
                     "error": loaded.error,
                 }
@@ -1709,6 +1784,11 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 async def invoke_hook_async(hook_name: str, **kwargs: Any) -> List[Any]:
     """Invoke sync/async callbacks registered for a plugin lifecycle hook."""
     return await get_plugin_manager().invoke_hook_async(hook_name, **kwargs)
+
+
+async def invoke_plugin_action(action: str, **kwargs: Any) -> Any:
+    """Dispatch one namespaced action to its owning plugin."""
+    return await _ensure_plugins_discovered().invoke_action(action, **kwargs)
 
 
 def has_hook(hook_name: str) -> bool:
