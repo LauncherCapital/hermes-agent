@@ -10,6 +10,7 @@ Covers:
 - Auth enforcement (401 when API_SERVER_KEY is set)
 """
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -187,6 +188,25 @@ class TestAdminConfig:
             resp = await cli.post("/admin/config", json={"agent": {"reasoning_effort": None}})
             assert resp.status == 200
             assert "reasoning_effort" not in (load_config().get("agent") or {})
+
+    @pytest.mark.asyncio
+    async def test_max_turns_applies_to_config_and_live_env(self, adapter):
+        from hermes_cli.config import load_config
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.dict("os.environ", {}, clear=False):
+                resp = await cli.post("/admin/config", json={"agent": {"max_turns": 3}})
+                assert resp.status == 200
+                assert (await resp.json())["applied"]["max_turns"] == 3
+                assert load_config()["agent"]["max_turns"] == 3
+                assert os.environ["HERMES_MAX_ITERATIONS"] == "3"
+
+                for invalid in (0, -1, "bad", None):
+                    resp = await cli.post(
+                        "/admin/config", json={"agent": {"max_turns": invalid}}
+                    )
+                    assert resp.status == 400
 
     @pytest.mark.asyncio
     async def test_mcp_addition_uses_incremental_discovery(self, adapter):
