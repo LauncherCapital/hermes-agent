@@ -8,6 +8,7 @@ Exposes an HTTP server with endpoints:
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent as an available model
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
+- POST /v1/plugin-actions          — authenticated project-bound plugin control
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
@@ -1267,6 +1268,180 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=500,
             )
 
+    async def _handle_plugin_action(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /v1/plugin-actions -- authenticated project-bound control.
+
+        Request shape:
+        ``{action, project_id, request_id, payload}``.
+        Action names are lowercase and namespaced. Exactly one plugin owns each
+        action, so unknown actions cannot invoke unrelated plugin code.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "invalid_json",
+                        "message": "request body must be a JSON object",
+                    }
+                },
+                status=400,
+            )
+        if not isinstance(body, dict):
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "invalid_request",
+                        "message": "request body must be a JSON object",
+                    }
+                },
+                status=400,
+            )
+
+        action_value = body.get("action")
+        action = action_value.strip() if isinstance(action_value, str) else ""
+        if (
+            len(action) > 200
+            or re.fullmatch(
+                r"[a-z][a-z0-9]*(?:[._:-][a-z0-9]+)+",
+                action,
+            )
+            is None
+        ):
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "invalid_action",
+                        "message": "action must be a lowercase namespaced identifier",
+                    }
+                },
+                status=400,
+            )
+
+        request_id_value = body.get("request_id")
+        request_id = (
+            request_id_value.strip()
+            if isinstance(request_id_value, str)
+            else ""
+        )
+        if not request_id or len(request_id) > 128:
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "invalid_request_id",
+                        "message": "request_id is required and must be at most 128 characters",
+                    }
+                },
+                status=400,
+            )
+        payload = body.get("payload", {})
+        if not isinstance(payload, dict):
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "invalid_payload",
+                        "message": "payload must be a JSON object",
+                    }
+                },
+                status=400,
+            )
+
+        from gateway.event_ingress import read_project_marker
+
+        marker = read_project_marker()
+        if marker is None:
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "project_unclaimed",
+                        "message": "runtime is not claimed",
+                    }
+                },
+                status=503,
+            )
+        try:
+            project_id = str(uuid.UUID(str(body.get("project_id") or "")))
+        except (TypeError, ValueError):
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "invalid_project",
+                        "message": "project_id must be a UUID",
+                    }
+                },
+                status=400,
+            )
+        if project_id != marker["project_id"]:
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "project_mismatch",
+                        "message": "action targets another project",
+                    }
+                },
+                status=403,
+            )
+
+        canonical = {
+            "action": action,
+            "project_id": project_id,
+            "request_id": request_id,
+            "payload": payload,
+        }
+        try:
+            from hermes_cli.plugins import (
+                PluginActionUnavailable,
+                invoke_plugin_action,
+            )
+
+            result = await invoke_plugin_action(action, request=canonical)
+        except PluginActionUnavailable:
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "plugin_action_unavailable",
+                        "message": "no plugin owns the requested action",
+                    }
+                },
+                status=503,
+            )
+        except Exception:
+            logger.exception("plugin action failed: %s", action)
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "plugin_action_failed",
+                        "message": "plugin action failed",
+                    }
+                },
+                status=500,
+            )
+        if not isinstance(result, dict):
+            logger.error("plugin action returned a non-object result: %s", action)
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "invalid_plugin_action_result",
+                        "message": "plugin action returned an invalid result",
+                    }
+                },
+                status=500,
+            )
+        return web.json_response(
+            {
+                "ok": True,
+                "action": action,
+                "request_id": request_id,
+                "result": result,
+            }
+        )
+
     async def _handle_message_store_query(
         self, request: "web.Request"
     ) -> "web.Response":
@@ -1400,6 +1575,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_streaming": True,
                 "session_context_messages": True,
                 "session_fork": True,
+                "plugin_actions": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -1423,6 +1599,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
+                "plugin_actions": {
+                    "method": "POST",
+                    "path": "/v1/plugin-actions",
+                },
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
@@ -4938,6 +5118,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_post("/v1/events", self._handle_events)
+            self._app.router.add_post(
+                "/v1/plugin-actions", self._handle_plugin_action
+            )
             self._app.router.add_post(
                 "/v1/message-store/query", self._handle_message_store_query
             )
