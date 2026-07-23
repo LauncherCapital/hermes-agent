@@ -93,6 +93,20 @@ def test_repair_merges_consecutive_user_messages():
     assert messages[0]["content"] == "first\n\nsecond"
 
 
+def test_repair_preserves_external_user_message_boundaries():
+    agent = _bare_agent()
+    messages = [
+        {"role": "user", "content": "U1: first", "message_id": "slack:1"},
+        {"role": "user", "content": "U2: second", "message_id": "slack:2"},
+    ]
+    original = [dict(message) for message in messages]
+
+    repairs = AIAgent._repair_message_sequence(agent, messages)
+
+    assert repairs == 0
+    assert messages == original
+
+
 def test_repair_preserves_user_content_when_one_side_empty():
     agent = _bare_agent()
     messages = [

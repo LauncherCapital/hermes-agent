@@ -356,6 +356,7 @@ def run_conversation(
     task_id: str = None,
     stream_callback: Optional[callable] = None,
     persist_user_message: Optional[str] = None,
+    persist_user_message_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -371,6 +372,8 @@ def run_conversation(
         persist_user_message: Optional clean user message to store in
             transcripts/history when user_message contains API-only
             synthetic prefixes.
+        persist_user_message_id: Optional external platform message id to
+            retain for context synchronization and user-turn boundaries.
                 or queuing follow-up prefetch work.
 
     Returns:
@@ -563,6 +566,8 @@ def run_conversation(
 
     # Add user message
     user_msg = {"role": "user", "content": user_message}
+    if persist_user_message_id:
+        user_msg["message_id"] = persist_user_message_id
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
@@ -975,6 +980,9 @@ def run_conversation(
             # Remove finish_reason - not accepted by strict APIs (e.g. Mistral)
             if "finish_reason" in api_msg:
                 api_msg.pop("finish_reason")
+            # External ids are transcript metadata, not provider API fields.
+            api_msg.pop("message_id", None)
+            api_msg.pop("platform_message_id", None)
             # Strip internal thinking-prefill marker
             api_msg.pop("_thinking_prefill", None)
             # Strip Codex Responses API fields (call_id, response_item_id) for

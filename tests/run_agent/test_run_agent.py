@@ -5968,6 +5968,7 @@ class TestPersistUserMessageOverride:
                     "[Voice input — respond concisely and conversationally, "
                     "2-3 sentences max. No code blocks or markdown.] Hello there"
                 ),
+                "message_id": "slack:123.456",
             },
             {"role": "assistant", "content": "Hi!"},
         ]
@@ -5977,6 +5978,46 @@ class TestPersistUserMessageOverride:
         assert messages[0]["content"] == "Hello there"
         first_db_write = agent._session_db.append_message.call_args_list[0].kwargs
         assert first_db_write["content"] == "Hello there"
+        assert first_db_write["platform_message_id"] == "slack:123.456"
+
+    def test_external_user_turns_stay_separate_but_ids_stay_off_wire(self, agent):
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.tool_delay = 0
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="done",
+            finish_reason="stop",
+        )
+        history = [
+            {"role": "user", "content": "U1: first", "message_id": "slack:1"},
+            {"role": "user", "content": "U2: second", "message_id": "slack:2"},
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation(
+                "U3: current",
+                conversation_history=history,
+                persist_user_message_id="slack:3",
+            )
+
+        sent_messages = agent.client.chat.completions.create.call_args.kwargs[
+            "messages"
+        ]
+        sent_users = [
+            message for message in sent_messages if message.get("role") == "user"
+        ]
+        assert [message["content"] for message in sent_users] == [
+            "U1: first",
+            "U2: second",
+            "U3: current",
+        ]
+        assert all("message_id" not in message for message in sent_users)
 
 
 class TestReasoningReplayForStrictProviders:
