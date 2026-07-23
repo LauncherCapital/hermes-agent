@@ -1974,7 +1974,17 @@ class APIServerAdapter(BasePlatformAdapter):
         if not isinstance(body, dict):
             return web.json_response(_openai_error("Body must be a JSON object"), status=400)
 
-        allowed = {"model", "agent", "mcp_servers", "toolsets", "web", "env", "project"}
+        allowed = {
+            "model",
+            "agent",
+            "skills",
+            "memory",
+            "mcp_servers",
+            "toolsets",
+            "web",
+            "env",
+            "project",
+        }
         unknown = set(body) - allowed
         if unknown:
             return web.json_response(
@@ -2049,6 +2059,33 @@ class APIServerAdapter(BasePlatformAdapter):
                     config["agent"] = agent_cfg
                     config_dirty = True
                 applied["max_turns"] = max_turns
+
+            for section, field in (
+                ("skills", "creation_nudge_interval"),
+                ("memory", "nudge_interval"),
+            ):
+                spec = body.get(section)
+                if not isinstance(spec, dict) or field not in spec:
+                    continue
+                try:
+                    interval = int(spec.get(field))
+                except (TypeError, ValueError):
+                    interval = -1
+                if interval < 0:
+                    return web.json_response(
+                        _openai_error(
+                            f"{section}.{field} must be a non-negative integer"
+                        ),
+                        status=400,
+                    )
+                current = config.get(section)
+                if not isinstance(current, dict):
+                    current = {}
+                if current.get(field) != interval:
+                    current[field] = interval
+                    config[section] = current
+                    config_dirty = True
+                applied[f"{section}.{field}"] = interval
 
             mcp_spec = body.get("mcp_servers")
             if isinstance(mcp_spec, dict):

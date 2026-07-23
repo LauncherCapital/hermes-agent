@@ -1,0 +1,14 @@
+name: ringo-entity-skills
+version: "0.1.0"
+kind: service
+description: "Loads and curates exact Ringo entity SKILL.md files."
+author: "LauncherCapital"
+actions:
+  - ringo.entity_skills.prepare
+  - ringo.entity_skills.finish
+  - ringo.entity_skills.context
+hooks:
+  - pre_llm_call
+  - pre_tool_call
+  - post_tool_call
+  - health_report
