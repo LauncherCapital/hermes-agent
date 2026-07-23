@@ -22,6 +22,7 @@ SCHEMA_VERSION = 3
 MESSAGE_RETENTION_DAYS = 30
 DELIVERY_RETENTION_DAYS = 7
 RETENTION_INTERVAL_SECONDS = 3600
+MAX_BATCH_EVENTS = 500
 
 
 _SCHEMA = """
@@ -329,6 +330,33 @@ class MessageStore:
         event_type = str(event.get("event_type") or "")
         if not event_type:
             return  # P2 fixture/health deliveries carry only cursor metadata.
+        if event_type == "events.batch":
+            events = event.get("events")
+            if (
+                not isinstance(events, list)
+                or not events
+                or len(events) > MAX_BATCH_EVENTS
+            ):
+                raise ValueError("normalized event batch size is invalid")
+            for child in events:
+                if not isinstance(child, dict):
+                    raise ValueError("normalized event batch contains a non-object")
+                child_type = str(child.get("event_type") or "")
+                if not child_type or child_type == "events.batch":
+                    raise ValueError("normalized event batch child type is invalid")
+                child_event = {
+                    **child,
+                    "project_id": self.project_id,
+                    "provider": str(
+                        child.get("provider") or event.get("provider") or ""
+                    ),
+                    "workspace_id": str(
+                        child.get("workspace_id") or event.get("workspace_id") or ""
+                    ),
+                    "sequence": int(event["sequence"]),
+                }
+                self._apply_normalized_event(conn, child_event, applied_at)
+            return
         provider = str(event.get("provider") or "")
         workspace_id = str(event.get("workspace_id") or "")
         if not provider or not workspace_id:
@@ -684,7 +712,12 @@ class MessageStore:
     def query(self, request: dict[str, Any]) -> dict[str, Any]:
         """Bounded project-local read after IE has resolved current ACL."""
         operation = str(request.get("operation") or "")
-        if operation not in {"recent_activity", "fetch_history", "ingest_window"}:
+        if operation not in {
+            "recent_activity",
+            "fetch_history",
+            "fetch_snapshot",
+            "ingest_window",
+        }:
             raise ValueError("unsupported message store query operation")
         start = str(request.get("start") or "")
         end = str(request.get("end") or "")
@@ -738,6 +771,30 @@ class MessageStore:
             len(conversations) != 1 or (allowed is not None and len(allowed) != 1)
         ):
             raise ValueError("fetch_history requires one authorized conversation")
+        snapshot_keys: set[tuple[str, str]] = set()
+        if operation == "fetch_snapshot":
+            raw_keys = request.get("provider_message_keys")
+            if not isinstance(raw_keys, list) or not raw_keys:
+                raise ValueError("fetch_snapshot requires provider message keys")
+            if len(raw_keys) > 1000:
+                raise ValueError("fetch_snapshot provider message key limit is 1000")
+            for item in raw_keys:
+                if not isinstance(item, dict):
+                    raise ValueError("invalid provider message key")
+                key = (
+                    str(item.get("conversation_id") or ""),
+                    str(item.get("provider_message_id") or ""),
+                )
+                if not all(key):
+                    raise ValueError("invalid provider message key")
+                snapshot_keys.add(key)
+            if len(snapshot_keys) != len(raw_keys):
+                raise ValueError("duplicate provider message key")
+            if conversations and any(
+                conversation_id not in conversations
+                for conversation_id, _message_id in snapshot_keys
+            ):
+                raise ValueError("provider message key is outside conversation scope")
 
         with self._writer_lock, self._connect() as conn:
             unresolved_gap = conn.execute(
@@ -749,59 +806,61 @@ class MessageStore:
                     "coverage_complete": False,
                     "reason": "delivery_gap",
                 }
-            coverage_sql = (
-                "SELECT provider, workspace_id, conversation_id, contiguous_since, "
-                "state FROM coverage WHERE project_id = ?"
-            )
-            coverage_params: list[Any] = [self.project_id]
-            coverage_sql, coverage_params = self._query_filters(
-                coverage_sql,
-                coverage_params,
-                providers=providers,
-                workspaces=workspaces,
-                conversations=conversations,
-                allowed=allowed,
-            )
-            coverage_rows = conn.execute(coverage_sql, coverage_params).fetchall()
-            covered_sources = {
-                (
-                    str(row["provider"]),
-                    str(row["workspace_id"]),
-                    str(row["conversation_id"]),
+            coverage_rows = []
+            if operation != "fetch_snapshot":
+                coverage_sql = (
+                    "SELECT provider, workspace_id, conversation_id, contiguous_since, "
+                    "state FROM coverage WHERE project_id = ?"
                 )
-                for row in coverage_rows
-            }
-            if allowed is not None and covered_sources != allowed:
-                return {
-                    "messages": [],
-                    "coverage_complete": False,
-                    "reason": "coverage_missing",
+                coverage_params: list[Any] = [self.project_id]
+                coverage_sql, coverage_params = self._query_filters(
+                    coverage_sql,
+                    coverage_params,
+                    providers=providers,
+                    workspaces=workspaces,
+                    conversations=conversations,
+                    allowed=allowed,
+                )
+                coverage_rows = conn.execute(coverage_sql, coverage_params).fetchall()
+                covered_sources = {
+                    (
+                        str(row["provider"]),
+                        str(row["workspace_id"]),
+                        str(row["conversation_id"]),
+                    )
+                    for row in coverage_rows
                 }
-            if allowed is None and conversations:
-                covered_ids = {item[2] for item in covered_sources}
-                if covered_ids != conversations:
+                if allowed is not None and covered_sources != allowed:
                     return {
                         "messages": [],
                         "coverage_complete": False,
                         "reason": "coverage_missing",
                     }
-            if not coverage_rows:
-                return {
-                    "messages": [],
-                    "coverage_complete": False,
-                    "reason": "coverage_missing",
-                }
-            if any(
-                row["state"] != "COLLECTING"
-                or not row["contiguous_since"]
-                or str(row["contiguous_since"]) > start
-                for row in coverage_rows
-            ):
-                return {
-                    "messages": [],
-                    "coverage_complete": False,
-                    "reason": "coverage_incomplete",
-                }
+                if allowed is None and conversations:
+                    covered_ids = {item[2] for item in covered_sources}
+                    if covered_ids != conversations:
+                        return {
+                            "messages": [],
+                            "coverage_complete": False,
+                            "reason": "coverage_missing",
+                        }
+                if not coverage_rows:
+                    return {
+                        "messages": [],
+                        "coverage_complete": False,
+                        "reason": "coverage_missing",
+                    }
+                if any(
+                    row["state"] != "COLLECTING"
+                    or not row["contiguous_since"]
+                    or str(row["contiguous_since"]) > start
+                    for row in coverage_rows
+                ):
+                    return {
+                        "messages": [],
+                        "coverage_complete": False,
+                        "reason": "coverage_incomplete",
+                    }
 
             time_column = (
                 "m.updated_at" if operation == "ingest_window" else "m.occurred_at"
@@ -828,7 +887,15 @@ class MessageStore:
                 allowed=allowed,
             )
             parent = str(request.get("parent_message_id") or "")
-            if parent:
+            if operation == "fetch_snapshot":
+                clauses = []
+                for conversation_id, message_id in sorted(snapshot_keys):
+                    clauses.append(
+                        "(m.conversation_id=? AND m.provider_message_id=?)"
+                    )
+                    params.extend([conversation_id, message_id])
+                sql += " AND (" + " OR ".join(clauses) + ")"
+            elif parent:
                 sql += " AND (m.provider_message_id=? OR m.parent_message_id=?)"
                 params.extend([parent, parent])
             elif operation == "fetch_history":
@@ -859,7 +926,11 @@ class MessageStore:
                 "m.workspace_id DESC, m.conversation_id DESC, "
                 "m.provider_message_id DESC LIMIT ?"
             )
-            params.append(limit * 10 if operation == "recent_activity" else limit)
+            params.append(
+                limit * 10
+                if operation == "recent_activity"
+                else max(limit, len(snapshot_keys))
+            )
             rows = conn.execute(sql, params).fetchall()
             selected_rows = []
             per_counts: dict[str, int] = {}
@@ -910,7 +981,27 @@ class MessageStore:
             messages: list[dict[str, Any]] = []
             for row in selected_rows:
                 conversation_id = str(row["conversation_id"])
-                reaction_map = reactions_by_message.get(
+                try:
+                    provider_payload = json.loads(row["provider_payload_json"] or "{}")
+                except json.JSONDecodeError:
+                    provider_payload = {}
+                reaction_map: dict[str, dict[str, Any]] = {}
+                for reaction in provider_payload.get("reactions") or []:
+                    if not isinstance(reaction, dict):
+                        continue
+                    name = str(reaction.get("name") or "")
+                    if not name:
+                        continue
+                    users = [
+                        str(actor)
+                        for actor in reaction.get("users") or []
+                        if str(actor)
+                    ]
+                    reaction_map[name] = {
+                        "count": max(int(reaction.get("count") or 0), len(users)),
+                        "users": users,
+                    }
+                stored_reactions = reactions_by_message.get(
                     (
                         str(row["provider"]),
                         str(row["workspace_id"]),
@@ -919,10 +1010,18 @@ class MessageStore:
                     ),
                     {},
                 )
-                try:
-                    provider_payload = json.loads(row["provider_payload_json"] or "{}")
-                except json.JSONDecodeError:
-                    provider_payload = {}
+                for name, actors in stored_reactions.items():
+                    current = reaction_map.setdefault(
+                        name,
+                        {"count": 0, "users": []},
+                    )
+                    current["users"] = sorted(
+                        set(current["users"]) | set(actors)
+                    )
+                    current["count"] = max(
+                        int(current["count"]),
+                        len(current["users"]),
+                    )
                 messages.append(
                     {
                         "provider": row["provider"],
@@ -939,11 +1038,33 @@ class MessageStore:
                         "edited_at": row["edited_at"],
                         "provider_payload": provider_payload,
                         "reactions": [
-                            {"name": name, "count": len(users), "users": users}
-                            for name, users in sorted(reaction_map.items())
+                            {
+                                "name": name,
+                                "count": value["count"],
+                                "users": value["users"],
+                            }
+                            for name, value in sorted(reaction_map.items())
                         ],
                     }
                 )
+            if operation == "fetch_snapshot":
+                returned_keys = {
+                    (
+                        str(message["conversation_id"]),
+                        str(message["provider_message_id"]),
+                    )
+                    for message in messages
+                }
+                missing = snapshot_keys - returned_keys
+                cursor = conn.execute(
+                    "SELECT last_sequence FROM delivery_cursor WHERE stream='project'"
+                ).fetchone()
+                return {
+                    "messages": messages,
+                    "coverage_complete": not missing,
+                    "reason": "snapshot_missing" if missing else "snapshot_exact",
+                    "last_sequence": int(cursor[0]) if cursor else 0,
+                }
             floor = max(str(row["contiguous_since"]) for row in coverage_rows)
             result = {
                 "messages": messages,

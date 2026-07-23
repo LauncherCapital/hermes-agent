@@ -592,6 +592,225 @@ def test_normalized_events_share_one_apply_path_and_tombstone_wins(
     assert membership[0] == 1
 
 
+def test_normalized_event_batch_applies_atomically_in_order(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+
+    result = store.record_envelope(
+        {
+            "project_id": project_id,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "delivery_id": "batch-1",
+            "sequence": 1,
+            "event_type": "events.batch",
+            "events": [
+                {
+                    "event_type": "message.created",
+                    "conversation_id": "C1",
+                    "message_id": "M1",
+                    "sender_id": "U1",
+                    "text": "original",
+                    "occurred_at": "2026-07-21T00:00:01+00:00",
+                    "provider_version": "0001",
+                    "provider_payload": {
+                        "reactions": [
+                            {
+                                "name": "white_check_mark",
+                                "count": 3,
+                                "users": ["U1", "U2"],
+                            }
+                        ]
+                    },
+                },
+                {
+                    "event_type": "message.updated",
+                    "conversation_id": "C1",
+                    "message_id": "M1",
+                    "sender_id": "U1",
+                    "text": "edited",
+                    "occurred_at": "2026-07-21T00:00:02+00:00",
+                    "provider_version": "0002",
+                    "provider_payload": {
+                        "reactions": [
+                            {
+                                "name": "white_check_mark",
+                                "count": 3,
+                                "users": ["U1", "U2"],
+                            }
+                        ]
+                    },
+                },
+                {
+                    "event_type": "reaction.added",
+                    "conversation_id": "C1",
+                    "message_id": "M1",
+                    "reaction_name": "white_check_mark",
+                    "actor_id": "U2",
+                    "occurred_at": "2026-07-21T00:00:03+00:00",
+                },
+                {
+                    "event_type": "coverage.completed",
+                    "conversation_id": "C1",
+                    "contiguous_since": "2026-07-20T00:00:00+00:00",
+                    "occurred_at": "2026-07-21T00:00:04+00:00",
+                },
+            ],
+        },
+        "batch-hash",
+    )
+
+    with store._connect() as conn:
+        message = conn.execute(
+            "SELECT text, provider_version FROM messages WHERE provider_message_id='M1'"
+        ).fetchone()
+        reaction = conn.execute(
+            "SELECT reaction_name, actor_id FROM reactions"
+        ).fetchone()
+        deliveries = conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0]
+    queried = store.query(
+        {
+            "operation": "fetch_history",
+            "start": "2026-07-21T00:00:00+00:00",
+            "end": "2026-07-21T01:00:00+00:00",
+            "providers": ["slack"],
+            "workspace_ids": ["T1"],
+            "conversation_ids": ["C1"],
+            "limit": 10,
+        }
+    )
+
+    assert result["status"] == "accepted"
+    assert tuple(message) == ("edited", "0002")
+    assert tuple(reaction) == ("white_check_mark", "U2")
+    assert deliveries == 1
+    assert queried["messages"][0]["reactions"] == [
+        {
+            "name": "white_check_mark",
+            "count": 3,
+            "users": ["U1", "U2"],
+        }
+    ]
+
+
+def test_normalized_event_batch_rolls_back_every_child_on_failure(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+
+    with pytest.raises(ValueError, match="unsupported normalized event type"):
+        store.record_envelope(
+            {
+                "project_id": project_id,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "delivery_id": "batch-invalid",
+                "sequence": 1,
+                "event_type": "events.batch",
+                "events": [
+                    {
+                        "event_type": "message.created",
+                        "conversation_id": "C1",
+                        "message_id": "M1",
+                        "text": "must roll back",
+                        "occurred_at": "2026-07-21T00:00:01+00:00",
+                        "provider_version": "0001",
+                    },
+                    {"event_type": "unsupported.fixture"},
+                ],
+            },
+            "batch-invalid-hash",
+        )
+
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM delivery_cursor"
+        ).fetchone()[0] == 0
+
+
+def test_snapshot_query_reads_exact_acked_ids_without_claiming_contiguous_coverage(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store.record_envelope(
+        {
+            "project_id": project_id,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "delivery_id": "snapshot-batch",
+            "sequence": 1,
+            "event_type": "events.batch",
+            "events": [
+                {
+                    "event_type": "message.created",
+                    "conversation_id": "C1",
+                    "message_id": "M1",
+                    "text": "selected",
+                    "occurred_at": "2026-07-21T00:00:01+00:00",
+                    "provider_version": "0001",
+                },
+                {
+                    "event_type": "message.created",
+                    "conversation_id": "C2",
+                    "message_id": "M2",
+                    "text": "not selected",
+                    "occurred_at": "2026-07-21T00:00:02+00:00",
+                    "provider_version": "0002",
+                },
+            ],
+        },
+        "snapshot-batch-hash",
+    )
+    base = {
+        "operation": "fetch_snapshot",
+        "start": "2026-07-21T00:00:00+00:00",
+        "end": "2026-07-21T01:00:00+00:00",
+        "allowed_source_ids": ["slack:T1:C1"],
+        "provider_message_keys": [
+            {"conversation_id": "C1", "provider_message_id": "M1"}
+        ],
+        "limit": 10,
+    }
+
+    exact = store.query(base)
+    missing = store.query(
+        {
+            **base,
+            "provider_message_keys": [
+                {"conversation_id": "C1", "provider_message_id": "missing"}
+            ],
+        }
+    )
+
+    assert exact["coverage_complete"] is True
+    assert exact["reason"] == "snapshot_exact"
+    assert [item["provider_message_id"] for item in exact["messages"]] == ["M1"]
+    assert missing["coverage_complete"] is False
+    assert missing["reason"] == "snapshot_missing"
+    with pytest.raises(ValueError, match="outside conversation scope"):
+        store.query(
+            {
+                **base,
+                "provider_message_keys": [
+                    {"conversation_id": "C2", "provider_message_id": "M2"}
+                ],
+            }
+        )
+
+
 def test_reaction_tombstone_rejects_stale_add(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     project_id = str(uuid.uuid4())
