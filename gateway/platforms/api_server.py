@@ -1570,10 +1570,10 @@ class APIServerAdapter(BasePlatformAdapter):
         Body (all keys optional):
           model:       {"default": str, "provider": str?} → config.yaml model.*
                        (picked up per request — the next turn uses it)
-          agent:       {"reasoning_effort": str | null} → config.yaml
-                       agent.reasoning_effort (none|minimal|low|medium|high|xhigh;
-                       null clears back to the default). Read per request like
-                       model — the next turn uses it.
+          agent:       {"reasoning_effort": str | null, "max_turns": int} →
+                       config.yaml agent.*. reasoning_effort accepts
+                       none|minimal|low|medium|high|xhigh; null clears it.
+                       max_turns must be positive. Both apply on the next turn.
           mcp_servers: {name: {url, headers?, enabled?, tools?} | null} — upsert
                        entries, null removes; tools = {include?/exclude?: [names]}
                        (selective tool loading); additions connect via incremental
@@ -1649,6 +1649,26 @@ class APIServerAdapter(BasePlatformAdapter):
                         config["agent"] = agent_cfg
                         config_dirty = True
                     applied["reasoning_effort"] = effort
+
+            if isinstance(agent_spec, dict) and "max_turns" in agent_spec:
+                raw_max_turns = agent_spec.get("max_turns")
+                try:
+                    max_turns = int(raw_max_turns)
+                except (TypeError, ValueError):
+                    max_turns = 0
+                if max_turns < 1:
+                    return web.json_response(
+                        _openai_error("max_turns must be a positive integer"),
+                        status=400,
+                    )
+                agent_cfg = config.get("agent")
+                if not isinstance(agent_cfg, dict):
+                    agent_cfg = {}
+                if agent_cfg.get("max_turns") != max_turns:
+                    agent_cfg["max_turns"] = max_turns
+                    config["agent"] = agent_cfg
+                    config_dirty = True
+                applied["max_turns"] = max_turns
 
             mcp_spec = body.get("mcp_servers")
             if isinstance(mcp_spec, dict):
@@ -1727,6 +1747,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
             if config_dirty:
                 save_config(config)
+            if "max_turns" in applied:
+                os.environ["HERMES_MAX_ITERATIONS"] = str(applied["max_turns"])
 
             env_spec = body.get("env")
             if isinstance(env_spec, dict) and env_spec:
@@ -4106,6 +4128,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                 "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
                 "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                "cache_read_tokens": getattr(agent, "session_cache_read_tokens", 0) or 0,
+                "cache_write_tokens": getattr(agent, "session_cache_write_tokens", 0) or 0,
             }
             # Include the effective session ID in the result so callers
             # (e.g. X-Hermes-Session-Id header) can track compression-
