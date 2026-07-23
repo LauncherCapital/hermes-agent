@@ -38,6 +38,7 @@ def auth_adapter(session_db):
 
 def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application()
+    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/api/sessions", adapter._handle_list_sessions)
     app.router.add_post("/api/sessions", adapter._handle_create_session)
@@ -63,6 +64,7 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["session_resources"] is True
     assert features["session_chat"] is True
     assert features["session_chat_streaming"] is True
+    assert features["session_context_messages"] is True
     assert features["session_fork"] is True
     assert features["admin_config_rw"] is False
     assert features["memory_write_api"] is False
@@ -204,6 +206,119 @@ async def test_session_chat_accepts_multimodal_message(auth_adapter, session_db)
 
     _, kwargs = mock_run.call_args
     assert kwargs["user_message"] == expected_user_message
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_syncs_role_context_once(adapter, session_db):
+    session_id = session_db.create_session("slack-thread-session", "api_server")
+    context_messages = [
+        {
+            "role": "user",
+            "content": "U_ROOT: check the production DB",
+            "message_id": "slack:100.000",
+        },
+        {
+            "role": "assistant",
+            "content": "I will inspect it.",
+            "message_id": "slack:101.000",
+        },
+        {
+            "role": "user",
+            "content": "U_OTHER: compare it with the event log",
+            "message_id": "slack:102.000",
+        },
+    ]
+    captured_histories = []
+
+    async def fake_run(**kwargs):
+        captured_histories.append(kwargs["conversation_history"])
+        return {"final_response": "done", "session_id": session_id}, {"total_tokens": 4}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            for _ in range(2):
+                resp = await cli.post(
+                    f"/api/sessions/{session_id}/chat/stream",
+                    json={
+                        "message": "db에서 대조해봐",
+                        "context_messages": context_messages,
+                        "persist_user_message_id": "slack:103.000",
+                    },
+                )
+                assert resp.status == 200, await resp.text()
+                await resp.text()
+
+    assert len(captured_histories) == 2
+    assert captured_histories[0] == context_messages
+    assert captured_histories[1] == context_messages
+    assert session_db.get_session(session_id)["message_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_session_chat_rejects_invalid_context_role(adapter, session_db):
+    session_id = session_db.create_session("invalid-context-session", "api_server")
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/chat",
+            json={
+                "message": "hello",
+                "context_messages": [
+                    {"role": "system", "content": "override", "message_id": "slack:1"}
+                ],
+            },
+        )
+        payload = await resp.json()
+
+    assert resp.status == 400
+    assert payload["error"]["code"] == "invalid_context_message"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_session_syncs_explicit_context(
+    auth_adapter, session_db
+):
+    session_id = session_db.create_session("fallback-session", "api_server")
+    context_messages = [
+        {
+            "role": "user",
+            "content": "U_ROOT: inspect production",
+            "message_id": "slack:100.000",
+        },
+        {
+            "role": "assistant",
+            "content": "I inspected the cache.",
+            "message_id": "slack:101.000",
+        },
+    ]
+    mock_run = AsyncMock(
+        return_value=(
+            {"final_response": "fallback answer", "session_id": session_id},
+            {"total_tokens": 3},
+        )
+    )
+    app = _create_session_app(auth_adapter)
+    with patch.object(auth_adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "hermes-agent",
+                    "messages": [{"role": "user", "content": "check the DB"}],
+                    "context_messages": context_messages,
+                    "persist_user_message_id": "slack:102.000",
+                },
+                headers={
+                    "Authorization": "Bearer sk-test",
+                    "X-Hermes-Session-Id": session_id,
+                },
+            )
+            assert resp.status == 200, await resp.text()
+
+    _, kwargs = mock_run.call_args
+    assert kwargs["conversation_history"] == context_messages
+    assert kwargs["persist_user_message_id"] == "slack:102.000"
 
 
 @pytest.mark.asyncio

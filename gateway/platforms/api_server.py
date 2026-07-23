@@ -334,6 +334,87 @@ def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") 
         return None, _multimodal_validation_error(exc, param=param)
 
 
+def _session_chat_context_messages(
+    body: Dict[str, Any],
+) -> tuple[List[Dict[str, str]], Optional["web.Response"]]:
+    """Validate role-tagged external messages that precede the live user turn."""
+    raw_messages = body.get("context_messages")
+    if raw_messages is None:
+        return [], None
+    if not isinstance(raw_messages, list) or len(raw_messages) > 100:
+        return [], web.json_response(
+            _openai_error(
+                "context_messages must be an array with at most 100 entries",
+                code="invalid_context_messages",
+            ),
+            status=400,
+        )
+
+    messages: List[Dict[str, str]] = []
+    for idx, raw in enumerate(raw_messages):
+        if not isinstance(raw, dict) or raw.get("role") not in {"user", "assistant"}:
+            return [], web.json_response(
+                _openai_error(
+                    f"context_messages[{idx}] must have role 'user' or 'assistant'",
+                    code="invalid_context_message",
+                ),
+                status=400,
+            )
+        content = raw.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return [], web.json_response(
+                _openai_error(
+                    f"context_messages[{idx}].content must be a non-empty string",
+                    code="invalid_context_message",
+                ),
+                status=400,
+            )
+        message: Dict[str, str] = {
+            "role": str(raw["role"]),
+            "content": content,
+        }
+        message_id = raw.get("message_id")
+        if message_id is not None:
+            if (
+                not isinstance(message_id, str)
+                or not message_id.strip()
+                or len(message_id) > 512
+                or re.search(r"[\r\n\x00]", message_id)
+            ):
+                return [], web.json_response(
+                    _openai_error(
+                        f"context_messages[{idx}].message_id is invalid",
+                        code="invalid_context_message",
+                    ),
+                    status=400,
+                )
+            message["message_id"] = message_id.strip()
+        messages.append(message)
+    return messages, None
+
+
+def _session_chat_persist_user_message_id(
+    body: Dict[str, Any],
+) -> tuple[Optional[str], Optional["web.Response"]]:
+    message_id = body.get("persist_user_message_id")
+    if message_id is None:
+        return None, None
+    if (
+        not isinstance(message_id, str)
+        or not message_id.strip()
+        or len(message_id) > 512
+        or re.search(r"[\r\n\x00]", message_id)
+    ):
+        return None, web.json_response(
+            _openai_error(
+                "persist_user_message_id is invalid",
+                code="invalid_message_id",
+            ),
+            status=400,
+        )
+    return message_id.strip(), None
+
+
 def check_api_server_requirements() -> bool:
     """Check if API server dependencies are available."""
     return AIOHTTP_AVAILABLE
@@ -1317,6 +1398,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_resources": True,
                 "session_chat": True,
                 "session_chat_streaming": True,
+                "session_context_messages": True,
                 "session_fork": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
@@ -1890,6 +1972,54 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
 
+    def _conversation_history_with_context(
+        self,
+        session_id: str,
+        context_messages: List[Dict[str, str]],
+    ) -> List[Dict[str, Any]]:
+        """Persist unseen external turns, then return one ordered session history."""
+        history = self._conversation_history_for_session(session_id)
+        if not context_messages:
+            return history
+        db = self._ensure_session_db()
+        if db is None:
+            return [*history, *context_messages]
+
+        existing_ids = {
+            str(message.get("message_id"))
+            for message in history
+            if message.get("message_id")
+        }
+        unkeyed_counts: Dict[tuple[str, str], int] = {}
+        for message in history:
+            if message.get("message_id"):
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                key = (str(message.get("role") or ""), content)
+                unkeyed_counts[key] = unkeyed_counts.get(key, 0) + 1
+
+        appended = False
+        for message in context_messages:
+            message_id = message.get("message_id")
+            if message_id and message_id in existing_ids:
+                continue
+            key = (message["role"], message["content"])
+            if unkeyed_counts.get(key, 0) > 0:
+                unkeyed_counts[key] -= 1
+                continue
+            db.append_message(
+                session_id,
+                message["role"],
+                message["content"],
+                platform_message_id=message_id,
+            )
+            if message_id:
+                existing_ids.add(message_id)
+            appended = True
+
+        return self._conversation_history_for_session(session_id) if appended else history
+
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list persisted Hermes sessions."""
         auth_err = self._check_auth(request)
@@ -2089,16 +2219,23 @@ class APIServerAdapter(BasePlatformAdapter):
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
+        context_messages, err = _session_chat_context_messages(body)
+        if err is not None:
+            return err
+        persist_user_message_id, err = _session_chat_persist_user_message_id(body)
+        if err is not None:
+            return err
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
-        history = self._conversation_history_for_session(session_id)
+        history = self._conversation_history_with_context(session_id, context_messages)
         result, usage = await self._run_agent(
             user_message=user_message,
             conversation_history=history,
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            persist_user_message_id=persist_user_message_id,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -2131,6 +2268,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         user_message, err = _session_chat_user_message(body)
+        if err is not None:
+            return err
+        context_messages, err = _session_chat_context_messages(body)
+        if err is not None:
+            return err
+        persist_user_message_id, err = _session_chat_persist_user_message_id(body)
         if err is not None:
             return err
         system_prompt = body.get("system_message") or body.get("instructions")
@@ -2181,7 +2324,9 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
-                history = self._conversation_history_for_session(session_id)
+                history = self._conversation_history_with_context(
+                    session_id, context_messages
+                )
                 result, usage = await self._run_agent(
                     user_message=user_message,
                     conversation_history=history,
@@ -2190,6 +2335,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
+                    persist_user_message_id=persist_user_message_id,
                 )
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -2274,6 +2420,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": {"message": "Missing or invalid 'messages' field", "type": "invalid_request_error"}},
                 status=400,
             )
+        context_messages, context_err = _session_chat_context_messages(body)
+        if context_err is not None:
+            return context_err
+        persist_user_message_id, message_id_err = (
+            _session_chat_persist_user_message_id(body)
+        )
+        if message_id_err is not None:
+            return message_id_err
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
 
@@ -2353,7 +2507,9 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 db = self._ensure_session_db()
                 if db is not None:
-                    history = db.get_messages_as_conversation(session_id)
+                    history = self._conversation_history_with_context(
+                        session_id, context_messages
+                    )
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
@@ -2369,6 +2525,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
+            if context_messages:
+                history = [*context_messages, *history]
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
@@ -2456,6 +2614,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                persist_user_message_id=persist_user_message_id,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -2475,11 +2634,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                persist_user_message_id=persist_user_message_id,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
-            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
+            fp = _make_request_fingerprint(
+                body,
+                keys=[
+                    "model",
+                    "messages",
+                    "context_messages",
+                    "persist_user_message_id",
+                    "tools",
+                    "tool_choice",
+                    "stream",
+                ],
+            )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
             except Exception as e:
@@ -4092,6 +4263,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        persist_user_message_id: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4119,10 +4291,15 @@ class APIServerAdapter(BasePlatformAdapter):
             if agent_ref is not None:
                 agent_ref[0] = agent
             effective_task_id = session_id or str(uuid.uuid4())
+            run_kwargs = {
+                "user_message": user_message,
+                "conversation_history": conversation_history,
+                "task_id": effective_task_id,
+            }
+            if persist_user_message_id is not None:
+                run_kwargs["persist_user_message_id"] = persist_user_message_id
             result = agent.run_conversation(
-                user_message=user_message,
-                conversation_history=conversation_history,
-                task_id=effective_task_id,
+                **run_kwargs,
             )
             usage = {
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,

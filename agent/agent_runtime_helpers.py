@@ -361,8 +361,10 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
     Repairs applied:
       1. Stray ``tool`` messages whose ``tool_call_id`` doesn't match
          any preceding assistant tool_call — dropped.
-      2. Consecutive ``user`` messages — merged with newline separator
-         so no user input is lost.
+      2. Consecutive anonymous ``user`` messages — merged with newline
+         separator so no user input is lost. Externally identified turns stay
+         separate so multi-speaker attribution and the live-turn boundary
+         survive to the provider.
 
     Deliberately does NOT rewind orphan ``assistant(tool_calls)+tool``
     pairs that precede a user message — that pattern IS valid when the
@@ -419,6 +421,8 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
             and msg.get("role") == "user"
             and isinstance(merged[-1], dict)
             and merged[-1].get("role") == "user"
+            and not msg.get("message_id")
+            and not merged[-1].get("message_id")
         ):
             prev = merged[-1]
             prev_content = prev.get("content", "")
