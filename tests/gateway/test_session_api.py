@@ -65,6 +65,7 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["session_chat"] is True
     assert features["session_chat_streaming"] is True
     assert features["session_context_messages"] is True
+    assert features["standard_session_messages"] is True
     assert features["session_fork"] is True
     assert features["admin_config_rw"] is False
     assert features["memory_write_api"] is False
@@ -253,6 +254,105 @@ async def test_session_chat_stream_syncs_role_context_once(adapter, session_db):
     assert captured_histories[0] == context_messages
     assert captured_histories[1] == context_messages
     assert session_db.get_session(session_id)["message_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_uses_canonical_standard_messages(
+    adapter,
+    session_db,
+):
+    session_id = session_db.create_session("canonical-session", "api_server")
+    session_db.append_message(session_id, "user", "stale local history")
+    captured = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        return {
+            "final_response": "fresh",
+            "session_id": session_id,
+            "messages": [
+                *kwargs["conversation_history"],
+                {"role": "user", "content": kwargs["user_message"]},
+                {"role": "assistant", "content": "fresh"},
+            ],
+        }, {"total_tokens": 4}
+
+    messages = [
+        {"role": "system", "content": "fixed rules"},
+        {"role": "developer", "content": "prior rolling summary"},
+        {
+            "role": "assistant",
+            "content": "checking",
+            "tool_calls": [{"id": "call-1"}],
+        },
+        {
+            "role": "tool",
+            "content": "result",
+            "tool_call_id": "call-1",
+            "name": "search",
+        },
+        {"role": "user", "content": "continue"},
+    ]
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"messages": messages},
+            )
+            assert resp.status == 200, await resp.text()
+            await resp.text()
+
+    assert captured["user_message"] == "continue"
+    assert captured["ephemeral_system_prompt"] == "fixed rules"
+    assert captured["conversation_history"] == messages[1:-1]
+    assert all(
+        message.get("content") != "stale local history"
+        for message in captured["conversation_history"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_preserves_standard_developer_and_tool_history(
+    adapter,
+):
+    captured = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        return {
+            "final_response": "fresh",
+            "session_id": kwargs["session_id"],
+        }, {"total_tokens": 4}
+
+    messages = [
+        {"role": "system", "content": "fixed rules"},
+        {"role": "developer", "content": "prior rolling summary"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1"}],
+        },
+        {
+            "role": "tool",
+            "content": "result",
+            "tool_call_id": "call-1",
+            "name": "search",
+        },
+        {"role": "user", "content": "continue"},
+    ]
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                json={"model": "hermes-agent", "messages": messages},
+            )
+            assert resp.status == 200, await resp.text()
+
+    assert captured["user_message"] == "continue"
+    assert captured["ephemeral_system_prompt"] == "fixed rules"
+    assert captured["conversation_history"] == messages[1:-1]
 
 
 @pytest.mark.asyncio
