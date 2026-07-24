@@ -25,6 +25,7 @@ _LANGUAGE = re.compile(
     r"(?mi)^\s*language_preference\s*:\s*"
     r"(ko|en|ja|zh-CN|zh-TW)\s*$"
 )
+_LEGACY_SECTION_MARKER = "<!-- migrated-from-ringo-profile-sync -->"
 
 
 class EntitySkillError(RuntimeError):
@@ -49,6 +50,12 @@ def _optional_component(value: object, field: str) -> str:
     if value is None or value == "":
         return ""
     return _component(value, field)
+
+
+def _optional_uuid(value: object, field: str) -> str:
+    if value is None or value == "":
+        return ""
+    return _uuid(value, field)
 
 
 def _hash(content: bytes) -> str:
@@ -135,6 +142,135 @@ class EntitySkillService:
         if not path.is_relative_to(self.skills_root):
             raise EntitySkillError("entity skill path escapes root")
         return path
+
+    @staticmethod
+    def _legacy_title(paths: list[Path], fallback: str) -> str:
+        for path in paths:
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeError):
+                continue
+            for line in lines:
+                if line.startswith("# "):
+                    title = line[2:].strip()
+                    if title:
+                        return title
+        return fallback
+
+    @staticmethod
+    def _legacy_sections(paths: list[Path]) -> list[tuple[str, list[str]]]:
+        sections: list[tuple[str, list[str]]] = []
+        for path in paths:
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except FileNotFoundError:
+                continue
+            except (OSError, UnicodeError) as exc:
+                raise EntitySkillError("legacy profile could not be read") from exc
+            if path.name == "notes.md":
+                note = " ".join(
+                    line.strip()
+                    for line in lines
+                    if line.strip() and not line.strip().startswith("<!--")
+                )
+                if note:
+                    sections.append(("Working notes", [note]))
+                continue
+            heading = ""
+            values: list[str] = []
+            for raw in lines:
+                line = raw.strip()
+                if line.startswith("## "):
+                    if heading and values:
+                        sections.append((heading, values))
+                    heading = line[3:].strip()
+                    values = []
+                    continue
+                if not heading or not line.startswith("- "):
+                    continue
+                value = " ".join(line[2:].split())
+                if value and value.casefold() != "none" and value not in values:
+                    values.append(value)
+            if heading and values:
+                sections.append((heading, values))
+        return sections
+
+    @staticmethod
+    def _write_atomic(path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        target = path.with_name(path.name + ".ringo-tmp")
+        target.write_text(content, encoding="utf-8")
+        os.chmod(target, 0o600)
+        os.replace(target, path)
+        os.chmod(path, 0o600)
+
+    def _migrate_legacy(
+        self,
+        *,
+        kind: str,
+        entity_id: str,
+        legacy_dir: Path,
+        legacy_names: tuple[str, ...],
+    ) -> bool:
+        paths = [legacy_dir / name for name in legacy_names]
+        existing = [path for path in paths if path.is_file() and not path.is_symlink()]
+        if not existing:
+            return False
+        target = self._path(kind, entity_id)
+        try:
+            current = target.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            title = self._legacy_title(existing, entity_id)
+            current = (
+                "---\n"
+                f"name: {kind[:-1]}-{entity_id}\n"
+                f"description: {json.dumps(title + ' context', ensure_ascii=False)}\n"
+                "---\n\n"
+                f"# {title}\n"
+            )
+        except (OSError, UnicodeError) as exc:
+            raise EntitySkillError("entity skill could not be read") from exc
+
+        sections = self._legacy_sections(existing)
+        if sections and _LEGACY_SECTION_MARKER not in current:
+            additions = ["", _LEGACY_SECTION_MARKER, "## Profile knowledge"]
+            for heading, values in sections:
+                additions.extend(["", f"### {heading}"])
+                additions.extend(f"- {value}" for value in values)
+            current = current.rstrip() + "\n" + "\n".join(additions) + "\n"
+        self._write_atomic(target, current)
+
+        for path in existing:
+            path.unlink()
+        parent = legacy_dir
+        while parent != self.home:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+        return True
+
+    def _migrate_legacy_context(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+        principal_id: str,
+    ) -> None:
+        self._migrate_legacy(
+            kind="organizations",
+            entity_id=workspace_id,
+            legacy_dir=self.home / "organizations" / "slack" / workspace_id,
+            legacy_names=("profile.md", "ORGANIZATION.md"),
+        )
+        if user_id and principal_id:
+            self._migrate_legacy(
+                kind="users",
+                entity_id=user_id,
+                legacy_dir=self.home / "profiles" / principal_id,
+                legacy_names=("profile.md", "CHARACTER.md", "notes.md"),
+            )
 
     @staticmethod
     def _team_slug(value: object) -> str:
@@ -241,8 +377,15 @@ class EntitySkillService:
             raise EntitySkillError("invalid prepare payload")
         agent_id = _uuid(payload.get("agent_id"), "agent_id")
         workspace_id = _component(payload.get("workspace_id"), "workspace_id")
+        user_id = _optional_component(payload.get("user_id"), "user_id")
+        principal_id = _optional_uuid(payload.get("principal_id"), "principal_id")
         session_id = _component(payload.get("session_id"), "session_id")
         turn_id = _component(payload.get("turn_id"), "turn_id")
+        self._migrate_legacy_context(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            principal_id=principal_id,
+        )
         entities = self._entities(payload)
         paths = {item["path"] for item in entities}
 
@@ -387,10 +530,16 @@ class EntitySkillService:
         *,
         workspace_id: str,
         user_id: str = "",
+        principal_id: str = "",
         channel_id: str = "",
         channel_type: str = "",
         team_slug: str = "",
     ) -> dict[str, Any]:
+        self._migrate_legacy_context(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            principal_id=principal_id,
+        )
         requested = [("organizations", workspace_id)]
         if user_id:
             requested.append(("users", user_id))
@@ -456,6 +605,10 @@ class EntitySkillService:
         return self._context_payload(
             workspace_id=workspace_id,
             user_id=_optional_component(payload.get("user_id"), "user_id"),
+            principal_id=_optional_uuid(
+                payload.get("principal_id"),
+                "principal_id",
+            ),
             channel_id=_optional_component(
                 payload.get("channel_id"),
                 "channel_id",
@@ -494,6 +647,10 @@ class EntitySkillService:
                     "workspace_id",
                 ),
                 user_id=_optional_component(runtime.get("user_id"), "user_id"),
+                principal_id=_optional_uuid(
+                    runtime.get("principal_id"),
+                    "principal_id",
+                ),
                 channel_id=_optional_component(
                     runtime.get("channel_id"),
                     "channel_id",

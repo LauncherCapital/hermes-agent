@@ -229,3 +229,68 @@ def test_finish_reports_only_actual_file_changes(tmp_path):
     )
     assert result["status"] == "applied"
     assert result["changed"] == [str(user_path)]
+
+
+def test_context_migrates_legacy_profile_files_into_entity_skills(tmp_path):
+    service_mod = _load_service_module()
+    service = service_mod.EntitySkillService(tmp_path)
+    principal_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    legacy_user = tmp_path / "profiles" / principal_id
+    legacy_user.mkdir(parents=True)
+    (legacy_user / "profile.md").write_text(
+        "# Suho Seok\n\n## Confirmed\n- Role: Founder\n",
+        encoding="utf-8",
+    )
+    (legacy_user / "CHARACTER.md").write_text(
+        "# Suho Seok\n\n## Preference\n- Concise answers\n",
+        encoding="utf-8",
+    )
+    (legacy_user / "notes.md").write_text(
+        "Explains decisions in Korean.",
+        encoding="utf-8",
+    )
+    legacy_org = tmp_path / "organizations" / "slack" / "T1"
+    legacy_org.mkdir(parents=True)
+    (legacy_org / "profile.md").write_text(
+        "# Launcher Capital Inc.\n",
+        encoding="utf-8",
+    )
+    (legacy_org / "ORGANIZATION.md").write_text(
+        "# Launcher Capital Inc.\n\n## Working norms\n- Ship small changes\n",
+        encoding="utf-8",
+    )
+    _skill(tmp_path / "skills/users/U1/SKILL.md", "Existing user context.")
+    _skill(
+        tmp_path / "skills/organizations/T1/SKILL.md",
+        "Existing organization context.",
+    )
+
+    result = service.context(
+        request={
+            "project_id": PROJECT_ID,
+            "payload": {
+                "workspace_id": "T1",
+                "user_id": "U1",
+                "principal_id": principal_id,
+            },
+        }
+    )
+
+    user_skill = (tmp_path / "skills/users/U1/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    organization_skill = (
+        tmp_path / "skills/organizations/T1/SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "Existing user context." in user_skill
+    assert "Role: Founder" in user_skill
+    assert "Concise answers" in user_skill
+    assert "Explains decisions in Korean." in user_skill
+    assert "Existing organization context." in organization_skill
+    assert "Ship small changes" in organization_skill
+    assert not legacy_user.exists()
+    assert not legacy_org.exists()
+    assert {item["kind"] for item in result["documents"]} == {
+        "users",
+        "organizations",
+    }
