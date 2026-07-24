@@ -218,7 +218,7 @@ def _constant_time_equal(left: str, right: str) -> bool:
 
 
 class EventReplayGuard:
-    """Reserve successful signed requests across restarts and concurrent calls."""
+    """Reserve signed requests and persist only successfully applied deliveries."""
 
     def __init__(self, path: Path | None = None):
         self.path = path or (state_dir() / "event_replays.db")
@@ -235,8 +235,21 @@ class EventReplayGuard:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS seen_requests ("
                 "delivery_id TEXT PRIMARY KEY, body_sha256 TEXT NOT NULL, "
-                "seen_at INTEGER NOT NULL)"
+                "seen_at INTEGER NOT NULL, committed INTEGER NOT NULL DEFAULT 0)"
             )
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(seen_requests)")
+            }
+            if "committed" not in columns:
+                conn.execute(
+                    "ALTER TABLE seen_requests "
+                    "ADD COLUMN committed INTEGER NOT NULL DEFAULT 0"
+                )
+            # A row that was merely reserved by a process which no longer exists
+            # is not proof that the plugin committed it. Replaying it is safe:
+            # the project message store has its own atomic delivery dedup.
+            conn.execute("DELETE FROM seen_requests WHERE committed = 0")
         os.chmod(self.path, 0o600)
 
     def reserve(self, delivery_id: str, body_sha256: str) -> str:
@@ -245,19 +258,37 @@ class EventReplayGuard:
             conn.execute("DELETE FROM seen_requests WHERE seen_at < ?", (cutoff,))
             try:
                 conn.execute(
-                    "INSERT INTO seen_requests(delivery_id, body_sha256, seen_at) "
-                    "VALUES (?, ?, ?)",
+                    "INSERT INTO seen_requests("
+                    "delivery_id, body_sha256, seen_at, committed"
+                    ") VALUES (?, ?, ?, 0)",
                     (delivery_id, body_sha256, int(time.time())),
                 )
                 return "new"
             except sqlite3.IntegrityError:
                 existing = conn.execute(
-                    "SELECT body_sha256 FROM seen_requests WHERE delivery_id = ?",
+                    "SELECT body_sha256, committed FROM seen_requests "
+                    "WHERE delivery_id = ?",
                     (delivery_id,),
                 ).fetchone()
-                if existing and existing[0] == body_sha256:
+                if (
+                    existing
+                    and existing[0] == body_sha256
+                    and bool(existing[1])
+                ):
                     return "duplicate"
+                if existing and existing[0] == body_sha256:
+                    return "pending"
                 return "conflict"
+
+    def commit(self, delivery_id: str, body_sha256: str) -> None:
+        with self._lock, self._connect() as conn:
+            result = conn.execute(
+                "UPDATE seen_requests SET committed = 1, seen_at = ? "
+                "WHERE delivery_id = ? AND body_sha256 = ?",
+                (int(time.time()), delivery_id, body_sha256),
+            )
+            if result.rowcount != 1:
+                raise RuntimeError("event replay reservation was lost before commit")
 
     def release(self, delivery_id: str, body_sha256: str) -> None:
         with self._lock, self._connect() as conn:
