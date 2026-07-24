@@ -1318,6 +1318,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 },
                 status=409,
             )
+        if replay_status == "pending":
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "event_in_progress",
+                        "message": "delivery is already being applied",
+                    }
+                },
+                status=503,
+            )
         try:
             from hermes_cli.plugins import invoke_hook_async
 
@@ -1371,6 +1381,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     },
                     status=409,
                 )
+            guard.commit(verified.delivery_id, verified.body_sha256)
             return web.json_response(
                 {
                     "ok": True,

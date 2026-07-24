@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from gateway.config import PlatformConfig
 from gateway.event_ingress import (
+    EventReplayGuard,
     EventIngressError,
     canonical_request,
     read_project_marker,
@@ -157,6 +158,32 @@ async def test_signed_event_dispatch_and_identical_replay_are_idempotent(tmp_pat
     assert replay.status == 200
     assert replay_payload["replayed"] is True
     hook.assert_awaited_once()
+
+
+def test_replay_guard_drops_uncommitted_reservation_after_restart(tmp_path):
+    path = tmp_path / "event_replays.db"
+    delivery_id = str(uuid.uuid4())
+    digest = "a" * 64
+
+    first = EventReplayGuard(path)
+    assert first.reserve(delivery_id, digest) == "new"
+    assert first.reserve(delivery_id, digest) == "pending"
+
+    restarted = EventReplayGuard(path)
+    assert restarted.reserve(delivery_id, digest) == "new"
+
+
+def test_replay_guard_keeps_committed_delivery_after_restart(tmp_path):
+    path = tmp_path / "event_replays.db"
+    delivery_id = str(uuid.uuid4())
+    digest = "b" * 64
+
+    first = EventReplayGuard(path)
+    assert first.reserve(delivery_id, digest) == "new"
+    first.commit(delivery_id, digest)
+
+    restarted = EventReplayGuard(path)
+    assert restarted.reserve(delivery_id, digest) == "duplicate"
 
 
 @pytest.mark.asyncio
