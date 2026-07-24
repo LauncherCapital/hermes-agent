@@ -263,3 +263,39 @@ async def test_gap_response_releases_replay_reservation(tmp_path, monkeypatch):
     assert first_payload["error"]["code"] == "delivery_gap"
     assert first_payload["error"]["expected_sequence"] == 1
     assert hook.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_conflict_response_releases_replay_reservation(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    key_id = "ie-signing-v1"
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    public_pem = private_key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+    write_project_marker(project_id, event_verifiers={key_id: public_pem})
+    envelope = {
+        "schema_version": 1,
+        "delivery_id": str(uuid.uuid4()),
+        "sequence": 1,
+        "project_id": project_id,
+        "provider": "fixture",
+        "workspace_id": "W1",
+    }
+    body, headers = _signed_request(private_key, key_id, project_id, envelope)
+    hook = AsyncMock(
+        return_value=[{"status": "conflict", "code": "delivery_conflict"}]
+    )
+
+    with patch("hermes_cli.plugins.invoke_hook_async", hook):
+        async with TestClient(TestServer(_app(_adapter()))) as client:
+            first = await client.post("/v1/events", data=body, headers=headers)
+            replay = await client.post("/v1/events", data=body, headers=headers)
+            first_payload = await first.json()
+
+    assert first.status == 409
+    assert replay.status == 409
+    assert first_payload["error"]["code"] == "delivery_conflict"
+    assert hook.await_count == 2

@@ -1361,6 +1361,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 None,
             )
             if conflict is not None:
+                guard.release(verified.delivery_id, verified.body_sha256)
                 return web.json_response(
                     {
                         "error": {
