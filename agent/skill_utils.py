@@ -40,6 +40,13 @@ EXCLUDED_SKILL_DIRS = frozenset(
         ".pytest_cache",
         ".mypy_cache",
         ".ruff_cache",
+        # Ringo reserves these roots for exact-runtime entity context. They are
+        # loaded by the ringo-entity-skills plugin, never by the generic skill
+        # index where one user's private context could leak into another turn.
+        "users",
+        "channels",
+        "teams",
+        "organizations",
     )
 )
 

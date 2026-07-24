@@ -102,6 +102,25 @@ def test_iter_skill_index_files_prunes_dependency_dirs(tmp_path):
     assert found == [real / "SKILL.md"]
 
 
+def test_iter_skill_index_files_prunes_ringo_entity_context(tmp_path):
+    ordinary = tmp_path / "ordinary"
+    ordinary.mkdir()
+    (ordinary / "SKILL.md").write_text(
+        "---\nname: ordinary\n---\n",
+        encoding="utf-8",
+    )
+    private = tmp_path / "users" / "U123"
+    private.mkdir(parents=True)
+    (private / "SKILL.md").write_text(
+        "---\nname: private-user-context\n---\n",
+        encoding="utf-8",
+    )
+
+    assert list(iter_skill_index_files(tmp_path, "SKILL.md")) == [
+        ordinary / "SKILL.md"
+    ]
+
+
 # ── skill_matches_platform on Termux ──────────────────────────────────────
 
 

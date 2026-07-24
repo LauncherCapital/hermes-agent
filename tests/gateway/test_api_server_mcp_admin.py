@@ -209,6 +209,33 @@ class TestAdminConfig:
                     assert resp.status == 400
 
     @pytest.mark.asyncio
+    async def test_ringo_review_nudges_can_be_disabled_live(self, adapter):
+        from hermes_cli.config import load_config
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/admin/config",
+                json={
+                    "skills": {"creation_nudge_interval": 0},
+                    "memory": {"nudge_interval": 0},
+                },
+            )
+            assert resp.status == 200
+            applied = (await resp.json())["applied"]
+            assert applied["skills.creation_nudge_interval"] == 0
+            assert applied["memory.nudge_interval"] == 0
+            config = load_config()
+            assert config["skills"]["creation_nudge_interval"] == 0
+            assert config["memory"]["nudge_interval"] == 0
+
+            resp = await cli.post(
+                "/admin/config",
+                json={"skills": {"creation_nudge_interval": -1}},
+            )
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
     async def test_mcp_addition_uses_incremental_discovery(self, adapter):
         """Adding a server must not drop live connections (no full shutdown)."""
         from hermes_cli.config import load_config
