@@ -233,6 +233,31 @@ def test_successful_supported_tool_edits_are_queued_only(tmp_path):
     assert queued == [("one", False), ("two", True)]
 
 
+def test_entity_skill_tool_edits_are_not_queued_as_regular_skills(tmp_path):
+    sync = _load_sync_module()
+    service = sync.SkillSyncService(tmp_path)
+    queued = []
+    service.queue_local_sync = lambda name, deleted=False: queued.append(
+        (name, deleted)
+    )
+
+    for kind in ("organizations", "users", "channels", "teams"):
+        service.observe_tool(
+            tool_name="patch",
+            args={"path": str(tmp_path / f"skills/{kind}/entity/SKILL.md")},
+            result=json.dumps({"success": True}),
+            status="ok",
+        )
+    service.observe_tool(
+        tool_name="write_file",
+        args={"path": str(tmp_path / "skills/ordinary/SKILL.md")},
+        result=json.dumps({"success": True}),
+        status="ok",
+    )
+
+    assert queued == [("ordinary", False)]
+
+
 def test_edit_during_correction_request_remains_dirty_for_next_push(
     tmp_path,
     monkeypatch,

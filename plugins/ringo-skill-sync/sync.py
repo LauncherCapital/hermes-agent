@@ -22,6 +22,7 @@ _ALLOWED_SUBDIRS = {"assets", "references", "scripts", "templates"}
 _MAX_FILE_COUNT = 20
 _MAX_FILE_CHARS = 200_000
 _MAX_FILES_TOTAL_CHARS = 1_000_000
+_ENTITY_SKILL_ROOTS = {"organizations", "users", "channels", "teams"}
 
 
 class SkillSyncError(RuntimeError):
@@ -656,7 +657,10 @@ class SkillSyncService:
             relative = path.relative_to(self.skills_dir.resolve())
         except (OSError, ValueError):
             return
-        if len(relative.parts) >= 2:
+        if (
+            len(relative.parts) >= 2
+            and relative.parts[0] not in _ENTITY_SKILL_ROOTS
+        ):
             self.queue_local_sync(relative.parts[0])
 
     def health(self) -> dict[str, Any]:
