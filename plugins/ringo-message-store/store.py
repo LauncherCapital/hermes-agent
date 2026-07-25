@@ -19,6 +19,16 @@ from .database import EncryptedDatabase
 
 logger = logging.getLogger(__name__)
 SCHEMA_VERSION = 3
+PROTOCOL_VERSION = 1
+PROTOCOL_CAPABILITIES = (
+    "acl_metadata",
+    "allowed_source_ids",
+    "detailed_health",
+    "event_batch",
+    "ingest_window",
+    "reconciliation_events",
+    "stable_cursor",
+)
 MESSAGE_RETENTION_DAYS = 30
 DELIVERY_RETENTION_DAYS = 7
 RETENTION_INTERVAL_SECONDS = 3600
@@ -1328,6 +1338,9 @@ class MessageStore:
             latest = conn.execute(
                 "SELECT MAX(applied_at) FROM deliveries"
             ).fetchone()[0]
+            message_count = conn.execute(
+                "SELECT COUNT(*) FROM messages"
+            ).fetchone()[0]
         lag_seconds = None
         if latest:
             try:
@@ -1346,6 +1359,9 @@ class MessageStore:
             "status": "ready",
             "project_id": self.project_id,
             "schema_version": SCHEMA_VERSION,
+            "protocol_version": PROTOCOL_VERSION,
+            "capabilities": list(PROTOCOL_CAPABILITIES),
+            "message_count": int(message_count),
             "key_version": self.key_version,
             "storage_encryption": "sqlcipher",
             "database_key_version": self.database.active_key_version,
