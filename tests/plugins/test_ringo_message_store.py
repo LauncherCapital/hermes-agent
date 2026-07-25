@@ -145,6 +145,9 @@ async def test_claim_initializes_schema_key_and_idempotent_delivery(tmp_path, mo
     assert health["last_sequence"] == 1
     assert {
         "schema_version",
+        "protocol_version",
+        "capabilities",
+        "message_count",
         "key_version",
         "storage_encryption",
         "database_key_version",
@@ -161,6 +164,17 @@ async def test_claim_initializes_schema_key_and_idempotent_delivery(tmp_path, mo
     assert health["storage_encryption"] == "sqlcipher"
     assert health["database_key_version"] == 1
     assert health["encryption_integrity"] == "ok"
+    assert health["protocol_version"] >= 1
+    assert {
+        "acl_metadata",
+        "allowed_source_ids",
+        "detailed_health",
+        "event_batch",
+        "ingest_window",
+        "reconciliation_events",
+        "stable_cursor",
+    } <= set(health["capabilities"])
+    assert health["message_count"] == 1
 
 
 def test_retention_removes_expired_messages_reactions_and_deliveries(
