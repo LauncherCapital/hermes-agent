@@ -159,7 +159,11 @@ async def test_session_chat_loads_history_and_preserves_session_headers(auth_ada
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post(
                 f"/api/sessions/{session_id}/chat",
-                json={"message": "next", "system_message": "stay focused"},
+                json={
+                    "message": "next",
+                    "system_message": "stay focused",
+                    "max_iterations": 6,
+                },
                 headers={"Authorization": "Bearer sk-test", "X-Hermes-Session-Key": "client-42"},
             )
             assert resp.status == 200
@@ -175,11 +179,31 @@ async def test_session_chat_loads_history_and_preserves_session_headers(auth_ada
     _, kwargs = mock_run.call_args
     assert kwargs["session_id"] == session_id
     assert kwargs["gateway_session_key"] == "client-42"
+    assert kwargs["max_iterations"] == 6
     assert kwargs["ephemeral_system_prompt"] == "stay focused"
     assert kwargs["conversation_history"] == [
         {"role": "user", "content": "earlier"},
         {"role": "assistant", "content": "prior answer"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_session_chat_rejects_unbounded_iteration_override(
+    auth_adapter,
+    session_db,
+):
+    session_id = session_db.create_session("bounded-session", "api_server")
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/chat",
+            json={"message": "next", "max_iterations": 13},
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        payload = await resp.json()
+
+    assert resp.status == 400
+    assert payload["error"]["code"] == "invalid_max_iterations"
 
 
 @pytest.mark.asyncio

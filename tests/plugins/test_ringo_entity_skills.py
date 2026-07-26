@@ -96,6 +96,7 @@ def test_prepare_binds_only_exact_runtime_entities(tmp_path):
         ("channels", "C2"),
     }
     assert all(item["path"].endswith("/SKILL.md") for item in result["entities"])
+    assert all(item["exists"] is False for item in result["entities"])
     assert not any(path.exists() for path in map(
         lambda item: Path(item["path"]),
         result["entities"],
@@ -195,6 +196,87 @@ def test_review_lease_serializes_shared_entity_and_turn_is_idempotent(tmp_path):
     )
     assert result["status"] == "no_change"
     assert service.prepare(request=_request())["status"] == "duplicate"
+
+
+def test_required_initial_write_is_retryable_when_agent_makes_no_change(
+    tmp_path,
+):
+    service_mod = _load_service_module()
+    service = _service(service_mod, tmp_path)
+    bootstrap_request = _request(
+        user_id="",
+        include_organization=False,
+        public_channel_ids=["C1"],
+        bootstrap=True,
+    )
+    prepared = service.prepare(request=bootstrap_request)
+    assert all(item["exists"] is False for item in prepared["entities"])
+
+    result = service.finish(
+        request={
+            "project_id": PROJECT_ID,
+            "payload": {
+                "session_id": SESSION_ID,
+                "turn_id": TURN_ID,
+                "success": True,
+            },
+        }
+    )
+
+    assert result["status"] == "change_required"
+    assert service.prepare(request=bootstrap_request)["status"] == "ready"
+
+
+def test_missing_channel_bootstrap_unlocks_tools_after_exact_initial_write(
+    tmp_path,
+):
+    service_mod = _load_service_module()
+    service = _service(service_mod, tmp_path)
+    prepared = service.prepare(
+        request=_request(
+            user_id="",
+            include_organization=False,
+            public_channel_ids=["C1"],
+            bootstrap=True,
+        )
+    )
+    channel_path = prepared["entities"][0]["path"]
+
+    blocked = service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="read_file",
+        args={"path": channel_path},
+    )
+    assert blocked["action"] == "block"
+    assert "requires write_file" in blocked["message"]
+
+    written = service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="write_file",
+        args={
+            "path": channel_path,
+            "content": "---\nname: channel-C1\n---\n\nObserved state.\n",
+        },
+    )
+    assert written["action"] == "handled"
+    assert service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="read_file",
+        args={"path": channel_path},
+    )["action"] == "handled"
+
+    result = service.finish(
+        request={
+            "project_id": PROJECT_ID,
+            "payload": {
+                "session_id": SESSION_ID,
+                "turn_id": TURN_ID,
+                "success": True,
+                "require_change": True,
+            },
+        }
+    )
+    assert result["status"] == "applied"
 
 
 def test_bound_review_can_only_read_or_edit_exact_skill_files(tmp_path):
