@@ -520,3 +520,168 @@ def test_restricted_channel_cannot_be_read_from_another_session(tmp_path):
     )
 
     assert blocked["action"] == "block"
+
+
+def test_dm_loads_live_authorized_restricted_channel_skill(tmp_path):
+    service_mod = _load_service_module()
+    revoked = False
+    calls = []
+
+    def check(payload):
+        calls.append(dict(payload))
+        if revoked or payload["channel_id"] != "G1":
+            raise PermissionError("denied")
+        return {
+            "authorized": True,
+            "project_id": PROJECT_ID,
+            "agent_id": AGENT_ID,
+            "workspace_id": "T1",
+            "channel_id": "G1",
+            "session_id": payload["session_id"],
+            "operation": payload["operation"],
+            "visibility": "private",
+        }
+
+    service = service_mod.EntitySkillService(
+        tmp_path,
+        access_checker=check,
+    )
+    principal_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    prepared = service.prepare(
+        request=_request(
+            user_id="",
+            slack_user_id="U1",
+            principal_id=principal_id,
+            channel_id="G1",
+            channel_type="group",
+            restricted_channel_id="G1",
+            channel_visibility="private",
+            include_organization=False,
+            public_channel_ids=[],
+        )
+    )
+    channel_path = prepared["entities"][0]["path"]
+    assert service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="write_file",
+        args={
+            "path": channel_path,
+            "content": (
+                "---\nname: channel-G1\n---\n\n"
+                "PRIVATE_CHANNEL_CONTEXT\n"
+            ),
+        },
+    )["action"] == "handled"
+    service.finish(
+        request={
+            "project_id": PROJECT_ID,
+            "payload": {
+                "session_id": SESSION_ID,
+                "turn_id": TURN_ID,
+                "success": True,
+            },
+        }
+    )
+
+    injected = service.inject_context(
+        session_id="dm-session",
+        trusted_runtime_metadata={
+            "project_id": PROJECT_ID,
+            "agent_id": AGENT_ID,
+            "workspace_id": "T1",
+            "user_id": "U1",
+            "principal_id": principal_id,
+            "channel_id": "D1",
+            "channel_type": "im",
+        },
+    )
+
+    assert "PRIVATE_CHANNEL_CONTEXT" in injected["context"]
+    assert calls[-1]["operation"] == "read"
+    assert calls[-1]["session_id"] == "dm-session"
+
+    revoked = True
+    assert service.inject_context(
+        session_id="revoked-dm-session",
+        trusted_runtime_metadata={
+            "project_id": PROJECT_ID,
+            "agent_id": AGENT_ID,
+            "workspace_id": "T1",
+            "user_id": "U1",
+            "principal_id": principal_id,
+            "channel_id": "D1",
+            "channel_type": "im",
+        },
+    ) is None
+
+
+def test_multi_user_channel_never_loads_another_private_channel(tmp_path):
+    service_mod = _load_service_module()
+
+    def check(payload):
+        visibility = (
+            "private" if payload["channel_id"] == "G1" else "public"
+        )
+        return {
+            "authorized": True,
+            "project_id": PROJECT_ID,
+            "agent_id": AGENT_ID,
+            "workspace_id": "T1",
+            "channel_id": payload["channel_id"],
+            "session_id": payload["session_id"],
+            "operation": payload["operation"],
+            "visibility": visibility,
+        }
+
+    service = service_mod.EntitySkillService(
+        tmp_path,
+        access_checker=check,
+    )
+    principal_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    prepared = service.prepare(
+        request=_request(
+            user_id="",
+            slack_user_id="U1",
+            principal_id=principal_id,
+            channel_id="G1",
+            channel_type="group",
+            restricted_channel_id="G1",
+            channel_visibility="private",
+            include_organization=False,
+            public_channel_ids=[],
+        )
+    )
+    channel_path = prepared["entities"][0]["path"]
+    assert service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="write_file",
+        args={
+            "path": channel_path,
+            "content": "---\nname: private\n---\n\nPRIVATE_OTHER_CHANNEL\n",
+        },
+    )["action"] == "handled"
+    service.finish(
+        request={
+            "project_id": PROJECT_ID,
+            "payload": {
+                "session_id": SESSION_ID,
+                "turn_id": TURN_ID,
+                "success": True,
+            },
+        }
+    )
+
+    injected = service.inject_context(
+        session_id="public-session",
+        trusted_runtime_metadata={
+            "project_id": PROJECT_ID,
+            "agent_id": AGENT_ID,
+            "workspace_id": "T1",
+            "user_id": "U1",
+            "principal_id": principal_id,
+            "channel_id": "C_PUBLIC",
+            "channel_type": "channel",
+        },
+    )
+
+    assert injected is None or "PRIVATE_OTHER_CHANNEL" not in injected["context"]
