@@ -73,6 +73,20 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _pending_initial_write_paths(binding: dict[str, Any]) -> set[str]:
+    required = {
+        path
+        for path in binding.get("required_initial_write_paths") or []
+        if isinstance(path, str)
+    }
+    changed = {
+        path
+        for path in binding.get("changed") or []
+        if isinstance(path, str)
+    }
+    return required - changed
+
+
 def _ie_rest_base_url() -> str:
     base = str(os.getenv("RINGO_IE_MCP_URL") or "").rstrip("/")
     if base.endswith("/mcp"):
@@ -477,6 +491,23 @@ class EntitySkillService:
                 kind=item["kind"],
                 entity_id=item["id"],
             )
+        baseline = {
+            item["path"]: _hash(
+                self._document(project_id, item["kind"], item["id"])
+            )
+            for item in entities
+        }
+        entities = [
+            {**item, "exists": baseline[item["path"]] is not None}
+            for item in entities
+        ]
+        required_initial_write_paths = [
+            item["path"]
+            for item in entities
+            if payload.get("bootstrap") is True
+            and item["kind"] == "channels"
+            and item["exists"] is False
+        ]
 
         with self._lock:
             manifest = self._load()
@@ -512,18 +543,13 @@ class EntitySkillService:
                 }
                 if paths & active_paths:
                     return {"status": "busy", "turn_id": turn_id}
-            baseline = {
-                item["path"]: _hash(
-                    self._document(project_id, item["kind"], item["id"])
-                )
-                for item in entities
-            }
             manifest["bindings"][session_id] = {
                 "turn_id": turn_id,
                 "expires_at": (_now() + timedelta(minutes=LEASE_MINUTES)).isoformat(),
                 "entities": entities,
                 "baseline": baseline,
                 "changed": [],
+                "required_initial_write_paths": required_initial_write_paths,
                 "project_id": project_id,
                 "agent_id": agent_id,
                 "workspace_id": workspace_id,
@@ -550,6 +576,7 @@ class EntitySkillService:
         session_id = _component(payload.get("session_id"), "session_id")
         turn_id = _component(payload.get("turn_id"), "turn_id")
         success = payload.get("success") is True
+        require_change = payload.get("require_change") is True
         with self._lock:
             manifest = self._load()
             if manifest.get("project_id") != project_id:
@@ -565,7 +592,11 @@ class EntitySkillService:
                 for path in binding.get("changed") or []
                 if isinstance(path, str)
             ]
-            if success:
+            change_required = success and (
+                (require_change and not changed)
+                or bool(_pending_initial_write_paths(binding))
+            )
+            if success and not change_required:
                 completed = [
                     item
                     for item in manifest["completed_turns"]
@@ -591,6 +622,8 @@ class EntitySkillService:
             "status": (
                 "released"
                 if not success
+                else "change_required"
+                if change_required
                 else "applied"
                 if changed
                 else "no_change"
@@ -923,6 +956,17 @@ class EntitySkillService:
             return {
                 "action": "block",
                 "message": "Tool path is outside this review's bound entities.",
+            }
+        pending_initial_writes = _pending_initial_write_paths(binding)
+        if pending_initial_writes and (
+            name != "write_file" or str(path) not in pending_initial_writes
+        ):
+            return {
+                "action": "block",
+                "message": (
+                    "Initial channel bootstrap requires write_file for the "
+                    "missing exact channel SKILL.md before other tools."
+                ),
             }
         try:
             if entity["kind"] == "channels":

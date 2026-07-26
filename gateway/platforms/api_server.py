@@ -533,6 +533,27 @@ def _session_chat_persist_user_message_id(
     return message_id.strip(), None
 
 
+def _session_chat_max_iterations(
+    body: Dict[str, Any],
+) -> tuple[Optional[int], Optional["web.Response"]]:
+    value = body.get("max_iterations")
+    if value is None:
+        return None, None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= 12
+    ):
+        return None, web.json_response(
+            _openai_error(
+                "max_iterations must be an integer between 1 and 12",
+                code="invalid_max_iterations",
+            ),
+            status=400,
+        )
+    return value, None
+
+
 _TRUSTED_RUNTIME_FIELDS = {
     "project_id",
     "agent_id",
@@ -1224,6 +1245,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        max_iterations: Optional[int] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1251,7 +1273,11 @@ class APIServerAdapter(BasePlatformAdapter):
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
-        max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+        resolved_max_iterations = (
+            max_iterations
+            if max_iterations is not None
+            else int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+        )
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -1260,7 +1286,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
-            max_iterations=max_iterations,
+            max_iterations=resolved_max_iterations,
             quiet_mode=True,
             verbose_logging=False,
             ephemeral_system_prompt=ephemeral_system_prompt or None,
@@ -2626,6 +2652,9 @@ class APIServerAdapter(BasePlatformAdapter):
         persist_user_message_id, err = _session_chat_persist_user_message_id(body)
         if err is not None:
             return err
+        max_iterations, err = _session_chat_max_iterations(body)
+        if err is not None:
+            return err
         system_prompt = (
             standard_system
             if has_standard_messages
@@ -2646,6 +2675,7 @@ class APIServerAdapter(BasePlatformAdapter):
             gateway_session_key=gateway_session_key,
             persist_user_message_id=persist_user_message_id,
             trusted_runtime_metadata=trusted_runtime,
+            max_iterations=max_iterations,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -2700,6 +2730,9 @@ class APIServerAdapter(BasePlatformAdapter):
             if err is not None:
                 return err
         persist_user_message_id, err = _session_chat_persist_user_message_id(body)
+        if err is not None:
+            return err
+        max_iterations, err = _session_chat_max_iterations(body)
         if err is not None:
             return err
         system_prompt = (
@@ -2771,6 +2804,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     gateway_session_key=gateway_session_key,
                     persist_user_message_id=persist_user_message_id,
                     trusted_runtime_metadata=trusted_runtime,
+                    max_iterations=max_iterations,
                 )
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -2866,6 +2900,9 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if message_id_err is not None:
             return message_id_err
+        max_iterations, max_iterations_err = _session_chat_max_iterations(body)
+        if max_iterations_err is not None:
+            return max_iterations_err
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
 
@@ -3100,6 +3137,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 persist_user_message_id=persist_user_message_id,
                 trusted_runtime_metadata=trusted_runtime,
+                max_iterations=max_iterations,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -3121,6 +3159,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 persist_user_message_id=persist_user_message_id,
                 trusted_runtime_metadata=trusted_runtime,
+                max_iterations=max_iterations,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -3132,6 +3171,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "messages",
                     "context_messages",
                     "persist_user_message_id",
+                    "max_iterations",
                     "tools",
                     "tool_choice",
                     "stream",
@@ -4763,6 +4803,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         persist_user_message_id: Optional[str] = None,
         trusted_runtime_metadata: Optional[Dict[str, str]] = None,
+        max_iterations: Optional[int] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4786,6 +4827,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 gateway_session_key=gateway_session_key,
+                max_iterations=max_iterations,
             )
             agent._trusted_runtime_metadata = (
                 dict(trusted_runtime_metadata)
