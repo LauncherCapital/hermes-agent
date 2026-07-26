@@ -29,6 +29,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_guardrails import ToolGuardrailDecision
+from hermes_cli.plugins import HandledToolResult
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -50,6 +51,30 @@ logger = logging.getLogger(__name__)
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
+
+
+def _redact_persisted_tool_arguments(
+    messages: list,
+    *tool_call_ids: str,
+) -> None:
+    """Remove sensitive handled-tool args from the canonical transcript."""
+    candidates = {item for item in tool_call_ids if item}
+    if not candidates:
+        return
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for tool_call in message.get("tool_calls") or []:
+            if (
+                isinstance(tool_call, dict)
+                and (
+                    tool_call.get("id") in candidates
+                    or tool_call.get("call_id") in candidates
+                )
+                and isinstance(tool_call.get("function"), dict)
+            ):
+                tool_call["function"]["arguments"] = "{}"
+                return
 
 
 def _ra():
@@ -284,7 +309,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception:
                 block_message = None
 
-            if block_message is not None:
+            if isinstance(block_message, HandledToolResult):
+                block_result = block_message
+                if block_message.redact_args:
+                    function_args = {}
+                    tool_call.function.arguments = "{}"
+                    _redact_persisted_tool_arguments(
+                        messages,
+                        getattr(tool_call, "id", "") or "",
+                        getattr(tool_call, "call_id", "") or "",
+                    )
+            elif block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
                 _emit_terminal_post_tool_call(
                     agent,
@@ -377,7 +412,19 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     results = [None] * num_tools
     for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
         if block_result is not None:
-            results[i] = (name, args, block_result, 0.0, True, True)
+            handled = False
+            try:
+                handled = isinstance(block_result, HandledToolResult)
+            except Exception:
+                pass
+            results[i] = (
+                name,
+                args,
+                str(block_result),
+                0.0,
+                not handled,
+                True,
+            )
 
     # Touch activity before launching workers so the gateway knows
     # we're executing tools (not stuck).
@@ -759,13 +806,30 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception:
                 pass
 
+        _handled_result: str | None = None
+        if isinstance(_block_msg, HandledToolResult):
+            _handled_result = str(_block_msg)
+            if _block_msg.redact_args:
+                function_args = {}
+                tool_call.function.arguments = "{}"
+                _redact_persisted_tool_arguments(
+                    messages,
+                    getattr(tool_call, "id", "") or "",
+                    getattr(tool_call, "call_id", "") or "",
+                )
+            _block_msg = None
+
         _guardrail_block_decision: ToolGuardrailDecision | None = None
-        if _block_msg is None:
+        if _block_msg is None and _handled_result is None:
             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
             if not guardrail_decision.allows_execution:
                 _guardrail_block_decision = guardrail_decision
 
-        _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
+        _execution_blocked = (
+            _handled_result is not None
+            or _block_msg is not None
+            or _guardrail_block_decision is not None
+        )
 
         if _execution_blocked:
             # Tool blocked by plugin or guardrail policy — skip counters,
@@ -839,7 +903,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         tool_start_time = time.time()
 
-        if _block_msg is not None:
+        if _handled_result is not None:
+            function_result = _handled_result
+            tool_duration = 0.0
+        elif _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.
             function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
             tool_duration = 0.0

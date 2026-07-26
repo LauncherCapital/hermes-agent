@@ -199,6 +199,25 @@ class TestPreToolCallBlocking:
         assert post_call[1]["error_message"] == "Blocked by policy"
         assert post_call[1]["duration_ms"] == 0
 
+    def test_handled_tool_returns_without_host_dispatch(self, monkeypatch):
+        from hermes_cli.plugins import HandledToolResult
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            lambda *args, **kwargs: HandledToolResult('{"ok":true}'),
+        )
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("host dispatch must not run")
+            ),
+        )
+
+        assert handle_function_call(
+            "write_file",
+            {"path": "/virtual/SKILL.md", "content": "private"},
+        ) == '{"ok":true}'
+
     def test_blocked_tool_skips_read_loop_notification(self, monkeypatch):
         notifications = []
 

@@ -522,6 +522,27 @@ class TestPreToolCallBlocking:
         )
         assert get_pre_tool_call_block_message("todo", {}, task_id="t1") == "blocked by plugin"
 
+    def test_handled_directive_returns_redacting_result(self, monkeypatch):
+        from hermes_cli.plugins import HandledToolResult
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {
+                    "action": "handled",
+                    "result": '{"ok":true}',
+                    "redact_args": True,
+                }
+            ],
+        )
+        result = get_pre_tool_call_block_message(
+            "write_file",
+            {"content": "private"},
+        )
+        assert isinstance(result, HandledToolResult)
+        assert str(result) == '{"ok":true}'
+        assert result.redact_args is True
+
     def test_invalid_returns_are_ignored(self, monkeypatch):
         """Various malformed hook returns should not trigger a block."""
         monkeypatch.setattr(

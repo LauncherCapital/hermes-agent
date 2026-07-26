@@ -533,6 +533,44 @@ def _session_chat_persist_user_message_id(
     return message_id.strip(), None
 
 
+_TRUSTED_RUNTIME_FIELDS = {
+    "project_id",
+    "agent_id",
+    "workspace_id",
+    "channel_id",
+    "channel_type",
+    "user_id",
+    "principal_id",
+    "team_slug",
+}
+
+
+def _trusted_runtime_metadata(
+    body: Dict[str, Any],
+) -> tuple[Optional[Dict[str, str]], Optional["web.Response"]]:
+    value = body.get("trusted_runtime_metadata")
+    if value is None:
+        return None, None
+    if (
+        not isinstance(value, dict)
+        or set(value) - _TRUSTED_RUNTIME_FIELDS
+        or any(
+            not isinstance(item, str)
+            or len(item) > 256
+            or re.search(r"[\r\n\x00]", item)
+            for item in value.values()
+        )
+    ):
+        return None, web.json_response(
+            _openai_error(
+                "trusted_runtime_metadata is invalid",
+                code="invalid_runtime_metadata",
+            ),
+            status=400,
+        )
+    return {key: value.get(key, "") for key in _TRUSTED_RUNTIME_FIELDS}, None
+
+
 def check_api_server_requirements() -> bool:
     """Check if API server dependencies are available."""
     return AIOHTTP_AVAILABLE
@@ -2563,6 +2601,9 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
+        trusted_runtime, err = _trusted_runtime_metadata(body)
+        if err:
+            return err
         (
             standard_user,
             standard_history,
@@ -2604,6 +2645,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             gateway_session_key=gateway_session_key,
             persist_user_message_id=persist_user_message_id,
+            trusted_runtime_metadata=trusted_runtime,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -2633,6 +2675,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         body, err = await self._read_json_body(request)
+        if err:
+            return err
+        trusted_runtime, err = _trusted_runtime_metadata(body)
         if err:
             return err
         (
@@ -2725,6 +2770,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
                     persist_user_message_id=persist_user_message_id,
+                    trusted_runtime_metadata=trusted_runtime,
                 )
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -2802,6 +2848,9 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
         except (json.JSONDecodeError, Exception):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+        trusted_runtime, runtime_err = _trusted_runtime_metadata(body)
+        if runtime_err is not None:
+            return runtime_err
 
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
@@ -3050,6 +3099,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 persist_user_message_id=persist_user_message_id,
+                trusted_runtime_metadata=trusted_runtime,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -3070,6 +3120,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 persist_user_message_id=persist_user_message_id,
+                trusted_runtime_metadata=trusted_runtime,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -3963,6 +4014,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": {"message": "Invalid JSON in request body", "type": "invalid_request_error"}},
                 status=400,
             )
+        trusted_runtime, runtime_err = _trusted_runtime_metadata(body)
+        if runtime_err is not None:
+            return runtime_err
 
         raw_input = body.get("input")
         if raw_input is None:
@@ -4107,6 +4161,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                trusted_runtime_metadata=trusted_runtime,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -4140,6 +4195,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                trusted_runtime_metadata=trusted_runtime,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -4706,6 +4762,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         persist_user_message_id: Optional[str] = None,
+        trusted_runtime_metadata: Optional[Dict[str, str]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4729,6 +4786,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 gateway_session_key=gateway_session_key,
+            )
+            agent._trusted_runtime_metadata = (
+                dict(trusted_runtime_metadata)
+                if trusted_runtime_metadata is not None
+                else None
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
