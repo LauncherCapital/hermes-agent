@@ -29,6 +29,7 @@ import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
+from hermes_cli.plugins import HandledToolResult
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
 
@@ -1004,6 +1005,8 @@ def handle_function_call(
             except Exception as _hook_err:
                 logger.debug("pre_tool_call hook error: %s", _hook_err)
 
+            if isinstance(block_message, HandledToolResult):
+                return str(block_message)
             if block_message is not None:
                 result = json.dumps({"error": block_message}, ensure_ascii=False)
                 _emit_post_tool_call_hook(

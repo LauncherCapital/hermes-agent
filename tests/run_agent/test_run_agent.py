@@ -2591,6 +2591,121 @@ class TestConcurrentToolExecution:
         assert messages[0]["role"] == "tool"
         assert json.loads(messages[0]["content"]) == {"error": "Blocked by policy"}
 
+    def test_sequential_handled_tool_redacts_sensitive_arguments(self, agent, monkeypatch):
+        from hermes_cli.plugins import HandledToolResult
+
+        tool_call = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"/virtual/SKILL.md","content":"PRIVATE_FACT"}',
+            call_id="c1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": (
+                                '{"path":"/virtual/SKILL.md",'
+                                '"content":"PRIVATE_FACT"}'
+                            ),
+                        },
+                    }
+                ],
+            }
+        ]
+        starts = []
+        agent.tool_start_callback = lambda *args: starts.append(args)
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            lambda *args, **kwargs: HandledToolResult('{"ok":true}'),
+        )
+
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=AssertionError("host dispatch must not run"),
+        ):
+            agent._execute_tool_calls_sequential(
+                mock_msg,
+                messages,
+                "task-1",
+            )
+
+        assert tool_call.function.arguments == "{}"
+        assert starts == []
+        assert messages[0]["tool_calls"][0]["function"]["arguments"] == "{}"
+        assert messages[1]["content"] == '{"ok":true}'
+        assert "PRIVATE_FACT" not in json.dumps(mock_msg.__dict__, default=str)
+
+    def test_concurrent_handled_tool_redacts_sensitive_arguments(self, agent, monkeypatch):
+        from hermes_cli.plugins import HandledToolResult
+
+        handled = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"/virtual/SKILL.md","content":"PRIVATE_FACT"}',
+            call_id="c1",
+        )
+        ordinary = _mock_tool_call(
+            name="web_search",
+            arguments='{"query":"public"}',
+            call_id="c2",
+        )
+        mock_msg = _mock_assistant_msg(
+            content="",
+            tool_calls=[handled, ordinary],
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": (
+                                '{"path":"/virtual/SKILL.md",'
+                                '"content":"PRIVATE_FACT"}'
+                            ),
+                        },
+                    },
+                    {
+                        "id": "c2",
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": '{"query":"public"}',
+                        },
+                    },
+                ],
+            }
+        ]
+
+        def hook(name, *args, **kwargs):
+            if name == "write_file":
+                return HandledToolResult('{"ok":true}')
+            return None
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            hook,
+        )
+        with patch("run_agent.handle_function_call", return_value='{"ok":true}'):
+            agent._execute_tool_calls_concurrent(
+                mock_msg,
+                messages,
+                "task-1",
+            )
+
+        assert handled.function.arguments == "{}"
+        assert messages[0]["tool_calls"][0]["function"]["arguments"] == "{}"
+        assert len(messages) == 3
+        assert all("PRIVATE_FACT" not in str(item) for item in messages)
+
     def test_sequential_blocked_tool_emits_terminal_post_tool_hook(self, agent, monkeypatch):
         """Blocked pre_tool_call decisions still terminate observer tool spans."""
         tool_call = _mock_tool_call(name="write_file",

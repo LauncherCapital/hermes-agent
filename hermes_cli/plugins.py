@@ -1799,6 +1799,21 @@ def has_hook(hook_name: str) -> bool:
 _thread_tool_whitelist = threading.local()
 
 
+class HandledToolResult(str):
+    """A sensitive plugin handled the tool without host dispatch.
+
+    The string value is the model-visible tool result. ``redact_args`` tells
+    the agent loop to remove the original tool arguments before any transcript
+    persistence or observer callback.
+    """
+
+    def __new__(cls, result: str, *, redact_args: bool = True):
+        value = str(result)
+        instance = super().__new__(cls, value)
+        instance.redact_args = bool(redact_args)
+        return instance
+
+
 def set_thread_tool_whitelist(
     allowed: Optional[Set[str]],
     deny_msg_fmt: str = "Tool '{tool_name}' denied: not in this thread's tool whitelist",
@@ -1826,9 +1841,11 @@ def get_pre_tool_call_block_message(
     restrictions, approval workflows) can return::
 
         {"action": "block", "message": "Reason the tool was blocked"}
+        {"action": "handled", "result": "{\"ok\":true}", "redact_args": true}
 
     from their ``pre_tool_call`` callback.  The first valid block
-    directive wins.  Invalid or irrelevant hook return values are
+    or handled directive wins. A handled result skips host dispatch; its
+    arguments are redacted by default before persistence. Invalid returns are
     silently ignored so existing observer-only hooks are unaffected.
     """
     allowed = getattr(_thread_tool_whitelist, "allowed", None)
@@ -1850,11 +1867,19 @@ def get_pre_tool_call_block_message(
     for result in hook_results:
         if not isinstance(result, dict):
             continue
-        if result.get("action") != "block":
+        action = result.get("action")
+        if action == "handled":
+            handled = result.get("result")
+            if isinstance(handled, str) and handled:
+                return HandledToolResult(
+                    handled,
+                    redact_args=result.get("redact_args") is not False,
+                )
             continue
-        message = result.get("message")
-        if isinstance(message, str) and message:
-            return message
+        if action == "block":
+            message = result.get("message")
+            if isinstance(message, str) and message:
+                return message
 
     return None
 

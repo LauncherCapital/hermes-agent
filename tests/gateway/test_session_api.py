@@ -408,6 +408,16 @@ async def test_chat_completions_session_syncs_explicit_context(
                     "messages": [{"role": "user", "content": "check the DB"}],
                     "context_messages": context_messages,
                     "persist_user_message_id": "slack:102.000",
+                    "trusted_runtime_metadata": {
+                        "project_id": "11111111-1111-1111-1111-111111111111",
+                        "agent_id": "22222222-2222-2222-2222-222222222222",
+                        "workspace_id": "T1",
+                        "channel_id": "C1",
+                        "channel_type": "channel",
+                        "user_id": "U1",
+                        "principal_id": "",
+                        "team_slug": "",
+                    },
                 },
                 headers={
                     "Authorization": "Bearer sk-test",
@@ -419,6 +429,7 @@ async def test_chat_completions_session_syncs_explicit_context(
     _, kwargs = mock_run.call_args
     assert kwargs["conversation_history"] == context_messages
     assert kwargs["persist_user_message_id"] == "slack:102.000"
+    assert kwargs["trusted_runtime_metadata"]["channel_id"] == "C1"
 
 
 @pytest.mark.asyncio
