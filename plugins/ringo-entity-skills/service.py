@@ -72,6 +72,13 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _ie_rest_base_url() -> str:
+    base = str(os.getenv("RINGO_IE_MCP_URL") or "").rstrip("/")
+    if base.endswith("/mcp"):
+        base = base[:-4]
+    return base
+
+
 class EntitySkillService:
     def __init__(
         self,
@@ -385,7 +392,7 @@ class EntitySkillService:
             if self._access_checker is not None:
                 result = self._access_checker(payload)
             else:
-                base = str(os.getenv("RINGO_IE_MCP_URL") or "").rstrip("/")
+                base = _ie_rest_base_url()
                 key = str(os.getenv("RINGO_IE_MCP_KEY") or "")
                 if not base or not key:
                     raise EntitySkillError("entity skill ACL service unavailable")
