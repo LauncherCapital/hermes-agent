@@ -22,6 +22,7 @@ LEASE_MINUTES = 15
 MAX_SKILL_BYTES = 30_000
 MAX_CONTEXT_BYTES = 60_000
 MAX_COMPLETED_TURNS = 500
+MAX_DM_CHANNEL_SKILLS = 8
 ENTITY_KINDS = ("users", "channels", "teams", "organizations")
 _COMPONENT = re.compile(r"^[A-Za-z0-9._%-]{1,128}$")
 _TEAM_SLUG = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
@@ -110,6 +111,7 @@ class EntitySkillService:
                 "schema_version": SCHEMA_VERSION,
                 "bindings": {},
                 "completed_turns": [],
+                "channel_visibilities": {},
             }
         except (OSError, TypeError, ValueError) as exc:
             raise EntitySkillError("entity skill manifest is malformed") from exc
@@ -127,12 +129,25 @@ class EntitySkillService:
                     for item in payload.get("completed_turns") or []
                     if isinstance(item, str)
                 ][-MAX_COMPLETED_TURNS:],
+                "channel_visibilities": {},
             }
         if (
             not isinstance(payload, dict)
             or payload.get("schema_version") != SCHEMA_VERSION
             or not isinstance(payload.get("bindings"), dict)
             or not isinstance(payload.get("completed_turns"), list)
+        ):
+            raise EntitySkillError("unsupported entity skill manifest")
+        visibilities = payload.setdefault("channel_visibilities", {})
+        if (
+            not isinstance(visibilities, dict)
+            or any(
+                not isinstance(channel_id, str)
+                or _COMPONENT.fullmatch(channel_id) is None
+                or channel_id in {".", ".."}
+                or visibility not in {"private", "restricted"}
+                for channel_id, visibility in visibilities.items()
+            )
         ):
             raise EntitySkillError("unsupported entity skill manifest")
         return payload
@@ -472,6 +487,14 @@ class EntitySkillService:
                 workspace_id=workspace_id,
             )
             self._prune(manifest)
+            channel_visibilities = manifest["channel_visibilities"]
+            for item in entities:
+                if item["kind"] != "channels":
+                    continue
+                if item.get("visibility") in {"private", "restricted"}:
+                    channel_visibilities[item["id"]] = item["visibility"]
+                else:
+                    channel_visibilities.pop(item["id"], None)
             if turn_id in manifest["completed_turns"]:
                 return {"status": "duplicate", "turn_id": turn_id}
             existing = manifest["bindings"].get(session_id)
@@ -588,6 +611,7 @@ class EntitySkillService:
         channel_type: str = "",
         team_slug: str = "",
         session_id: str = "",
+        accessible_restricted_channel_ids: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         self._encrypt_plaintext_context(
             project_id=project_id,
@@ -610,11 +634,40 @@ class EntitySkillService:
                 operation="read",
             )
             requested.append(("channels", channel_id))
+        if (
+            channel_type in {"im", "dm"}
+            and user_id
+            and principal_id
+        ):
+            for candidate in accessible_restricted_channel_ids[
+                :MAX_DM_CHANNEL_SKILLS
+            ]:
+                try:
+                    access = self._check_channel_access(
+                        project_id=project_id,
+                        agent_id=agent_id,
+                        workspace_id=workspace_id,
+                        channel_id=candidate,
+                        channel_type="channel",
+                        principal_id=principal_id,
+                        slack_user_id=user_id,
+                        session_id=session_id,
+                        operation="read",
+                    )
+                except EntitySkillError:
+                    continue
+                if access.get("visibility") in {"private", "restricted"}:
+                    requested.append(("channels", candidate))
         if team_slug:
             requested.append(("teams", self._team_slug(team_slug)))
 
         documents: list[dict[str, str]] = []
         total = 0
+        cross_channel_ids = (
+            set(accessible_restricted_channel_ids)
+            if channel_type in {"im", "dm"}
+            else set()
+        )
         for kind, entity_id in requested:
             self._migrate_one(
                 project_id=project_id,
@@ -625,7 +678,11 @@ class EntitySkillService:
             if content is None:
                 continue
             size = len(content.encode("utf-8"))
-            if size > MAX_SKILL_BYTES or total + size > MAX_CONTEXT_BYTES:
+            if size > MAX_SKILL_BYTES:
+                raise EntitySkillError("entity skill context exceeds size limit")
+            if total + size > MAX_CONTEXT_BYTES:
+                if kind == "channels" and entity_id in cross_channel_ids:
+                    continue
                 raise EntitySkillError("entity skill context exceeds size limit")
             total += size
             documents.append(
@@ -759,6 +816,9 @@ class EntitySkillService:
                         workspace_id=workspace_id,
                     )
                     self._save(manifest)
+                    restricted_channel_ids = tuple(
+                        sorted(manifest["channel_visibilities"])
+                    )
                 payload = self._context_payload(
                     project_id=project_id,
                     agent_id=agent_id,
@@ -775,6 +835,9 @@ class EntitySkillService:
                     channel_type=str(runtime.get("channel_type") or ""),
                     team_slug=str(runtime.get("team_slug") or ""),
                     session_id=_component(session_id, "session_id"),
+                    accessible_restricted_channel_ids=(
+                        restricted_channel_ids
+                    ),
                 )
             else:
                 return None
