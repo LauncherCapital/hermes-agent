@@ -102,6 +102,54 @@ def test_prepare_binds_only_exact_runtime_entities(tmp_path):
     ))
 
 
+def test_channel_access_uses_rest_root_not_mcp_path(tmp_path, monkeypatch):
+    service_mod = _load_service_module()
+    monkeypatch.setenv("RINGO_IE_MCP_URL", "https://ie.example.com/mcp/")
+    monkeypatch.setenv("RINGO_IE_MCP_KEY", "control-key")
+    seen = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "authorized": True,
+                "project_id": PROJECT_ID,
+                "agent_id": AGENT_ID,
+                "workspace_id": "T1",
+                "channel_id": "C1",
+                "session_id": SESSION_ID,
+                "operation": "materialize",
+                "visibility": "public",
+            }
+
+    def post(url, **kwargs):
+        seen["url"] = url
+        seen["headers"] = kwargs["headers"]
+        return Response()
+
+    monkeypatch.setattr(service_mod.httpx, "post", post)
+    service = service_mod.EntitySkillService(tmp_path)
+
+    service._check_channel_access(
+        project_id=PROJECT_ID,
+        agent_id=AGENT_ID,
+        workspace_id="T1",
+        channel_id="C1",
+        channel_type="channel",
+        principal_id="",
+        slack_user_id="U1",
+        session_id=SESSION_ID,
+        operation="materialize",
+    )
+
+    assert seen["url"] == (
+        "https://ie.example.com/api/v1/agent/entity-skills/channel-access"
+    )
+    assert seen["headers"]["Authorization"] == "Bearer control-key"
+
+
 def test_team_requires_explicit_verified_membership(tmp_path):
     service_mod = _load_service_module()
     service = _service(service_mod, tmp_path)
