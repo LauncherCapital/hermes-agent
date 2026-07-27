@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import logging
 import json
+import math
 import os
+import re
 import threading
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -15,16 +20,24 @@ from hermes_constants import get_hermes_home
 
 from .crypto import KEY_VERSION, ensure_project_encryption_key
 from .database import EncryptedDatabase
+from .file_processing import (
+    FileProcessingError,
+    cleanup_stale_temp_files,
+    embed_text,
+    inspect_slack_image,
+    process_slack_file,
+)
 
 
 logger = logging.getLogger(__name__)
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 PROTOCOL_VERSION = 1
 PROTOCOL_CAPABILITIES = (
     "acl_metadata",
     "allowed_source_ids",
     "detailed_health",
     "event_batch",
+    "file_index_v1",
     "ingest_window",
     "reconciliation_events",
     "stable_cursor",
@@ -33,6 +46,9 @@ MESSAGE_RETENTION_DAYS = 30
 DELIVERY_RETENTION_DAYS = 7
 RETENTION_INTERVAL_SECONDS = 3600
 MAX_BATCH_EVENTS = 500
+FILE_SEARCH_RETRIEVE_LIMIT = 50
+FILE_SEARCH_RERANK_LIMIT = 10
+FILE_SEARCH_IMAGE_INSPECT_LIMIT = 3
 
 
 _SCHEMA = """
@@ -174,7 +190,118 @@ CREATE TABLE IF NOT EXISTS reconciliation_seen (
     FOREIGN KEY(cycle_id) REFERENCES reconciliation_cycles(cycle_id) ON DELETE CASCADE
 );
 """
-_MIGRATIONS = {1: _SCHEMA, 2: _MIGRATION_V2, 3: _MIGRATION_V3}
+_MIGRATION_V4 = """
+CREATE TABLE IF NOT EXISTS file_contents (
+    project_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    content_version INTEGER NOT NULL,
+    content_sha256 TEXT,
+    file_name TEXT,
+    mime_type TEXT,
+    byte_size INTEGER,
+    uploaded_at TEXT,
+    permalink TEXT,
+    processing_status TEXT NOT NULL,
+    caption_ocr TEXT,
+    text_content_embedding_json TEXT,
+    image_embedding_json TEXT,
+    caption_model TEXT,
+    caption_prompt_version TEXT,
+    text_embedding_model TEXT,
+    text_embedding_dimension INTEGER,
+    image_embedding_model TEXT,
+    image_embedding_dimension INTEGER,
+    last_error_code TEXT,
+    inserted_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, provider, workspace_id, file_id),
+    CHECK(processing_status IN
+          ('indexed', 'metadata_only', 'unsupported', 'unavailable', 'deleted'))
+);
+CREATE TABLE IF NOT EXISTS file_shares (
+    project_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    provider_message_id TEXT NOT NULL,
+    uploader_id TEXT,
+    upload_text TEXT,
+    thread_context TEXT,
+    context_version INTEGER NOT NULL,
+    shared_at TEXT,
+    tombstone_version INTEGER,
+    tombstoned_at TEXT,
+    inserted_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, provider, workspace_id, file_id,
+                conversation_id, provider_message_id)
+);
+CREATE TABLE IF NOT EXISTS file_tombstones (
+    project_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    source_version INTEGER NOT NULL,
+    tombstoned_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, provider, workspace_id, file_id)
+);
+CREATE TABLE IF NOT EXISTS file_index_runs (
+    provider TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    store_generation TEXT NOT NULL,
+    window_started_at TEXT NOT NULL,
+    window_ended_at TEXT NOT NULL,
+    allowed_scope_revision TEXT NOT NULL,
+    message_scan_cursor_json TEXT,
+    status TEXT NOT NULL,
+    processing_signature TEXT NOT NULL,
+    scanned_messages INTEGER NOT NULL DEFAULT 0,
+    discovered_shares INTEGER NOT NULL DEFAULT 0,
+    indexed_contents INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    PRIMARY KEY(provider, workspace_id, store_generation,
+                window_started_at, window_ended_at),
+    CHECK(status IN ('pending', 'running', 'complete', 'invalidated'))
+);
+CREATE INDEX IF NOT EXISTS ix_file_contents_workspace_time
+    ON file_contents(project_id, provider, workspace_id, uploaded_at DESC);
+CREATE INDEX IF NOT EXISTS ix_file_contents_workspace_hash
+    ON file_contents(project_id, provider, workspace_id, content_sha256)
+    WHERE content_sha256 IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_file_shares_source
+    ON file_shares(project_id, provider, workspace_id,
+                   conversation_id, shared_at DESC);
+CREATE INDEX IF NOT EXISTS ix_file_index_runs_status
+    ON file_index_runs(status, updated_at);
+"""
+_MIGRATION_V5 = """
+CREATE TABLE IF NOT EXISTS file_graph_ingest_state (
+    project_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    provider_message_id TEXT NOT NULL,
+    content_version INTEGER NOT NULL,
+    context_version INTEGER NOT NULL,
+    ingested_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, provider, workspace_id, file_id,
+                conversation_id, provider_message_id)
+);
+CREATE INDEX IF NOT EXISTS ix_file_graph_ingest_workspace
+    ON file_graph_ingest_state(project_id, provider, workspace_id, ingested_at);
+"""
+_MIGRATIONS = {
+    1: _SCHEMA,
+    2: _MIGRATION_V2,
+    3: _MIGRATION_V3,
+    4: _MIGRATION_V4,
+    5: _MIGRATION_V5,
+}
 
 
 class MessageStore:
@@ -199,6 +326,7 @@ class MessageStore:
         self.database.prepare()
         ensure_project_encryption_key(self.project_id, self.key_version)
         self._migrate()
+        cleanup_stale_temp_files()
 
     def _connect(self):
         return self.database.connect()
@@ -240,6 +368,17 @@ class MessageStore:
                 "INSERT INTO schema_meta(key, value) VALUES ('database_key_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (str(self.database.active_key_version),),
+            )
+            conn.execute(
+                "INSERT INTO schema_meta(key, value) VALUES "
+                "('file_index_store_generation', ?) ON CONFLICT(key) DO NOTHING",
+                (str(uuid.uuid4()),),
+            )
+            self.store_generation = str(
+                conn.execute(
+                    "SELECT value FROM schema_meta "
+                    "WHERE key='file_index_store_generation'"
+                ).fetchone()[0]
             )
         try:
             os.chmod(self.path, 0o600)
@@ -389,6 +528,10 @@ class MessageStore:
             self._apply_membership(conn, event, applied_at)
         elif event_type == "workspace.purge":
             self._apply_workspace_purge(conn, provider, workspace_id)
+        elif event_type in {"file.changed", "file.deleted", "file.unshared"}:
+            # File lifecycle is applied by the independent, versioned command
+            # path after this encrypted delivery is ACKed.
+            pass
         else:
             raise ValueError(f"unsupported normalized event type: {event_type}")
 
@@ -428,7 +571,15 @@ class MessageStore:
             "AND workspace_id=?",
             scope,
         )
+        conn.execute(
+            "DELETE FROM file_index_runs WHERE provider=? AND workspace_id=?",
+            (provider, workspace_id),
+        )
         for table in (
+            "file_graph_ingest_state",
+            "file_tombstones",
+            "file_shares",
+            "file_contents",
             "reactions",
             "messages",
             "conversation_memberships",
@@ -440,6 +591,1512 @@ class MessageStore:
                 f"DELETE FROM {table} WHERE project_id=? AND provider=? AND workspace_id=?",
                 scope,
             )
+
+    def apply_file_command(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Apply one independently authenticated file-index command."""
+        request = dict(request)
+        access_token = str(request.pop("provider_access_token", "") or "")
+        if str(request.get("project_id") or "") != self.project_id:
+            raise ValueError("file index project mismatch")
+        if str(request.get("store_generation") or "") != self.store_generation:
+            raise ValueError("file index store generation mismatch")
+        now = datetime.now(timezone.utc).isoformat()
+        with self._writer_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            hydrated = self._hydrate_file_command(conn, request)
+            if hydrated is None:
+                conn.commit()
+                return {
+                    "status": "deferred",
+                    "reason": "message_not_available",
+                    "store_generation": self.store_generation,
+                }
+            status = self._apply_file_command(conn, hydrated, now)
+            conn.commit()
+        indexed = 0
+        if (
+            status == "applied"
+            and str(hydrated.get("operation") or "")
+            in {"upsert_share", "refresh_file"}
+            and access_token
+        ):
+            indexed = int(
+                self._process_file_content(
+                    provider=str(hydrated.get("provider") or ""),
+                    workspace_id=str(hydrated.get("workspace_id") or ""),
+                    file_id=str(hydrated.get("file_id") or ""),
+                    access_token=access_token,
+                )
+            )
+            if not indexed:
+                with self._connect() as conn:
+                    content = conn.execute(
+                        "SELECT processing_status, last_error_code "
+                        "FROM file_contents WHERE project_id=? AND provider=? "
+                        "AND workspace_id=? AND file_id=?",
+                        (
+                            self.project_id,
+                            str(hydrated.get("provider") or ""),
+                            str(hydrated.get("workspace_id") or ""),
+                            str(hydrated.get("file_id") or ""),
+                        ),
+                    ).fetchone()
+                if (
+                    content is not None
+                    and str(content["processing_status"]) == "metadata_only"
+                    and content["last_error_code"]
+                ):
+                    return {
+                        "status": "deferred",
+                        "reason": str(content["last_error_code"]),
+                        "store_generation": self.store_generation,
+                        "indexed_contents": 0,
+                    }
+        return {
+            "status": status,
+            "store_generation": self.store_generation,
+            "indexed_contents": indexed,
+        }
+
+    def _hydrate_file_command(
+        self,
+        conn: Any,
+        request: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if str(request.get("operation") or "") != "upsert_share":
+            return request
+        if any(
+            key in request
+            for key in (
+                "content_version",
+                "context_version",
+                "file_name",
+                "content_sha256",
+                "processing_status",
+            )
+        ):
+            return request
+        provider = str(request.get("provider") or "")
+        workspace_id = str(request.get("workspace_id") or "")
+        conversation_id = str(request.get("conversation_id") or "")
+        message_id = str(request.get("provider_message_id") or "")
+        file_id = str(request.get("file_id") or "")
+        row = conn.execute(
+            "SELECT * FROM messages WHERE project_id=? AND provider=? "
+            "AND workspace_id=? AND conversation_id=? AND provider_message_id=? "
+            "AND deleted_at IS NULL",
+            (
+                self.project_id,
+                provider,
+                workspace_id,
+                conversation_id,
+                message_id,
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["provider_payload_json"] or "{}")
+        except json.JSONDecodeError:
+            return None
+        message_payload = (
+            payload.get("message")
+            if isinstance(payload, dict)
+            and isinstance(payload.get("message"), dict)
+            else payload
+        )
+        files = (
+            message_payload.get("files")
+            if isinstance(message_payload, dict)
+            else None
+        )
+        file_data = next(
+            (
+                item
+                for item in files or []
+                if isinstance(item, dict) and str(item.get("id") or "") == file_id
+            ),
+            None,
+        )
+        if file_data is None:
+            return None
+        context_version = self._canonical_file_version(row["updated_at"])
+        content_version = self._canonical_file_version(
+            file_data.get("timestamp")
+            or file_data.get("created")
+            or row["occurred_at"]
+        )
+        return {
+            **request,
+            "source_version": max(
+                int(request.get("source_version") or 0),
+                content_version,
+                context_version,
+            ),
+            "content_version": content_version,
+            "context_version": context_version,
+            "file_name": str(
+                file_data.get("name") or file_data.get("title") or ""
+            )
+            or None,
+            "mime_type": str(file_data.get("mimetype") or "") or None,
+            "byte_size": file_data.get("size"),
+            "uploaded_at": str(
+                file_data.get("timestamp")
+                or file_data.get("created")
+                or row["occurred_at"]
+            ),
+            "permalink": str(
+                file_data.get("permalink")
+                or file_data.get("permalink_public")
+                or ""
+            )
+            or None,
+            "uploader_id": str(
+                file_data.get("user") or row["sender_id"] or ""
+            )
+            or None,
+            "upload_text": str(row["text"] or "") or None,
+            "thread_context": self._file_thread_context(conn, row),
+            "shared_at": str(row["occurred_at"]),
+        }
+
+    @staticmethod
+    def _canonical_file_version(value: Any) -> int:
+        raw = str(value or "").strip()
+        if not raw:
+            return 0
+        try:
+            return int(Decimal(raw) * 1_000_000)
+        except (InvalidOperation, ValueError):
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                return 0
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return int(parsed.timestamp() * 1_000_000)
+
+    @staticmethod
+    def _allowed_file_sources(
+        raw_sources: Any,
+        *,
+        provider: str,
+        workspace_id: str,
+    ) -> list[str]:
+        if not isinstance(raw_sources, list):
+            raise ValueError("file index allowed sources are required")
+        conversations: set[str] = set()
+        for source_id in raw_sources:
+            parts = str(source_id).split(":", 2)
+            if len(parts) != 3 or not all(parts):
+                raise ValueError("invalid allowed source id")
+            if parts[0] == provider and parts[1] == workspace_id:
+                conversations.add(parts[2])
+        return sorted(conversations)
+
+    def reconcile_file_window(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Scan one bounded batch of already-encrypted local messages."""
+        request = dict(request)
+        access_token = str(request.pop("provider_access_token", "") or "")
+        if str(request.get("project_id") or "") != self.project_id:
+            raise ValueError("file index project mismatch")
+        if str(request.get("store_generation") or "") != self.store_generation:
+            raise ValueError("file index store generation mismatch")
+        provider = str(request.get("provider") or "")
+        workspace_id = str(request.get("workspace_id") or "")
+        start = str(request.get("window_started_at") or "")
+        end = str(request.get("window_ended_at") or "")
+        scope_revision = str(request.get("allowed_scope_revision") or "")
+        processing_signature = str(request.get("processing_signature") or "")
+        if (
+            not provider
+            or not workspace_id
+            or not start
+            or not end
+            or start >= end
+            or not scope_revision
+            or not processing_signature
+        ):
+            raise ValueError("bounded file reconcile scope is required")
+        conversations = self._allowed_file_sources(
+            request.get("allowed_source_ids"),
+            provider=provider,
+            workspace_id=workspace_id,
+        )
+        limit = max(1, min(int(request.get("batch_limit") or 100), 500))
+        now = datetime.now(timezone.utc).isoformat()
+        run_scope = (
+            provider,
+            workspace_id,
+            self.store_generation,
+            start,
+            end,
+        )
+
+        with self._writer_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                "SELECT * FROM file_index_runs WHERE provider=? AND workspace_id=? "
+                "AND store_generation=? AND window_started_at=? AND window_ended_at=?",
+                run_scope,
+            ).fetchone()
+            reset = (
+                run is not None
+                and (
+                    str(run["allowed_scope_revision"]) != scope_revision
+                    or str(run["processing_signature"]) != processing_signature
+                )
+            )
+            if run is None:
+                conn.execute(
+                    "INSERT INTO file_index_runs(provider, workspace_id, "
+                    "store_generation, window_started_at, window_ended_at, "
+                    "allowed_scope_revision, status, processing_signature, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)",
+                    (*run_scope, scope_revision, processing_signature, now),
+                )
+                cursor: dict[str, str] | None = None
+            elif reset:
+                conn.execute(
+                    "UPDATE file_index_runs SET allowed_scope_revision=?, "
+                    "message_scan_cursor_json=NULL, status='running', "
+                    "processing_signature=?, scanned_messages=0, "
+                    "discovered_shares=0, indexed_contents=0, updated_at=?, "
+                    "completed_at=NULL WHERE provider=? AND workspace_id=? "
+                    "AND store_generation=? AND window_started_at=? "
+                    "AND window_ended_at=?",
+                    (scope_revision, processing_signature, now, *run_scope),
+                )
+                cursor = None
+            else:
+                try:
+                    cursor = json.loads(run["message_scan_cursor_json"] or "null")
+                except json.JSONDecodeError:
+                    cursor = None
+
+            if not conversations:
+                conn.execute(
+                    "UPDATE file_index_runs SET status='complete', updated_at=?, "
+                    "completed_at=? WHERE provider=? AND workspace_id=? "
+                    "AND store_generation=? AND window_started_at=? "
+                    "AND window_ended_at=?",
+                    (now, now, *run_scope),
+                )
+                conn.commit()
+                return {
+                    "status": "complete",
+                    "store_generation": self.store_generation,
+                    "scanned_messages": 0,
+                    "discovered_shares": 0,
+                    "indexed_contents": 0,
+                }
+
+            placeholders = ",".join("?" for _ in conversations)
+            sql = (
+                "SELECT * FROM messages WHERE project_id=? AND provider=? "
+                "AND workspace_id=? AND conversation_id IN ("
+                + placeholders
+                + ") AND occurred_at>=? AND occurred_at<=? AND deleted_at IS NULL"
+            )
+            params: list[Any] = [
+                self.project_id,
+                provider,
+                workspace_id,
+                *conversations,
+                start,
+                end,
+            ]
+            if isinstance(cursor, dict):
+                cursor_values = [
+                    str(cursor.get(key) or "")
+                    for key in (
+                        "occurred_at",
+                        "conversation_id",
+                        "provider_message_id",
+                    )
+                ]
+                if all(cursor_values):
+                    sql += (
+                        " AND (occurred_at, conversation_id, provider_message_id) "
+                        "> (?, ?, ?)"
+                    )
+                    params.extend(cursor_values)
+            sql += (
+                " ORDER BY occurred_at, conversation_id, provider_message_id LIMIT ?"
+            )
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+            discovered = 0
+            indexed = 0
+            for row in rows:
+                try:
+                    payload = json.loads(row["provider_payload_json"] or "{}")
+                except json.JSONDecodeError:
+                    payload = {}
+                message_payload = (
+                    payload.get("message")
+                    if isinstance(payload, dict)
+                    and isinstance(payload.get("message"), dict)
+                    else payload
+                )
+                files = (
+                    message_payload.get("files")
+                    if isinstance(message_payload, dict)
+                    else None
+                )
+                if not isinstance(files, list):
+                    continue
+                thread_context = self._file_thread_context(conn, row)
+                context_version = self._canonical_file_version(row["updated_at"])
+                for file_data in files:
+                    if not isinstance(file_data, dict):
+                        continue
+                    file_id = str(file_data.get("id") or "")
+                    if not file_id:
+                        continue
+                    content_version = self._canonical_file_version(
+                        file_data.get("timestamp")
+                        or file_data.get("created")
+                        or row["occurred_at"]
+                    )
+                    self._apply_file_command(
+                        conn,
+                        {
+                            "operation": "upsert_share",
+                            "provider": provider,
+                            "workspace_id": workspace_id,
+                            "file_id": file_id,
+                            "conversation_id": str(row["conversation_id"]),
+                            "provider_message_id": str(
+                                row["provider_message_id"]
+                            ),
+                            "source_version": max(
+                                content_version,
+                                context_version,
+                            ),
+                            "content_version": content_version,
+                            "context_version": context_version,
+                            "file_name": str(
+                                file_data.get("name")
+                                or file_data.get("title")
+                                or ""
+                            )
+                            or None,
+                            "mime_type": str(file_data.get("mimetype") or "")
+                            or None,
+                            "byte_size": file_data.get("size"),
+                            "uploaded_at": str(
+                                file_data.get("timestamp")
+                                or file_data.get("created")
+                                or row["occurred_at"]
+                            ),
+                            "permalink": str(
+                                file_data.get("permalink")
+                                or file_data.get("permalink_public")
+                                or ""
+                            )
+                            or None,
+                            "uploader_id": str(
+                                file_data.get("user")
+                                or row["sender_id"]
+                                or ""
+                            )
+                            or None,
+                            "upload_text": str(row["text"] or "") or None,
+                            "thread_context": thread_context,
+                            "shared_at": str(row["occurred_at"]),
+                        },
+                        now,
+                    )
+                    discovered += 1
+
+            scan_complete = len(rows) < limit
+            next_cursor = None
+            if rows:
+                last = rows[-1]
+                next_cursor = {
+                    "occurred_at": str(last["occurred_at"]),
+                    "conversation_id": str(last["conversation_id"]),
+                    "provider_message_id": str(last["provider_message_id"]),
+                }
+            conn.execute(
+                "UPDATE file_index_runs SET message_scan_cursor_json=?, status=?, "
+                "scanned_messages=scanned_messages+?, "
+                "discovered_shares=discovered_shares+?, "
+                "indexed_contents=indexed_contents+?, updated_at=?, completed_at=? "
+                "WHERE provider=? AND workspace_id=? AND store_generation=? "
+                "AND window_started_at=? AND window_ended_at=?",
+                (
+                    json.dumps(next_cursor, separators=(",", ":"))
+                    if next_cursor is not None
+                    else None,
+                    "complete" if scan_complete else "running",
+                    len(rows),
+                    discovered,
+                    indexed,
+                    now,
+                    now if scan_complete else None,
+                    *run_scope,
+                ),
+            )
+            conn.commit()
+        processed = 0
+        pending = 0
+        if access_token:
+            processed = self._process_pending_file_contents(
+                provider=provider,
+                workspace_id=workspace_id,
+                access_token=access_token,
+                limit=1,
+            )
+            with self._writer_lock, self._connect() as conn:
+                pending = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM file_contents WHERE project_id=? "
+                        "AND provider=? AND workspace_id=? "
+                        "AND processing_status='metadata_only'",
+                        (self.project_id, provider, workspace_id),
+                    ).fetchone()[0]
+                )
+                retryable_pending = (
+                    conn.execute(
+                        "SELECT 1 FROM file_contents WHERE project_id=? "
+                        "AND provider=? AND workspace_id=? "
+                        "AND processing_status='metadata_only' "
+                        "AND last_error_code IS NOT NULL LIMIT 1",
+                        (self.project_id, provider, workspace_id),
+                    ).fetchone()
+                    is not None
+                )
+                complete = scan_complete and pending == 0
+                conn.execute(
+                    "UPDATE file_index_runs SET status=?, "
+                    "indexed_contents=indexed_contents+?, updated_at=?, "
+                    "completed_at=? WHERE provider=? AND workspace_id=? "
+                    "AND store_generation=? AND window_started_at=? "
+                    "AND window_ended_at=?",
+                    (
+                        "complete" if complete else "running",
+                        processed,
+                        datetime.now(timezone.utc).isoformat(),
+                        datetime.now(timezone.utc).isoformat()
+                        if complete
+                        else None,
+                        *run_scope,
+                    ),
+                )
+                conn.commit()
+        else:
+            complete = scan_complete
+            retryable_pending = False
+        if retryable_pending:
+            return {
+                "status": "deferred",
+                "reason": "file_content_retryable",
+                "store_generation": self.store_generation,
+                "scanned_messages": len(rows),
+                "discovered_shares": discovered,
+                "indexed_contents": processed,
+                "pending_contents": pending,
+            }
+        if complete:
+            self._expire_file_window(
+                provider=provider,
+                workspace_id=workspace_id,
+                window_started_at=start,
+            )
+        return {
+            "status": "complete" if complete else "continuation",
+            "store_generation": self.store_generation,
+            "scanned_messages": len(rows),
+            "discovered_shares": discovered,
+            "indexed_contents": processed,
+            "pending_contents": pending,
+        }
+
+    def _expire_file_window(
+        self,
+        *,
+        provider: str,
+        workspace_id: str,
+        window_started_at: str,
+    ) -> None:
+        tombstone_version = self._canonical_file_version(window_started_at)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._writer_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE file_shares SET tombstone_version=?, tombstoned_at=?, "
+                "updated_at=? WHERE project_id=? AND provider=? "
+                "AND workspace_id=? AND tombstoned_at IS NULL "
+                "AND shared_at IS NOT NULL AND shared_at<?",
+                (
+                    tombstone_version,
+                    now,
+                    now,
+                    self.project_id,
+                    provider,
+                    workspace_id,
+                    window_started_at,
+                ),
+            )
+            conn.execute(
+                "DELETE FROM file_contents WHERE project_id=? AND provider=? "
+                "AND workspace_id=? AND NOT EXISTS ("
+                "SELECT 1 FROM file_shares fs WHERE "
+                "fs.project_id=file_contents.project_id AND "
+                "fs.provider=file_contents.provider AND "
+                "fs.workspace_id=file_contents.workspace_id AND "
+                "fs.file_id=file_contents.file_id AND fs.tombstoned_at IS NULL)",
+                (self.project_id, provider, workspace_id),
+            )
+            conn.execute(
+                "DELETE FROM file_graph_ingest_state WHERE project_id=? "
+                "AND provider=? AND workspace_id=? AND NOT EXISTS ("
+                "SELECT 1 FROM file_shares fs WHERE "
+                "fs.project_id=file_graph_ingest_state.project_id AND "
+                "fs.provider=file_graph_ingest_state.provider AND "
+                "fs.workspace_id=file_graph_ingest_state.workspace_id AND "
+                "fs.file_id=file_graph_ingest_state.file_id AND "
+                "fs.conversation_id=file_graph_ingest_state.conversation_id AND "
+                "fs.provider_message_id=file_graph_ingest_state.provider_message_id "
+                "AND fs.tombstoned_at IS NULL)",
+                (self.project_id, provider, workspace_id),
+            )
+            conn.commit()
+
+    def _process_pending_file_contents(
+        self,
+        *,
+        provider: str,
+        workspace_id: str,
+        access_token: str,
+        limit: int,
+    ) -> int:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT file_id FROM file_contents WHERE project_id=? "
+                "AND provider=? AND workspace_id=? "
+                "AND processing_status='metadata_only' ORDER BY uploaded_at, file_id "
+                "LIMIT ?",
+                (self.project_id, provider, workspace_id, max(1, min(limit, 3))),
+            ).fetchall()
+        return sum(
+            int(
+                self._process_file_content(
+                    provider=provider,
+                    workspace_id=workspace_id,
+                    file_id=str(row["file_id"]),
+                    access_token=access_token,
+                )
+            )
+            for row in rows
+        )
+
+    def _process_file_content(
+        self,
+        *,
+        provider: str,
+        workspace_id: str,
+        file_id: str,
+        access_token: str,
+    ) -> bool:
+        if provider != "slack" or not file_id or not access_token:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT content_version, processing_status FROM file_contents "
+                "WHERE project_id=? AND provider=? AND workspace_id=? AND file_id=?",
+                (self.project_id, provider, workspace_id, file_id),
+            ).fetchone()
+        if row is None or str(row["processing_status"]) != "metadata_only":
+            return False
+        content_version = int(row["content_version"])
+        result = process_slack_file(
+            file_id,
+            access_token,
+            lambda digest, mime_type: self._derived_content_by_hash(
+                provider=provider,
+                workspace_id=workspace_id,
+                file_id=file_id,
+                content_sha256=digest,
+                mime_type=mime_type,
+            ),
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        text_embedding = result.get("text_content_embedding")
+        image_embedding = result.get("image_embedding")
+        with self._writer_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            updated = conn.execute(
+                "UPDATE file_contents SET content_sha256=?, "
+                "file_name=COALESCE(?, file_name), mime_type=COALESCE(?, mime_type), "
+                "byte_size=COALESCE(?, byte_size), "
+                "uploaded_at=COALESCE(?, uploaded_at), "
+                "permalink=COALESCE(?, permalink), processing_status=?, "
+                "caption_ocr=?, text_content_embedding_json=?, "
+                "image_embedding_json=?, caption_model=?, "
+                "caption_prompt_version=?, text_embedding_model=?, "
+                "text_embedding_dimension=?, image_embedding_model=?, "
+                "image_embedding_dimension=?, last_error_code=?, updated_at=? "
+                "WHERE project_id=? AND provider=? AND workspace_id=? AND file_id=? "
+                "AND content_version=? AND processing_status='metadata_only'",
+                (
+                    result.get("content_sha256"),
+                    result.get("file_name"),
+                    result.get("mime_type"),
+                    result.get("byte_size"),
+                    result.get("uploaded_at"),
+                    result.get("permalink"),
+                    str(result["processing_status"]),
+                    result.get("caption_ocr"),
+                    json.dumps(text_embedding, separators=(",", ":"))
+                    if text_embedding is not None
+                    else None,
+                    json.dumps(image_embedding, separators=(",", ":"))
+                    if image_embedding is not None
+                    else None,
+                    result.get("caption_model"),
+                    result.get("caption_prompt_version"),
+                    result.get("text_embedding_model"),
+                    result.get("text_embedding_dimension"),
+                    result.get("image_embedding_model"),
+                    result.get("image_embedding_dimension"),
+                    result.get("last_error_code"),
+                    now,
+                    self.project_id,
+                    provider,
+                    workspace_id,
+                    file_id,
+                    content_version,
+                ),
+            ).rowcount
+            conn.commit()
+        return bool(
+            updated and str(result.get("processing_status")) != "metadata_only"
+        )
+
+    def _derived_content_by_hash(
+        self,
+        *,
+        provider: str,
+        workspace_id: str,
+        file_id: str,
+        content_sha256: str,
+        mime_type: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM file_contents WHERE project_id=? AND provider=? "
+                "AND workspace_id=? AND file_id!=? AND content_sha256=? "
+                "AND mime_type=? AND processing_status='indexed' "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (
+                    self.project_id,
+                    provider,
+                    workspace_id,
+                    file_id,
+                    content_sha256,
+                    mime_type,
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            text_embedding = json.loads(
+                row["text_content_embedding_json"] or "null"
+            )
+            image_embedding = json.loads(row["image_embedding_json"] or "null")
+        except json.JSONDecodeError:
+            return None
+        return {
+            "caption_ocr": row["caption_ocr"],
+            "text_content_embedding": text_embedding,
+            "image_embedding": image_embedding,
+            "caption_model": row["caption_model"],
+            "caption_prompt_version": row["caption_prompt_version"],
+            "text_embedding_model": row["text_embedding_model"],
+            "text_embedding_dimension": row["text_embedding_dimension"],
+            "image_embedding_model": row["image_embedding_model"],
+            "image_embedding_dimension": row["image_embedding_dimension"],
+        }
+
+    @staticmethod
+    def _file_search_tokens(value: Any) -> set[str]:
+        return {
+            token
+            for token in re.findall(
+                r"[0-9A-Za-z가-힣_]+",
+                str(value or "").lower(),
+            )
+            if token
+        }
+
+    @staticmethod
+    def _file_search_cosine(left: list[float], right: list[float]) -> float:
+        if not left or len(left) != len(right):
+            return 0.0
+        dot = sum(a * b for a, b in zip(left, right))
+        left_norm = math.sqrt(sum(value * value for value in left))
+        right_norm = math.sqrt(sum(value * value for value in right))
+        if not left_norm or not right_norm:
+            return 0.0
+        return dot / (left_norm * right_norm)
+
+    def search_file_index(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Run the fixed retrieve-50, rerank-10, inspect-3, return-1..3 flow."""
+        request = dict(request)
+        access_token = str(request.pop("provider_access_token", "") or "")
+        if str(request.get("project_id") or "") != self.project_id:
+            raise ValueError("file index project mismatch")
+        if str(request.get("store_generation") or "") != self.store_generation:
+            raise ValueError("file index store generation mismatch")
+        provider = str(request.get("provider") or "")
+        workspace_id = str(request.get("workspace_id") or "")
+        query = str(request.get("query") or "").strip()
+        scope_revision = str(request.get("allowed_scope_revision") or "")
+        window_started_at = str(request.get("window_started_at") or "")
+        if not provider or not workspace_id or not query or not scope_revision:
+            raise ValueError("file search scope and query are required")
+        conversations = self._allowed_file_sources(
+            request.get("allowed_source_ids"),
+            provider=provider,
+            workspace_id=workspace_id,
+        )
+        if not conversations:
+            return {
+                "status": "complete",
+                "coverage_complete": True,
+                "retrieve_count": 0,
+                "rerank_count": 0,
+                "inspected_image_count": 0,
+                "files": [],
+                "store_generation": self.store_generation,
+            }
+        placeholders = ",".join("?" for _ in conversations)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT fc.*, fs.conversation_id, fs.provider_message_id, "
+                "fs.uploader_id, fs.upload_text, fs.thread_context, fs.shared_at, "
+                "i.display_name AS uploader_name, c.title AS conversation_name "
+                "FROM file_contents fc JOIN file_shares fs ON "
+                "fc.project_id=fs.project_id AND fc.provider=fs.provider AND "
+                "fc.workspace_id=fs.workspace_id AND fc.file_id=fs.file_id "
+                "LEFT JOIN identities i ON i.project_id=fs.project_id AND "
+                "i.provider=fs.provider AND i.workspace_id=fs.workspace_id AND "
+                "i.external_user_id=fs.uploader_id "
+                "LEFT JOIN conversations c ON c.project_id=fs.project_id AND "
+                "c.provider=fs.provider AND c.workspace_id=fs.workspace_id AND "
+                "c.conversation_id=fs.conversation_id "
+                "WHERE fc.project_id=? AND fc.provider=? AND fc.workspace_id=? "
+                "AND fs.conversation_id IN ("
+                + placeholders
+                + ") AND fc.processing_status!='deleted' "
+                "AND fs.tombstoned_at IS NULL "
+                + ("AND fs.shared_at>=? " if window_started_at else "")
+                + "ORDER BY fs.shared_at DESC LIMIT 5000",
+                (
+                    self.project_id,
+                    provider,
+                    workspace_id,
+                    *conversations,
+                    *([window_started_at] if window_started_at else []),
+                ),
+            ).fetchall()
+            coverage_complete = (
+                conn.execute(
+                    "SELECT 1 FROM file_index_runs WHERE provider=? "
+                    "AND workspace_id=? AND store_generation=? "
+                    "AND allowed_scope_revision=? AND status='complete' LIMIT 1",
+                    (
+                        provider,
+                        workspace_id,
+                        self.store_generation,
+                        scope_revision,
+                    ),
+                ).fetchone()
+                is not None
+            )
+
+        query_tokens = self._file_search_tokens(query)
+        uploader_filter = str(request.get("uploader_id") or "")
+        raw_types = request.get("file_types")
+        file_types = {
+            str(value).lower()
+            for value in raw_types or []
+            if str(value or "").strip()
+        } if isinstance(raw_types, list) else set()
+        query_embedding: list[float] = []
+        try:
+            query_embedding, _ = embed_text(query)
+        except FileProcessingError:
+            pass
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            if uploader_filter and str(row["uploader_id"] or "") != uploader_filter:
+                continue
+            if file_types:
+                mime_type = str(row["mime_type"] or "").lower()
+                suffix = Path(str(row["file_name"] or "")).suffix.lower().lstrip(".")
+                if not (
+                    suffix in file_types
+                    or mime_type in file_types
+                    or ("images" in file_types and mime_type.startswith("image/"))
+                    or (
+                        "pdfs" in file_types
+                        and (
+                            suffix == "pdf"
+                            or mime_type == "application/pdf"
+                        )
+                    )
+                ):
+                    continue
+            fields = (
+                ("file_name", 4.0),
+                ("uploader_name", 2.5),
+                ("uploader_id", 1.5),
+                ("conversation_name", 2.0),
+                ("conversation_id", 1.0),
+                ("uploaded_at", 0.5),
+                ("shared_at", 0.5),
+                ("upload_text", 2.0),
+                ("thread_context", 1.5),
+                ("caption_ocr", 1.0),
+            )
+            lexical = sum(
+                weight
+                * len(query_tokens & self._file_search_tokens(row[field]))
+                for field, weight in fields
+            )
+            haystack = " ".join(
+                str(row[field] or "").lower() for field, _ in fields
+            )
+            phrase = 3.0 if query.lower() in haystack else 0.0
+            semantic = 0.0
+            if query_embedding:
+                for column in (
+                    "text_content_embedding_json",
+                    "image_embedding_json",
+                ):
+                    try:
+                        vector = json.loads(row[column] or "[]")
+                    except json.JSONDecodeError:
+                        vector = []
+                    if isinstance(vector, list):
+                        semantic = max(
+                            semantic,
+                            self._file_search_cosine(query_embedding, vector),
+                        )
+            semantic_signal = semantic if semantic >= 0.2 else 0.0
+            retrieval_score = lexical + semantic_signal * 4.0
+            if retrieval_score <= 0:
+                continue
+            candidates.append(
+                {
+                    "file_id": str(row["file_id"]),
+                    "name": row["file_name"],
+                    "mimetype": row["mime_type"],
+                    "size": row["byte_size"],
+                    "uploaded_at": row["uploaded_at"],
+                    "shared_at": row["shared_at"],
+                    "uploader_id": row["uploader_id"],
+                    "uploader_name": row["uploader_name"],
+                    "channel_id": row["conversation_id"],
+                    "channel_name": row["conversation_name"],
+                    "message_id": row["provider_message_id"],
+                    "permalink": row["permalink"],
+                    "upload_text": row["upload_text"],
+                    "thread_context": row["thread_context"],
+                    "caption_ocr": row["caption_ocr"],
+                    "processing_status": row["processing_status"],
+                    "retrieval_score": retrieval_score,
+                    "rerank_score": retrieval_score + phrase,
+                    "semantic_score": semantic,
+                }
+            )
+        retrieved = sorted(
+            candidates,
+            key=lambda item: (
+                item["retrieval_score"],
+                str(item.get("shared_at") or ""),
+            ),
+            reverse=True,
+        )[:FILE_SEARCH_RETRIEVE_LIMIT]
+        reranked = sorted(
+            retrieved,
+            key=lambda item: (
+                item["rerank_score"],
+                str(item.get("shared_at") or ""),
+            ),
+            reverse=True,
+        )[:FILE_SEARCH_RERANK_LIMIT]
+        inspected = 0
+        for item in reranked:
+            item["image_inspected"] = False
+        inspectable = [
+            item
+            for item in reranked
+            if str(item.get("mimetype") or "").startswith("image/")
+        ][:FILE_SEARCH_IMAGE_INSPECT_LIMIT]
+        if access_token and inspectable:
+            with ThreadPoolExecutor(max_workers=len(inspectable)) as pool:
+                futures = {
+                    pool.submit(
+                        inspect_slack_image,
+                        str(item["file_id"]),
+                        access_token,
+                        query,
+                    ): item
+                    for item in inspectable
+                }
+                for future in as_completed(futures):
+                    item = futures[future]
+                    try:
+                        inspection = future.result()
+                    except Exception:
+                        continue
+                    item["image_inspected"] = True
+                    item["image_inspection"] = inspection
+                    item["rerank_score"] += len(
+                        query_tokens & self._file_search_tokens(inspection)
+                    )
+                    inspected += 1
+        reranked.sort(
+            key=lambda item: (
+                item["rerank_score"],
+                str(item.get("shared_at") or ""),
+            ),
+            reverse=True,
+        )
+        limit = max(1, min(int(request.get("limit") or 3), 3))
+        output = []
+        for item in reranked[:limit]:
+            evidence = []
+            for label, key in (
+                ("upload", "upload_text"),
+                ("thread", "thread_context"),
+                ("image", "caption_ocr"),
+                ("inspection", "image_inspection"),
+            ):
+                value = str(item.get(key) or "").strip()
+                if value and query_tokens & self._file_search_tokens(value):
+                    evidence.append(f"{label}: {value[:160]}")
+            output.append(
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key
+                    not in {
+                        "upload_text",
+                        "thread_context",
+                        "caption_ocr",
+                        "retrieval_score",
+                        "semantic_score",
+                        "image_inspection",
+                    }
+                }
+                | {"why_matched": " | ".join(evidence)[:320] or "metadata match"}
+            )
+        return {
+            "status": "complete",
+            "coverage_complete": coverage_complete,
+            "retrieve_count": len(retrieved),
+            "rerank_count": len(reranked),
+            "inspected_image_count": inspected,
+            "files": output,
+            "store_generation": self.store_generation,
+        }
+
+    def file_graph_batch(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Export a bounded, ACL-filtered Episode batch without persisting it centrally."""
+        request = dict(request)
+        request.pop("provider_access_token", None)
+        if str(request.get("project_id") or "") != self.project_id:
+            raise ValueError("file graph project mismatch")
+        if str(request.get("store_generation") or "") != self.store_generation:
+            raise ValueError("file graph store generation mismatch")
+        provider = str(request.get("provider") or "")
+        workspace_id = str(request.get("workspace_id") or "")
+        conversations = self._allowed_file_sources(
+            request.get("allowed_source_ids"),
+            provider=provider,
+            workspace_id=workspace_id,
+        )
+        if not provider or not workspace_id or not conversations:
+            return {
+                "status": "complete",
+                "episodes": [],
+                "store_generation": self.store_generation,
+            }
+        limit = max(1, min(int(request.get("limit") or 3), 10))
+        window_started_at = str(request.get("window_started_at") or "")
+        placeholders = ",".join("?" for _ in conversations)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT fc.file_id, fc.content_version, fc.file_name, "
+                "fc.mime_type, fc.permalink, fc.caption_ocr, "
+                "fs.conversation_id, fs.provider_message_id, fs.uploader_id, "
+                "fs.upload_text, fs.thread_context, fs.context_version, "
+                "fs.shared_at, c.title AS conversation_name "
+                "FROM file_contents fc JOIN file_shares fs ON "
+                "fc.project_id=fs.project_id AND fc.provider=fs.provider AND "
+                "fc.workspace_id=fs.workspace_id AND fc.file_id=fs.file_id "
+                "LEFT JOIN conversations c ON c.project_id=fs.project_id AND "
+                "c.provider=fs.provider AND c.workspace_id=fs.workspace_id AND "
+                "c.conversation_id=fs.conversation_id "
+                "LEFT JOIN file_graph_ingest_state gs ON "
+                "gs.project_id=fs.project_id AND gs.provider=fs.provider AND "
+                "gs.workspace_id=fs.workspace_id AND gs.file_id=fs.file_id AND "
+                "gs.conversation_id=fs.conversation_id AND "
+                "gs.provider_message_id=fs.provider_message_id "
+                "WHERE fc.project_id=? AND fc.provider=? AND fc.workspace_id=? "
+                "AND fs.conversation_id IN ("
+                + placeholders
+                + ") AND fc.processing_status NOT IN ('deleted', 'metadata_only') "
+                "AND fs.tombstoned_at IS NULL "
+                + ("AND fs.shared_at>=? " if window_started_at else "")
+                + "AND (gs.file_id IS NULL OR "
+                "gs.content_version<fc.content_version OR "
+                "gs.context_version<fs.context_version) "
+                "ORDER BY fs.shared_at, fs.conversation_id, "
+                "fs.provider_message_id, fs.file_id LIMIT ?",
+                (
+                    self.project_id,
+                    provider,
+                    workspace_id,
+                    *conversations,
+                    *([window_started_at] if window_started_at else []),
+                    limit,
+                ),
+            ).fetchall()
+        episodes = []
+        for row in rows:
+            body_parts = [
+                "Slack file-share evidence.",
+                f"File name: {str(row['file_name'] or '')[:500]}",
+                f"MIME type: {str(row['mime_type'] or '')[:200]}",
+                f"Uploader Slack ID: {str(row['uploader_id'] or '')[:200]}",
+                "Upload message:\n" + str(row["upload_text"] or "")[:4_000],
+                "Thread context:\n" + str(row["thread_context"] or "")[:8_000],
+                "File description/OCR:\n" + str(row["caption_ocr"] or "")[:8_000],
+            ]
+            file_id = str(row["file_id"])
+            conversation_id = str(row["conversation_id"])
+            message_id = str(row["provider_message_id"])
+            episodes.append(
+                {
+                    "episode_id": ":".join(
+                        (
+                            provider,
+                            workspace_id,
+                            file_id,
+                            conversation_id,
+                            message_id,
+                        )
+                    ),
+                    "name": f"slack-file:{workspace_id}:{file_id}:{conversation_id}:{message_id}",
+                    "body": "\n\n".join(body_parts)[:20_000],
+                    "source_description": (
+                        f"{provider}:{workspace_id}:{conversation_id} #"
+                        + str(row["conversation_name"] or conversation_id)[:500]
+                        + " file"
+                    ),
+                    "reference_time": str(
+                        row["shared_at"] or datetime.now(timezone.utc).isoformat()
+                    ),
+                    "source_id": f"{provider}:{workspace_id}:{conversation_id}",
+                    "source_metadata": {
+                        "file_id": file_id,
+                        "uploader_id": row["uploader_id"],
+                        "permalink": row["permalink"],
+                        "mime_type": row["mime_type"],
+                        "content_version": int(row["content_version"]),
+                        "context_version": int(row["context_version"]),
+                    },
+                }
+            )
+        return {
+            "status": "continuation" if len(episodes) == limit else "complete",
+            "episodes": episodes,
+            "store_generation": self.store_generation,
+        }
+
+    def ack_file_graph_batch(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Advance only the independent file-graph watermark after graph commit."""
+        if str(request.get("project_id") or "") != self.project_id:
+            raise ValueError("file graph project mismatch")
+        if str(request.get("store_generation") or "") != self.store_generation:
+            raise ValueError("file graph store generation mismatch")
+        provider = str(request.get("provider") or "")
+        workspace_id = str(request.get("workspace_id") or "")
+        acknowledgements = request.get("acknowledgements")
+        if (
+            not provider
+            or not workspace_id
+            or not isinstance(acknowledgements, list)
+            or len(acknowledgements) > 10
+        ):
+            raise ValueError("file graph acknowledgements are invalid")
+        now = datetime.now(timezone.utc).isoformat()
+        applied = 0
+        with self._writer_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for item in acknowledgements:
+                if not isinstance(item, dict):
+                    raise ValueError("file graph acknowledgement is invalid")
+                required = (
+                    str(item.get("file_id") or ""),
+                    str(item.get("conversation_id") or ""),
+                    str(item.get("provider_message_id") or ""),
+                )
+                versions = (
+                    item.get("content_version"),
+                    item.get("context_version"),
+                )
+                if (
+                    not all(required)
+                    or any(
+                        isinstance(value, bool) or not isinstance(value, int)
+                        for value in versions
+                    )
+                ):
+                    raise ValueError("file graph acknowledgement is invalid")
+                conn.execute(
+                    "INSERT INTO file_graph_ingest_state(project_id, provider, "
+                    "workspace_id, file_id, conversation_id, provider_message_id, "
+                    "content_version, context_version, ingested_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(project_id, provider, workspace_id, file_id, "
+                    "conversation_id, provider_message_id) DO UPDATE SET "
+                    "content_version=MAX(file_graph_ingest_state.content_version, "
+                    "excluded.content_version), "
+                    "context_version=MAX(file_graph_ingest_state.context_version, "
+                    "excluded.context_version), ingested_at=excluded.ingested_at",
+                    (
+                        self.project_id,
+                        provider,
+                        workspace_id,
+                        *required,
+                        int(versions[0]),
+                        int(versions[1]),
+                        now,
+                    ),
+                )
+                applied += 1
+            conn.commit()
+        return {
+            "status": "complete",
+            "acknowledged": applied,
+            "store_generation": self.store_generation,
+        }
+
+    def _file_thread_context(self, conn: Any, row: Any) -> str | None:
+        root = str(row["parent_message_id"] or row["provider_message_id"])
+        context_rows = conn.execute(
+            "SELECT text FROM messages WHERE project_id=? AND provider=? "
+            "AND workspace_id=? AND conversation_id=? AND deleted_at IS NULL "
+            "AND (provider_message_id=? OR parent_message_id=?) "
+            "ORDER BY occurred_at LIMIT 20",
+            (
+                self.project_id,
+                str(row["provider"]),
+                str(row["workspace_id"]),
+                str(row["conversation_id"]),
+                root,
+                root,
+            ),
+        ).fetchall()
+        text = "\n".join(
+            str(item["text"]).strip()
+            for item in context_rows
+            if str(item["text"] or "").strip()
+        )
+        return text[:8_000] or None
+
+    def _apply_file_command(
+        self,
+        conn: Any,
+        request: dict[str, Any],
+        applied_at: str,
+    ) -> str:
+        operation = str(request.get("operation") or "")
+        if operation not in {
+            "upsert_share",
+            "remove_share",
+            "refresh_file",
+            "delete_file",
+        }:
+            raise ValueError("unsupported file index operation")
+        provider = str(request.get("provider") or "")
+        workspace_id = str(request.get("workspace_id") or "")
+        file_id = str(request.get("file_id") or "")
+        source_version = request.get("source_version")
+        if (
+            not provider
+            or not workspace_id
+            or not file_id
+            or isinstance(source_version, bool)
+            or not isinstance(source_version, int)
+            or source_version < 0
+        ):
+            raise ValueError("file index scope and integer version are required")
+        occurred_at = str(request.get("occurred_at") or applied_at)
+        file_scope = (self.project_id, provider, workspace_id, file_id)
+
+        if operation == "delete_file":
+            current = conn.execute(
+                "SELECT source_version FROM file_tombstones WHERE project_id=? "
+                "AND provider=? AND workspace_id=? AND file_id=?",
+                file_scope,
+            ).fetchone()
+            if current is not None and int(current["source_version"]) > source_version:
+                return "stale"
+            conn.execute(
+                "INSERT INTO file_tombstones(project_id, provider, workspace_id, "
+                "file_id, source_version, tombstoned_at) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(project_id, provider, workspace_id, file_id) DO UPDATE SET "
+                "source_version=excluded.source_version, "
+                "tombstoned_at=excluded.tombstoned_at "
+                "WHERE excluded.source_version >= file_tombstones.source_version",
+                (*file_scope, source_version, occurred_at),
+            )
+            conn.execute(
+                "UPDATE file_contents SET processing_status='deleted', updated_at=? "
+                "WHERE project_id=? AND provider=? AND workspace_id=? AND file_id=? "
+                "AND content_version<=?",
+                (applied_at, *file_scope, source_version),
+            )
+            conn.execute(
+                "UPDATE file_shares SET tombstone_version=?, tombstoned_at=?, "
+                "updated_at=? WHERE project_id=? AND provider=? AND workspace_id=? "
+                "AND file_id=? AND (tombstone_version IS NULL OR tombstone_version<=?)",
+                (source_version, occurred_at, applied_at, *file_scope, source_version),
+            )
+            return "applied"
+
+        if operation == "refresh_file":
+            file_tombstone = conn.execute(
+                "SELECT source_version FROM file_tombstones WHERE project_id=? "
+                "AND provider=? AND workspace_id=? AND file_id=?",
+                file_scope,
+            ).fetchone()
+            if (
+                file_tombstone is not None
+                and int(file_tombstone["source_version"]) >= source_version
+            ):
+                return "stale"
+            content = conn.execute(
+                "SELECT content_version FROM file_contents WHERE project_id=? "
+                "AND provider=? AND workspace_id=? AND file_id=?",
+                file_scope,
+            ).fetchone()
+            if content is None:
+                return "stale"
+            if int(content["content_version"]) > source_version:
+                return "stale"
+            conn.execute(
+                "UPDATE file_contents SET content_version=?, "
+                "processing_status='metadata_only', last_error_code=NULL, "
+                "updated_at=? WHERE project_id=? AND provider=? "
+                "AND workspace_id=? AND file_id=?",
+                (source_version, applied_at, *file_scope),
+            )
+            return "applied"
+
+        conversation_id = str(request.get("conversation_id") or "")
+        message_id = str(request.get("provider_message_id") or "")
+        if not conversation_id or not message_id:
+            raise ValueError("file index share identifiers are required")
+        share_scope = (*file_scope, conversation_id, message_id)
+        file_tombstone = conn.execute(
+            "SELECT source_version FROM file_tombstones WHERE project_id=? "
+            "AND provider=? AND workspace_id=? AND file_id=?",
+            file_scope,
+        ).fetchone()
+        if (
+            file_tombstone is not None
+            and int(file_tombstone["source_version"]) >= source_version
+        ):
+            return "stale"
+
+        if operation == "remove_share":
+            if message_id == "*":
+                conn.execute(
+                    "UPDATE file_shares SET tombstone_version=?, tombstoned_at=?, "
+                    "updated_at=? WHERE project_id=? AND provider=? "
+                    "AND workspace_id=? AND file_id=? AND conversation_id=? "
+                    "AND (tombstone_version IS NULL OR tombstone_version<=?)",
+                    (
+                        source_version,
+                        occurred_at,
+                        applied_at,
+                        *file_scope,
+                        conversation_id,
+                        source_version,
+                    ),
+                )
+                return "applied"
+            conn.execute(
+                "INSERT INTO file_shares(project_id, provider, workspace_id, file_id, "
+                "conversation_id, provider_message_id, context_version, "
+                "tombstone_version, tombstoned_at, inserted_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(project_id, provider, workspace_id, file_id, "
+                "conversation_id, provider_message_id) DO UPDATE SET "
+                "tombstone_version=excluded.tombstone_version, "
+                "tombstoned_at=excluded.tombstoned_at, updated_at=excluded.updated_at "
+                "WHERE file_shares.tombstone_version IS NULL OR "
+                "excluded.tombstone_version >= file_shares.tombstone_version",
+                (
+                    *share_scope,
+                    source_version,
+                    source_version,
+                    occurred_at,
+                    applied_at,
+                    applied_at,
+                ),
+            )
+            return "applied"
+
+        content_version = request.get("content_version", source_version)
+        context_version = request.get("context_version", source_version)
+        if (
+            isinstance(content_version, bool)
+            or not isinstance(content_version, int)
+            or isinstance(context_version, bool)
+            or not isinstance(context_version, int)
+        ):
+            raise ValueError("file content and context versions must be integers")
+
+        existing_share = conn.execute(
+            "SELECT tombstone_version FROM file_shares WHERE project_id=? "
+            "AND provider=? AND workspace_id=? AND file_id=? AND conversation_id=? "
+            "AND provider_message_id=?",
+            share_scope,
+        ).fetchone()
+        if (
+            existing_share is not None
+            and existing_share["tombstone_version"] is not None
+            and int(existing_share["tombstone_version"]) >= context_version
+        ):
+            return "stale"
+
+        processing_status = str(
+            request.get("processing_status") or "metadata_only"
+        )
+        if processing_status not in {
+            "indexed",
+            "metadata_only",
+            "unsupported",
+            "unavailable",
+            "deleted",
+        }:
+            raise ValueError("invalid file processing status")
+        text_embedding = request.get("text_content_embedding")
+        image_embedding = request.get("image_embedding")
+        existing_content = conn.execute(
+            "SELECT content_version FROM file_contents WHERE project_id=? "
+            "AND provider=? AND workspace_id=? AND file_id=?",
+            file_scope,
+        ).fetchone()
+        content_update = existing_content is None or any(
+            key in request
+            for key in (
+                "processing_status",
+                "content_sha256",
+                "caption_ocr",
+                "text_content_embedding",
+                "image_embedding",
+                "last_error_code",
+            )
+        )
+        if content_update:
+            conn.execute(
+            "INSERT INTO file_contents(project_id, provider, workspace_id, file_id, "
+            "content_version, content_sha256, file_name, mime_type, byte_size, "
+            "uploaded_at, permalink, processing_status, caption_ocr, "
+            "text_content_embedding_json, image_embedding_json, caption_model, "
+            "caption_prompt_version, text_embedding_model, text_embedding_dimension, "
+            "image_embedding_model, image_embedding_dimension, last_error_code, "
+            "inserted_at, updated_at) VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(project_id, provider, workspace_id, file_id) DO UPDATE SET "
+            "content_version=excluded.content_version, "
+            "content_sha256=excluded.content_sha256, file_name=excluded.file_name, "
+            "mime_type=excluded.mime_type, byte_size=excluded.byte_size, "
+            "uploaded_at=excluded.uploaded_at, permalink=excluded.permalink, "
+            "processing_status=excluded.processing_status, "
+            "caption_ocr=excluded.caption_ocr, "
+            "text_content_embedding_json=excluded.text_content_embedding_json, "
+            "image_embedding_json=excluded.image_embedding_json, "
+            "caption_model=excluded.caption_model, "
+            "caption_prompt_version=excluded.caption_prompt_version, "
+            "text_embedding_model=excluded.text_embedding_model, "
+            "text_embedding_dimension=excluded.text_embedding_dimension, "
+            "image_embedding_model=excluded.image_embedding_model, "
+            "image_embedding_dimension=excluded.image_embedding_dimension, "
+            "last_error_code=excluded.last_error_code, updated_at=excluded.updated_at "
+            "WHERE excluded.content_version >= file_contents.content_version",
+                (
+                    *file_scope,
+                    content_version,
+                    str(request.get("content_sha256") or "") or None,
+                    str(request.get("file_name") or "") or None,
+                    str(request.get("mime_type") or "") or None,
+                    int(request["byte_size"])
+                    if request.get("byte_size") is not None
+                    else None,
+                    str(request.get("uploaded_at") or "") or None,
+                    str(request.get("permalink") or "") or None,
+                    processing_status,
+                    str(request.get("caption_ocr") or "") or None,
+                    json.dumps(text_embedding, separators=(",", ":"))
+                    if text_embedding is not None
+                    else None,
+                    json.dumps(image_embedding, separators=(",", ":"))
+                    if image_embedding is not None
+                    else None,
+                    str(request.get("caption_model") or "") or None,
+                    str(request.get("caption_prompt_version") or "") or None,
+                    str(request.get("text_embedding_model") or "") or None,
+                    int(request["text_embedding_dimension"])
+                    if request.get("text_embedding_dimension") is not None
+                    else None,
+                    str(request.get("image_embedding_model") or "") or None,
+                    int(request["image_embedding_dimension"])
+                    if request.get("image_embedding_dimension") is not None
+                    else None,
+                    str(request.get("last_error_code") or "") or None,
+                    applied_at,
+                    applied_at,
+                ),
+            )
+        conn.execute(
+            "INSERT INTO file_shares(project_id, provider, workspace_id, file_id, "
+            "conversation_id, provider_message_id, uploader_id, upload_text, "
+            "thread_context, context_version, shared_at, tombstone_version, "
+            "tombstoned_at, inserted_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?) "
+            "ON CONFLICT(project_id, provider, workspace_id, file_id, "
+            "conversation_id, provider_message_id) DO UPDATE SET "
+            "uploader_id=excluded.uploader_id, upload_text=excluded.upload_text, "
+            "thread_context=excluded.thread_context, "
+            "context_version=excluded.context_version, shared_at=excluded.shared_at, "
+            "tombstone_version=NULL, tombstoned_at=NULL, updated_at=excluded.updated_at "
+            "WHERE excluded.context_version >= file_shares.context_version",
+            (
+                *share_scope,
+                str(request.get("uploader_id") or "") or None,
+                str(request.get("upload_text") or "") or None,
+                str(request.get("thread_context") or "") or None,
+                context_version,
+                str(request.get("shared_at") or "") or None,
+                applied_at,
+                applied_at,
+            ),
+        )
+        return "applied"
 
     def _apply_message(
         self,
@@ -1361,6 +3018,13 @@ class MessageStore:
             "schema_version": SCHEMA_VERSION,
             "protocol_version": PROTOCOL_VERSION,
             "capabilities": list(PROTOCOL_CAPABILITIES),
+            "file_index_store_generation": self.store_generation,
+            "file_index_actions": {
+                "apply": True,
+                "reconcile": True,
+                "search": True,
+                "graph": True,
+            },
             "message_count": int(message_count),
             "key_version": self.key_version,
             "storage_encryption": "sqlcipher",
