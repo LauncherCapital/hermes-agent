@@ -542,6 +542,9 @@ def test_restricted_channel_is_virtual_and_reauthorized_each_operation(tmp_path)
             "agent_id": AGENT_ID,
             "workspace_id": "T1",
             "channel_id": "G1",
+            "channel_type": payload["channel_type"],
+            "principal_id": payload["principal_id"],
+            "slack_user_id": payload["slack_user_id"],
             "session_id": SESSION_ID,
             "operation": payload["operation"],
             "visibility": "private",
@@ -619,6 +622,9 @@ def test_dm_loads_live_authorized_restricted_channel_skill(tmp_path):
             "agent_id": AGENT_ID,
             "workspace_id": "T1",
             "channel_id": "G1",
+            "channel_type": payload["channel_type"],
+            "principal_id": payload["principal_id"],
+            "slack_user_id": payload["slack_user_id"],
             "session_id": payload["session_id"],
             "operation": payload["operation"],
             "visibility": "private",
@@ -710,6 +716,9 @@ def test_multi_user_channel_never_loads_another_private_channel(tmp_path):
             "agent_id": AGENT_ID,
             "workspace_id": "T1",
             "channel_id": payload["channel_id"],
+            "channel_type": payload["channel_type"],
+            "principal_id": payload["principal_id"],
+            "slack_user_id": payload["slack_user_id"],
             "session_id": payload["session_id"],
             "operation": payload["operation"],
             "visibility": visibility,
@@ -767,3 +776,162 @@ def test_multi_user_channel_never_loads_another_private_channel(tmp_path):
     )
 
     assert injected is None or "PRIVATE_OTHER_CHANNEL" not in injected["context"]
+
+
+def test_acl_visibility_overrides_mistyped_public_channel_runtime(tmp_path):
+    service_mod = _load_service_module()
+    calls = []
+
+    def check(payload):
+        calls.append(dict(payload))
+        if (
+            payload["channel_id"] != "C099U109ZM4"
+            or payload["principal_id"]
+            != "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+            or payload["slack_user_id"] != "U1"
+        ):
+            raise PermissionError("wrong exact binding")
+        return {
+            "authorized": True,
+            "project_id": PROJECT_ID,
+            "agent_id": AGENT_ID,
+            "workspace_id": "T08LSGFSXQS",
+            "channel_id": "C099U109ZM4",
+            "channel_type": payload["channel_type"],
+            "principal_id": payload["principal_id"],
+            "slack_user_id": payload["slack_user_id"],
+            "session_id": payload["session_id"],
+            "operation": payload["operation"],
+            "visibility": "private",
+        }
+
+    service = service_mod.EntitySkillService(tmp_path, access_checker=check)
+    _skill(
+        tmp_path / "skills/users/U1/SKILL.md",
+        "PRIVATE_USER_CONTEXT_MUST_NOT_CROSS_AUDIENCES",
+    )
+    _skill(
+        tmp_path / "skills/organizations/T08LSGFSXQS/SKILL.md",
+        "ORGANIZATION_CONTEXT_MUST_NOT_ENTER_PRIVATE_CHANNEL",
+    )
+    service.documents.put(
+        PROJECT_ID,
+        "channels",
+        "C099U109ZM4",
+        "---\nname: channel-C099U109ZM4\n---\n\nPRIVATE_CHANNEL_CONTEXT\n",
+    )
+
+    injected = service.inject_context(
+        session_id="launcher-private-session",
+        trusted_runtime_metadata={
+            "project_id": PROJECT_ID,
+            "agent_id": AGENT_ID,
+            "workspace_id": "T08LSGFSXQS",
+            "user_id": "U1",
+            "principal_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "channel_id": "C099U109ZM4",
+            # Slack app_mention payloads can incorrectly report this as public.
+            "channel_type": "channel",
+        },
+    )
+
+    assert "PRIVATE_CHANNEL_CONTEXT" in injected["context"]
+    assert "PRIVATE_USER_CONTEXT_MUST_NOT_CROSS_AUDIENCES" not in injected["context"]
+    assert "ORGANIZATION_CONTEXT_MUST_NOT_ENTER_PRIVATE_CHANNEL" not in injected[
+        "context"
+    ]
+    assert calls == [
+        {
+            "agent_id": AGENT_ID,
+            "principal_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "workspace_id": "T08LSGFSXQS",
+            "channel_id": "C099U109ZM4",
+            "channel_type": "channel",
+            "slack_user_id": "U1",
+            "session_id": "launcher-private-session",
+            "operation": "read",
+        }
+    ]
+
+
+def test_channel_context_defaults_to_index_and_expands_references_on_demand(
+    tmp_path,
+):
+    service_mod = _load_service_module()
+    service = _service(service_mod, tmp_path)
+    service.documents.put(
+        PROJECT_ID,
+        "channels",
+        "C1",
+        (
+            "---\nname: channel-C1\n---\n\n"
+            "# Channel context\n\n"
+            "## Durable context\n\n"
+            "- The release train runs on Fridays.\n\n"
+            "## References\n\n"
+            "- PRIVATE_DETAILED_REFERENCE " + ("x" * 5000) + "\n"
+        ),
+    )
+    runtime = {
+        "project_id": PROJECT_ID,
+        "agent_id": AGENT_ID,
+        "workspace_id": "T1",
+        "user_id": "U1",
+        "channel_id": "C1",
+        "channel_type": "channel",
+    }
+
+    index = service.inject_context(
+        session_id="index-session",
+        user_message="When is the release train?",
+        trusted_runtime_metadata=runtime,
+    )
+    detailed = service.inject_context(
+        session_id="detail-session",
+        user_message="Show the source references for that schedule.",
+        trusted_runtime_metadata=runtime,
+    )
+
+    assert "release train runs on Fridays" in index["context"]
+    assert "PRIVATE_DETAILED_REFERENCE" not in index["context"]
+    assert "PRIVATE_DETAILED_REFERENCE" in detailed["context"]
+
+
+def test_private_acl_response_with_wrong_principal_fails_closed(tmp_path):
+    service_mod = _load_service_module()
+
+    def check(payload):
+        return {
+            "authorized": True,
+            "project_id": PROJECT_ID,
+            "agent_id": AGENT_ID,
+            "workspace_id": "T1",
+            "channel_id": "G1",
+            "channel_type": payload["channel_type"],
+            "principal_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "slack_user_id": payload["slack_user_id"],
+            "session_id": payload["session_id"],
+            "operation": payload["operation"],
+            "visibility": "private",
+        }
+
+    service = service_mod.EntitySkillService(tmp_path, access_checker=check)
+    service.documents.put(
+        PROJECT_ID,
+        "channels",
+        "G1",
+        "---\nname: channel-G1\n---\n\nPRIVATE_CHANNEL_CONTEXT\n",
+    )
+
+    assert service.inject_context(
+        session_id="wrong-principal-session",
+        trusted_runtime_metadata={
+            "project_id": PROJECT_ID,
+            "agent_id": AGENT_ID,
+            "workspace_id": "T1",
+            "user_id": "U1",
+            "principal_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "channel_id": "G1",
+            "channel_type": "channel",
+        },
+    ) is None
