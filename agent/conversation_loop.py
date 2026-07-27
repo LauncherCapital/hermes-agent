@@ -29,7 +29,11 @@ from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.display import KawaiiSpinner
-from agent.error_classifier import FailoverReason, classify_api_error
+from agent.error_classifier import (
+    FailoverReason,
+    classify_api_error,
+    structured_provider_error,
+)
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.message_sanitization import (
@@ -2333,6 +2337,15 @@ def run_conversation(
                     context_length=_ctx_len,
                     num_messages=len(api_messages) if api_messages else 0,
                 )
+                _structured_provider_error = structured_provider_error(
+                    classified,
+                    api_key=getattr(agent, "api_key", None),
+                )
+                _safe_error_message = (
+                    "OpenRouter key limit exceeded"
+                    if _structured_provider_error is not None
+                    else str(api_error)
+                )
                 logger.debug(
                     "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
                     classified.reason.value, classified.status_code,
@@ -2347,7 +2360,7 @@ def run_conversation(
                     api_start_time=api_start_time,
                     api_kwargs=api_kwargs,
                     error_type=type(api_error).__name__,
-                    error_message=str(api_error),
+                    error_message=_safe_error_message,
                     status_code=status_code,
                     retry_count=retry_count,
                     max_retries=max_retries,
@@ -2735,7 +2748,11 @@ def run_conversation(
                 
                 error_type = type(api_error).__name__
                 error_msg = str(api_error).lower()
-                _error_summary = agent._summarize_api_error(api_error)
+                _error_summary = (
+                    "HTTP 403: Key limit exceeded"
+                    if _structured_provider_error is not None
+                    else agent._summarize_api_error(api_error)
+                )
                 logger.warning(
                     "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
                     retry_count,
@@ -2753,7 +2770,11 @@ def run_conversation(
                 agent._buffer_vprint(f"   🔌 Provider: {_provider}  Model: {_model}")
                 agent._buffer_vprint(f"   🌐 Endpoint: {_base}")
                 agent._buffer_vprint(f"   📝 Error: {_error_summary}")
-                if status_code and status_code < 500:
+                if (
+                    _structured_provider_error is None
+                    and status_code
+                    and status_code < 500
+                ):
                     _err_body = getattr(api_error, "body", None)
                     _err_body_str = str(_err_body)[:300] if _err_body else None
                     if _err_body_str:
@@ -3343,7 +3364,10 @@ def run_conversation(
                         compression_attempts = 0
                         primary_recovery_attempted = False
                         continue
-                    if api_kwargs is not None:
+                    if (
+                        api_kwargs is not None
+                        and _structured_provider_error is None
+                    ):
                         agent._dump_api_request_debug(
                             api_kwargs, reason="non_retryable_client_error", error=api_error,
                         )
@@ -3358,7 +3382,7 @@ def run_conversation(
                     else:
                         agent._emit_status(
                             f"❌ Non-retryable error (HTTP {status_code}): "
-                            f"{agent._summarize_api_error(api_error)}"
+                            f"{_error_summary}"
                         )
                     agent._vprint(f"{agent.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
                     agent._vprint(f"{agent.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
@@ -3428,7 +3452,11 @@ def run_conversation(
                             f"{agent.log_prefix}        hermes fallback add   (interactive picker — same as `hermes model`)",
                             force=True,
                         )
-                    logger.error(f"{agent.log_prefix}Non-retryable client error: {api_error}")
+                    logger.error(
+                        "%sNon-retryable client error: %s",
+                        agent.log_prefix,
+                        _safe_error_message,
+                    )
                     # Skip session persistence when the error is likely
                     # context-overflow related (status 400 + large session).
                     # Persisting the failed user message would make the
@@ -3459,14 +3487,17 @@ def run_conversation(
                             "failed": True,
                             "error": f"content_policy_blocked: {_summary}",
                         }
-                    return {
+                    result = {
                         "final_response": None,
                         "messages": messages,
                         "api_calls": api_call_count,
                         "completed": False,
                         "failed": True,
-                        "error": str(api_error),
+                        "error": _safe_error_message,
                     }
+                    if _structured_provider_error is not None:
+                        result["provider_error"] = _structured_provider_error
+                    return result
 
                 if retry_count >= max_retries:
                     # Before falling back, try rebuilding the primary

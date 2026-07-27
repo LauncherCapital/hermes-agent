@@ -12,6 +12,7 @@ that the main retry loop in run_agent.py consults for every API failure.
 from __future__ import annotations
 
 import enum
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
@@ -88,6 +89,44 @@ class ClassifiedError:
     @property
     def is_auth(self) -> bool:
         return self.reason in {FailoverReason.auth, FailoverReason.auth_permanent}
+
+
+def structured_provider_error(
+    error: ClassifiedError,
+    *,
+    api_key: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Return a secret-safe terminal error for the OpenRouter key-limit case.
+
+    A generic 403, another provider's limit, or another billing refusal must
+    not open a customer's credit breaker. The body is canonicalized rather
+    than forwarding OpenRouter's raw response, which may contain key URLs or
+    other account metadata.
+    """
+    message = str(error.message or "").lower()
+    if not (
+        str(error.provider or "").strip().lower() == "openrouter"
+        and error.status_code == 403
+        and error.reason == FailoverReason.billing
+        and "key limit exceeded" in message
+    ):
+        return None
+
+    payload: Dict[str, Any] = {
+        "provider": "openrouter",
+        "status_code": 403,
+        "code": "key_limit_exceeded",
+        "body": {
+            "message": "Key limit exceeded",
+            "limit_kind": "total" if "total limit" in message else "unknown",
+        },
+    }
+    if isinstance(api_key, str) and api_key:
+        digest = hashlib.sha256(
+            api_key.encode("utf-8", errors="surrogatepass")
+        ).hexdigest()
+        payload["credential_fingerprint"] = f"sha256:{digest[:16]}"
+    return payload
 
 
 
