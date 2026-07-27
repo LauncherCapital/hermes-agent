@@ -49,8 +49,51 @@ MAX_BATCH_EVENTS = 500
 FILE_SEARCH_RETRIEVE_LIMIT = 50
 FILE_SEARCH_RERANK_LIMIT = 10
 FILE_SEARCH_IMAGE_INSPECT_LIMIT = 3
-FILE_SEARCH_MIN_TOKEN_COVERAGE = 0.34
-FILE_SEARCH_MIN_SEMANTIC_SCORE = 0.55
+FILE_SEARCH_MIN_SEMANTIC_SCORE = 0.72
+# Search-intent words describe the operation or media, not the subject to match.
+FILE_SEARCH_GENERIC_QUERY_TOKENS = frozenset(
+    {
+        "관련",
+        "거",
+        "것",
+        "좀",
+        "파일",
+        "사진",
+        "이미지",
+        "스크린샷",
+        "첨부",
+        "첨부파일",
+        "업로드",
+        "올린",
+        "올린거",
+        "올려",
+        "올렸",
+        "찾아",
+        "찾아줘",
+        "주세요",
+        "줘",
+        "보여",
+        "보여줘",
+        "related",
+        "file",
+        "files",
+        "image",
+        "images",
+        "photo",
+        "photos",
+        "picture",
+        "pictures",
+        "screenshot",
+        "screenshots",
+        "attachment",
+        "attached",
+        "upload",
+        "uploaded",
+        "find",
+        "show",
+        "please",
+    }
+)
 MAX_FILE_PROCESSING_ATTEMPTS = 3
 
 
@@ -1589,33 +1632,34 @@ class MessageStore:
             ),
             reverse=True,
         )
-        evidence_fields = (
+        # Thread context helps rank a shortlist, but cannot qualify every
+        # attachment in the same thread as a relevant file.
+        direct_evidence_fields = (
             "name",
             "uploader_name",
             "uploader_id",
             "conversation_name",
             "conversation_id",
-            "uploaded_at",
-            "shared_at",
             "upload_text",
-            "thread_context",
             "caption_ocr",
             "image_inspection",
         )
+        anchor_tokens = query_tokens - FILE_SEARCH_GENERIC_QUERY_TOKENS
+        if not anchor_tokens:
+            anchor_tokens = query_tokens
+        required_anchor_matches = min(2, len(anchor_tokens))
         relevant = []
         for item in reranked:
-            evidence_tokens: set[str] = set()
-            for key in evidence_fields:
-                evidence_tokens.update(
+            direct_evidence_tokens: set[str] = set()
+            for key in direct_evidence_fields:
+                direct_evidence_tokens.update(
                     self._file_search_tokens(item.get(key))
                 )
-            token_coverage = (
-                len(query_tokens & evidence_tokens) / len(query_tokens)
-                if query_tokens
-                else 0.0
+            direct_anchor_matches = len(
+                anchor_tokens & direct_evidence_tokens
             )
             if (
-                token_coverage >= FILE_SEARCH_MIN_TOKEN_COVERAGE
+                direct_anchor_matches >= required_anchor_matches > 0
                 or float(item.get("semantic_score") or 0.0)
                 >= FILE_SEARCH_MIN_SEMANTIC_SCORE
             ):
