@@ -5,6 +5,7 @@ from agent.error_classifier import (
     ClassifiedError,
     FailoverReason,
     classify_api_error,
+    structured_provider_error,
     _extract_status_code,
     _extract_error_body,
     _extract_error_code,
@@ -242,6 +243,49 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.billing
         assert result.should_rotate_credential is True
         assert result.should_fallback is True
+
+    def test_openrouter_key_limit_serializes_without_secret(self):
+        secret = "sk-or-v1-production-secret"
+        error = classify_api_error(
+            MockAPIError(
+                "Key limit exceeded (total limit): https://openrouter.ai/keys/key-id",
+                status_code=403,
+            ),
+            provider="openrouter",
+        )
+
+        payload = structured_provider_error(error, api_key=secret)
+
+        assert payload == {
+            "provider": "openrouter",
+            "status_code": 403,
+            "code": "key_limit_exceeded",
+            "body": {
+                "message": "Key limit exceeded",
+                "limit_kind": "total",
+            },
+            "credential_fingerprint": (
+                "sha256:40ab595077dd8bce"
+            ),
+        }
+        assert secret not in str(payload)
+        assert "key-id" not in str(payload)
+
+    @pytest.mark.parametrize(
+        ("provider", "message"),
+        [
+            ("openrouter", "Forbidden by organization policy"),
+            ("anthropic", "Key limit exceeded (total limit)"),
+        ],
+    )
+    def test_non_openrouter_key_limit_403_does_not_serialize(
+        self, provider, message
+    ):
+        error = classify_api_error(
+            MockAPIError(message, status_code=403),
+            provider=provider,
+        )
+        assert structured_provider_error(error, api_key="secret") is None
 
     def test_403_spending_limit_classified_as_billing(self):
         e = MockAPIError("spending limit reached", status_code=403)
