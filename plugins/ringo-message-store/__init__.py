@@ -121,7 +121,77 @@ async def _on_message_store_query(*, request: dict, **_: object) -> dict:
     return result
 
 
+async def _on_file_index_apply(*, request: dict, **_: object) -> dict:
+    store = _store()
+    if store is None:
+        return {"status": "unclaimed"}
+    payload = request.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("file index action payload is required")
+    return await asyncio.to_thread(
+        store.apply_file_command,
+        {**payload, "project_id": request.get("project_id")},
+    )
+
+
+async def _on_file_index_reconcile(*, request: dict, **_: object) -> dict:
+    store = _store()
+    if store is None:
+        return {"status": "unclaimed"}
+    payload = request.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("file index action payload is required")
+    return await asyncio.to_thread(
+        store.reconcile_file_window,
+        {**payload, "project_id": request.get("project_id")},
+    )
+
+
+async def _on_file_index_search(*, request: dict, **_: object) -> dict:
+    store = _store()
+    if store is None:
+        return {"status": "unclaimed", "coverage_complete": False, "files": []}
+    payload = request.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("file index action payload is required")
+    return await asyncio.to_thread(
+        store.search_file_index,
+        {**payload, "project_id": request.get("project_id")},
+    )
+
+
+async def _on_file_graph_batch(*, request: dict, **_: object) -> dict:
+    store = _store()
+    if store is None:
+        return {"status": "unclaimed", "episodes": []}
+    payload = request.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("file graph action payload is required")
+    return await asyncio.to_thread(
+        store.file_graph_batch,
+        {**payload, "project_id": request.get("project_id")},
+    )
+
+
+async def _on_file_graph_ack(*, request: dict, **_: object) -> dict:
+    store = _store()
+    if store is None:
+        return {"status": "unclaimed"}
+    payload = request.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("file graph action payload is required")
+    return await asyncio.to_thread(
+        store.ack_file_graph_batch,
+        {**payload, "project_id": request.get("project_id")},
+    )
+
+
 def register(ctx) -> None:
+    ctx.register_action("ringo.file_index.apply", _on_file_index_apply)
+    ctx.register_action("ringo.file_index.reconcile", _on_file_index_reconcile)
+    ctx.register_action("ringo.file_index.search", _on_file_index_search)
+    ctx.register_action("ringo.file_graph.batch", _on_file_graph_batch)
+    ctx.register_action("ringo.file_graph.ack", _on_file_graph_ack)
     ctx.register_hook("ingress_event", _on_ingress_event)
     ctx.register_hook("project_claimed", _on_project_claimed)
     ctx.register_hook("health_report", _health_report)

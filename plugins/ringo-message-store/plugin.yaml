@@ -1,5 +1,5 @@
 name: ringo-message-store
-version: "0.1.0"
+version: "0.2.0"
 kind: service
 description: "Stores authenticated project messages behind local tools."
 author: "LauncherCapital"
@@ -8,3 +8,9 @@ hooks:
   - project_claimed
   - health_report
   - message_store_query
+actions:
+  - ringo.file_index.apply
+  - ringo.file_index.reconcile
+  - ringo.file_index.search
+  - ringo.file_graph.batch
+  - ringo.file_graph.ack

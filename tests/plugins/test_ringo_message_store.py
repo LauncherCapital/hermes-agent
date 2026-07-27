@@ -4,6 +4,8 @@ import json
 import os
 import shutil
 import sqlite3
+import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -67,7 +69,7 @@ async def test_cold_claim_initializes_store_during_plugin_load(tmp_path, monkeyp
     assert (tmp_path / "state/keys/message-store-v1.pem").exists()
     health = _message_store_health(manager)
     assert health["project_id"] == project_id
-    assert health["schema_version"] == 3
+    assert health["schema_version"] == 5
 
 
 @pytest.mark.asyncio
@@ -135,7 +137,14 @@ async def test_claim_initializes_schema_key_and_idempotent_delivery(tmp_path, mo
             "reconciliation_cycles",
             "reconciliation_seen",
         }.issubset(tables)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert {
+            "file_contents",
+            "file_shares",
+            "file_tombstones",
+            "file_index_runs",
+            "file_graph_ingest_state",
+        }.issubset(tables)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
 
     original_key = private_path.read_bytes()
     reopened = module.MessageStore(project_id, path=db_path)
@@ -147,6 +156,7 @@ async def test_claim_initializes_schema_key_and_idempotent_delivery(tmp_path, mo
         "schema_version",
         "protocol_version",
         "capabilities",
+        "file_index_store_generation",
         "message_count",
         "key_version",
         "storage_encryption",
@@ -170,11 +180,35 @@ async def test_claim_initializes_schema_key_and_idempotent_delivery(tmp_path, mo
         "allowed_source_ids",
         "detailed_health",
         "event_batch",
+        "file_index_v1",
         "ingest_window",
         "reconciliation_events",
         "stable_cursor",
     } <= set(health["capabilities"])
     assert health["message_count"] == 1
+
+
+def test_schema_v5_upgrades_existing_v4_store_with_file_graph_cursor(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    with store._connect() as conn:
+        conn.execute("DROP TABLE file_graph_ingest_state")
+        conn.execute("PRAGMA user_version=4")
+        conn.commit()
+
+    reopened = module.MessageStore(project_id, path=store.path)
+
+    with reopened._connect() as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='file_graph_ingest_state'"
+        ).fetchone()
 
 
 def test_retention_removes_expired_messages_reactions_and_deliveries(
@@ -604,6 +638,832 @@ def test_normalized_events_share_one_apply_path_and_tombstone_wins(
     assert conversation[1:] == (1, 1)
     assert identity[0] == "Sunhee"
     assert membership[0] == 1
+
+
+def test_file_index_content_share_cas_and_delete_tombstone(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+
+    base = {
+        "project_id": project_id,
+        "store_generation": store.store_generation,
+        "provider": "slack",
+        "workspace_id": "T1",
+        "operation": "upsert_share",
+        "file_id": "F1",
+        "conversation_id": "C1",
+        "provider_message_id": "1700.1",
+        "occurred_at": "2026-07-21T00:00:01+00:00",
+        "source_version": 2,
+        "content_version": 2,
+        "context_version": 2,
+        "file_name": "profile.png",
+        "uploader_id": "U1",
+        "uploaded_at": "2026-07-21T00:00:00+00:00",
+        "content_sha256": "content-v2",
+        "processing_status": "indexed",
+        "upload_text": "Ringo rebrand profile",
+        "thread_context": "new icon",
+        "caption_ocr": "yellow app icon",
+        "text_content_embedding": [0.1, 0.2],
+        "image_embedding": [0.3, 0.4],
+    }
+    store.apply_file_command(base)
+    store.apply_file_command(
+        {
+            **base,
+            "source_version": 3,
+            "content_version": 1,
+            "context_version": 3,
+            "upload_text": "edited upload text",
+            "thread_context": "edited thread",
+            "processing_status": "indexed",
+            "caption_ocr": "stale caption",
+            "content_sha256": "stale-content",
+        }
+    )
+    store.apply_file_command(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "operation": "delete_file",
+            "file_id": "F1",
+            "occurred_at": "2026-07-21T00:00:04+00:00",
+            "source_version": 4,
+        }
+    )
+    stale = store.apply_file_command(
+        {
+            **base,
+            "source_version": 3,
+            "content_version": 3,
+            "context_version": 3,
+            "caption_ocr": "late stale caption",
+        }
+    )
+
+    with store._connect() as conn:
+        content = conn.execute(
+            "SELECT * FROM file_contents WHERE workspace_id='T1' AND file_id='F1'"
+        ).fetchone()
+        share = conn.execute(
+            "SELECT * FROM file_shares WHERE workspace_id='T1' AND file_id='F1'"
+        ).fetchone()
+        tombstone = conn.execute(
+            "SELECT source_version FROM file_tombstones "
+            "WHERE workspace_id='T1' AND file_id='F1'"
+        ).fetchone()
+
+    assert stale["status"] == "stale"
+    assert share["upload_text"] == "edited upload text"
+    assert share["thread_context"] == "edited thread"
+    assert share["tombstoned_at"] == "2026-07-21T00:00:04+00:00"
+    assert content["caption_ocr"] == "yellow app icon"
+    assert content["content_sha256"] == "content-v2"
+    assert content["processing_status"] == "deleted"
+    assert tombstone["source_version"] == 4
+
+
+def test_file_index_processes_raw_file_outside_transaction_without_storing_token(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+    seen = {}
+
+    def fake_process(file_id, access_token, _reuse_by_sha=None):
+        seen.update(file_id=file_id, access_token=access_token)
+        return {
+            "file_name": "profile.png",
+            "mime_type": "image/png",
+            "byte_size": 42,
+            "content_sha256": "abc123",
+            "processing_status": "indexed",
+            "caption_ocr": "yellow Ringo profile icon",
+            "text_content_embedding": [0.1, 0.2],
+            "image_embedding": [0.1, 0.2],
+            "caption_model": "vision-test",
+            "caption_prompt_version": "file-index-v1",
+            "text_embedding_model": "embedding-test",
+            "text_embedding_dimension": 2,
+            "image_embedding_model": "caption-text:embedding-test",
+            "image_embedding_dimension": 2,
+            "last_error_code": None,
+        }
+
+    monkeypatch.setattr(store_module, "process_slack_file", fake_process)
+    result = store.apply_file_command(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "operation": "upsert_share",
+            "file_id": "F1",
+            "conversation_id": "C1",
+            "provider_message_id": "M1",
+            "source_version": 1,
+            "content_version": 1,
+            "context_version": 1,
+            "file_name": "profile.png",
+            "processing_status": "metadata_only",
+            "provider_access_token": "xoxb-transient-secret",
+        }
+    )
+
+    with store._connect() as conn:
+        content = conn.execute(
+            "SELECT * FROM file_contents WHERE file_id='F1'"
+        ).fetchone()
+        serialized_rows = "\n".join(
+            "|".join("" if value is None else str(value) for value in row)
+            for table in ("file_contents", "file_shares", "schema_meta")
+            for row in conn.execute(f"SELECT * FROM {table}").fetchall()
+        )
+
+    assert result["indexed_contents"] == 1
+    assert seen == {
+        "file_id": "F1",
+        "access_token": "xoxb-transient-secret",
+    }
+    assert content["processing_status"] == "indexed"
+    assert content["content_sha256"] == "abc123"
+    assert json.loads(content["image_embedding_json"]) == [0.1, 0.2]
+    assert "xoxb-transient-secret" not in serialized_rows
+
+
+def test_file_processing_deletes_transient_bytes_on_success_and_failure(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    processing = sys.modules[module.MessageStore.apply_file_command.__globals__[
+        "process_slack_file"
+    ].__module__]
+    downloaded = tmp_path / "state" / "tmp" / "file-index" / "fi-test"
+    downloaded.parent.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(processing.FileProcessingError) as invalid_host:
+        processing._download(
+            url="https://example.com/private",
+            access_token="xoxb-secret",
+            expected_size=3,
+        )
+    assert invalid_host.value.code == "file_download_host_invalid"
+
+    monkeypatch.setattr(
+        processing,
+        "_slack_file_info",
+        lambda _file_id, _token, _reuse_by_sha=None: {
+            "name": "profile.png",
+            "mimetype": "image/png",
+            "size": 3,
+            "url_private_download": "https://files.slack.test/F1",
+        },
+    )
+
+    def fake_download(**_kwargs):
+        downloaded.write_bytes(b"raw")
+        return downloaded, "abc", 3
+
+    monkeypatch.setattr(processing, "_download", fake_download)
+    monkeypatch.setattr(
+        processing,
+        "_caption_image",
+        lambda _path: ("yellow profile icon", "vision-test"),
+    )
+    monkeypatch.setattr(
+        processing,
+        "embed_text",
+        lambda _text: ([0.1, 0.2], "embedding-test"),
+    )
+
+    result = processing.process_slack_file("F1", "xoxb-secret")
+
+    assert result["processing_status"] == "indexed"
+    assert not downloaded.exists()
+
+    monkeypatch.setattr(
+        processing,
+        "_caption_image",
+        lambda _path: pytest.fail("same hash must reuse derived content"),
+    )
+    reused = processing.process_slack_file(
+        "F1",
+        "xoxb-secret",
+        lambda digest, mime: (
+            {
+                "caption_ocr": "cached caption",
+                "image_embedding": [0.3, 0.4],
+            }
+            if (digest, mime) == ("abc", "image/png")
+            else None
+        ),
+    )
+    assert reused["caption_ocr"] == "cached caption"
+    assert not downloaded.exists()
+
+    def fail_caption(_path):
+        raise processing.FileProcessingError("image_caption_failed")
+
+    monkeypatch.setattr(processing, "_caption_image", fail_caption)
+    failed = processing.process_slack_file("F1", "xoxb-secret")
+
+    assert failed["processing_status"] == "metadata_only"
+    assert failed["last_error_code"] == "image_caption_failed"
+    assert not downloaded.exists()
+
+
+def test_file_change_refreshes_content_without_rewriting_share_context(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store.apply_file_command(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "operation": "upsert_share",
+            "file_id": "F1",
+            "conversation_id": "C1",
+            "provider_message_id": "M1",
+            "source_version": 1,
+            "content_version": 1,
+            "context_version": 1,
+            "processing_status": "indexed",
+            "content_sha256": "old",
+            "upload_text": "original context",
+        }
+    )
+    store_module = sys.modules[module.MessageStore.__module__]
+    monkeypatch.setattr(
+        store_module,
+        "process_slack_file",
+        lambda _file_id, _token, _reuse_by_sha=None: {
+            "processing_status": "indexed",
+            "content_sha256": "new",
+            "file_name": "profile-v2.png",
+            "mime_type": "image/png",
+            "last_error_code": None,
+        },
+    )
+
+    result = store.apply_file_command(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "operation": "refresh_file",
+            "file_id": "F1",
+            "source_version": 2,
+            "provider_access_token": "xoxb-transient",
+        }
+    )
+
+    with store._connect() as conn:
+        content = conn.execute("SELECT * FROM file_contents").fetchone()
+        share = conn.execute("SELECT * FROM file_shares").fetchone()
+    assert result["indexed_contents"] == 1
+    assert content["content_version"] == 2
+    assert content["content_sha256"] == "new"
+    assert share["upload_text"] == "original context"
+    assert share["context_version"] == 1
+
+
+def test_slow_file_processing_does_not_hold_message_writer_lock(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_process(_file_id, _token, _reuse_by_sha=None):
+        entered.set()
+        assert release.wait(timeout=3)
+        return {
+            "processing_status": "unsupported",
+            "last_error_code": "fixture",
+        }
+
+    monkeypatch.setattr(store_module, "process_slack_file", slow_process)
+    thread = threading.Thread(
+        target=store.apply_file_command,
+        args=(
+            {
+                "project_id": project_id,
+                "store_generation": store.store_generation,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "operation": "upsert_share",
+                "file_id": "F1",
+                "conversation_id": "C1",
+                "provider_message_id": "M1",
+                "source_version": 1,
+                "content_version": 1,
+                "context_version": 1,
+                "processing_status": "metadata_only",
+                "provider_access_token": "xoxb-transient",
+            },
+        ),
+    )
+    thread.start()
+    assert entered.wait(timeout=3)
+    started = time.monotonic()
+    store.record_envelope(
+        {
+            "project_id": project_id,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "delivery_id": "D1",
+            "sequence": 1,
+            "event_type": "message.created",
+            "conversation_id": "C1",
+            "message_id": "M2",
+            "occurred_at": "2026-07-28T00:00:00+00:00",
+            "provider_version": "1",
+            "text": "message is not blocked",
+        },
+        "hash-D1",
+    )
+    elapsed = time.monotonic() - started
+    release.set()
+    thread.join(timeout=3)
+
+    assert elapsed < 1
+    assert not thread.is_alive()
+
+
+def test_file_index_same_content_has_independent_shares_and_context_only_edit(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    base = {
+        "project_id": project_id,
+        "store_generation": store.store_generation,
+        "provider": "slack",
+        "workspace_id": "T1",
+        "operation": "upsert_share",
+        "file_id": "F1",
+        "source_version": 2,
+        "content_version": 2,
+        "context_version": 2,
+        "processing_status": "indexed",
+        "content_sha256": "content-v2",
+        "caption_ocr": "yellow app icon",
+    }
+    store.apply_file_command(
+        {
+            **base,
+            "conversation_id": "C1",
+            "provider_message_id": "M1",
+            "upload_text": "first share",
+        }
+    )
+    store.apply_file_command(
+        {
+            **base,
+            "conversation_id": "C2",
+            "provider_message_id": "M2",
+            "upload_text": "second share",
+        }
+    )
+    store.apply_file_command(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "operation": "upsert_share",
+            "file_id": "F1",
+            "conversation_id": "C1",
+            "provider_message_id": "M1",
+            "source_version": 3,
+            "content_version": 3,
+            "context_version": 3,
+            "upload_text": "edited context only",
+        }
+    )
+
+    with store._connect() as conn:
+        contents = conn.execute("SELECT * FROM file_contents").fetchall()
+        shares = conn.execute(
+            "SELECT conversation_id, upload_text FROM file_shares "
+            "ORDER BY conversation_id"
+        ).fetchall()
+
+    assert len(contents) == 1
+    assert contents[0]["content_version"] == 2
+    assert contents[0]["caption_ocr"] == "yellow app icon"
+    assert [tuple(row) for row in shares] == [
+        ("C1", "edited context only"),
+        ("C2", "second share"),
+    ]
+
+    store.apply_file_command(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "operation": "remove_share",
+            "file_id": "F1",
+            "conversation_id": "C1",
+            "provider_message_id": "*",
+            "source_version": 4,
+        }
+    )
+    with store._connect() as conn:
+        channel_states = conn.execute(
+            "SELECT conversation_id, tombstone_version FROM file_shares "
+            "ORDER BY conversation_id"
+        ).fetchall()
+    assert [tuple(row) for row in channel_states] == [
+        ("C1", 4),
+        ("C2", None),
+    ]
+
+
+def test_file_reconcile_resumes_local_encrypted_message_scan(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    for sequence, (message_id, file_id) in enumerate(
+        (("1700.1", "F1"), ("1700.2", "F2")),
+        start=1,
+    ):
+        store.record_envelope(
+            {
+                "project_id": project_id,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "conversation_id": "C1",
+                "delivery_id": f"d-{sequence}",
+                "sequence": sequence,
+                "event_type": "message.created",
+                "message_id": message_id,
+                "sender_id": "U1",
+                "text": f"upload {file_id}",
+                "occurred_at": f"2026-07-21T00:00:0{sequence}+00:00",
+                "provider_version": f"000{sequence}",
+                "provider_payload": {
+                    "files": [
+                        {
+                            "id": file_id,
+                            "name": f"{file_id}.png",
+                            "mimetype": "image/png",
+                            "size": 123,
+                            "timestamp": 1784592000 + sequence,
+                            "user": "U1",
+                            "permalink": f"https://slack.test/{file_id}",
+                        }
+                    ]
+                },
+            },
+            f"hash-{sequence}",
+        )
+    request = {
+        "project_id": project_id,
+        "provider": "slack",
+        "workspace_id": "T1",
+        "store_generation": store.store_generation,
+        "window_started_at": "2026-07-20T00:00:00+00:00",
+        "window_ended_at": "2026-07-22T00:00:00+00:00",
+        "allowed_source_ids": ["slack:T1:C1"],
+        "allowed_scope_revision": "scope-1",
+        "batch_limit": 1,
+        "processing_signature": "metadata-v1",
+    }
+
+    first = store.reconcile_file_window(request)
+    second = store.reconcile_file_window(request)
+    third = store.reconcile_file_window(request)
+
+    with store._connect() as conn:
+        contents = conn.execute(
+            "SELECT file_id, processing_status FROM file_contents ORDER BY file_id"
+        ).fetchall()
+        shares = conn.execute(
+            "SELECT file_id, upload_text FROM file_shares ORDER BY file_id"
+        ).fetchall()
+        run = conn.execute("SELECT * FROM file_index_runs").fetchone()
+
+    assert first["status"] == "continuation"
+    assert second["status"] == "continuation"
+    assert third["status"] == "complete"
+    assert [tuple(row) for row in contents] == [
+        ("F1", "metadata_only"),
+        ("F2", "metadata_only"),
+    ]
+    assert [tuple(row) for row in shares] == [
+        ("F1", "upload F1"),
+        ("F2", "upload F2"),
+    ]
+    assert run["status"] == "complete"
+    assert run["scanned_messages"] == 2
+    assert run["discovered_shares"] == 2
+
+
+def test_file_search_uses_fixed_acl_retrieve_rerank_inspect_limits(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+    monkeypatch.setattr(
+        store_module,
+        "embed_text",
+        lambda _text: ([1.0, 0.0], "embedding-test"),
+    )
+    monkeypatch.setattr(
+        store_module,
+        "inspect_slack_image",
+        lambda _file_id, _token, _query: "Ringo rebrand profile icon",
+    )
+    fixtures = [
+        (
+            "F0",
+            "Screenshot 2026-05-15 at 11.00.31 AM.png",
+            "C1",
+            "링고 리브랜딩 프로필 사진 올립니다",
+            "yellow Ringo profile logo",
+        ),
+        (
+            "F1",
+            "Screenshot 2026-05-15 at 11.00.31 AM.png",
+            "C1",
+            "ㅋㅋㅋ",
+            "Ringo2 app installer drag to Applications",
+        ),
+        (
+            "F2",
+            "profile-option.png",
+            "C1",
+            "old unrelated profile draft",
+            "blue abstract icon",
+        ),
+        (
+            "F3",
+            "brand-notes.png",
+            "C1",
+            "branding discussion",
+            "text notes",
+        ),
+        (
+            "F4",
+            "ringo-profile-secret.png",
+            "C2",
+            "링고 리브랜딩 프로필 사진",
+            "yellow Ringo profile logo",
+        ),
+    ]
+    for index, (file_id, name, channel_id, upload_text, caption) in enumerate(
+        fixtures
+    ):
+        store.apply_file_command(
+            {
+                "project_id": project_id,
+                "store_generation": store.store_generation,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "operation": "upsert_share",
+                "file_id": file_id,
+                "conversation_id": channel_id,
+                "provider_message_id": f"M{index}",
+                "source_version": index + 1,
+                "content_version": index + 1,
+                "context_version": index + 1,
+                "file_name": name,
+                "mime_type": "image/png",
+                "processing_status": "indexed",
+                "caption_ocr": caption,
+                "text_content_embedding": [1.0, 0.0],
+                "image_embedding": [1.0, 0.0],
+                "upload_text": upload_text,
+                "shared_at": f"2026-07-21T00:00:0{index}+00:00",
+            }
+        )
+    for index in range(10):
+        store.apply_file_command(
+            {
+                "project_id": project_id,
+                "store_generation": store.store_generation,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "operation": "upsert_share",
+                "file_id": f"N{index}",
+                "conversation_id": "C1",
+                "provider_message_id": f"MN{index}",
+                "source_version": 20 + index,
+                "content_version": 20 + index,
+                "context_version": 20 + index,
+                "file_name": f"notes-{index}.txt",
+                "mime_type": "text/plain",
+                "processing_status": "indexed",
+                "caption_ocr": "generic notes",
+                "text_content_embedding": [1.0, 0.0],
+                "upload_text": "unrelated notes",
+                "shared_at": f"2026-07-20T00:00:{index:02d}+00:00",
+            }
+        )
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO file_index_runs(provider, workspace_id, "
+            "store_generation, window_started_at, window_ended_at, "
+            "allowed_scope_revision, status, processing_signature, updated_at, "
+            "completed_at) VALUES (?, ?, ?, ?, ?, ?, 'complete', ?, ?, ?)",
+            (
+                "slack",
+                "T1",
+                store.store_generation,
+                "2026-06-21T00:00:00+00:00",
+                "2026-07-21T00:00:00+00:00",
+                "scope-1",
+                "content-v1",
+                "2026-07-21T00:00:00+00:00",
+                "2026-07-21T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+
+    result = store.search_file_index(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "query": "링고 리브랜딩 관련 프로필 사진 올린 거",
+            "allowed_source_ids": ["slack:T1:C1"],
+            "allowed_scope_revision": "scope-1",
+            "limit": 20,
+            "provider_access_token": "xoxb-transient",
+        }
+    )
+
+    assert result["coverage_complete"] is True
+    assert result["retrieve_count"] == 14
+    assert result["rerank_count"] == 10
+    assert result["inspected_image_count"] == 3
+    assert len(result["files"]) == 3
+    assert {item["channel_id"] for item in result["files"]} == {"C1"}
+    assert sum(item["image_inspected"] for item in result["files"]) == 3
+    assert result["files"][0]["file_id"] == "F0"
+    assert "upload:" in result["files"][0]["why_matched"]
+
+
+def test_file_graph_batch_has_independent_ack_cursor_and_no_vectors(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store.apply_file_command(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "operation": "upsert_share",
+            "file_id": "F1",
+            "conversation_id": "C1",
+            "provider_message_id": "M1",
+            "source_version": 2,
+            "content_version": 2,
+            "context_version": 2,
+            "file_name": "profile.png",
+            "mime_type": "image/png",
+            "permalink": "https://slack.test/F1",
+            "processing_status": "indexed",
+            "caption_ocr": "Ringo rebrand profile icon",
+            "text_content_embedding": [0.1, 0.2],
+            "image_embedding": [0.3, 0.4],
+            "upload_text": "Ringo rebrand",
+            "thread_context": "use as the new profile photo",
+            "shared_at": "2026-07-28T00:00:00+00:00",
+        }
+    )
+    request = {
+        "project_id": project_id,
+        "store_generation": store.store_generation,
+        "provider": "slack",
+        "workspace_id": "T1",
+        "allowed_source_ids": ["slack:T1:C1"],
+        "limit": 3,
+    }
+
+    first = store.file_graph_batch(request)
+    episode = first["episodes"][0]
+    serialized = json.dumps(episode, ensure_ascii=False)
+    assert "Ringo rebrand profile icon" in episode["body"]
+    assert episode["source_description"].startswith("slack:T1:C1 ")
+    assert "embedding" not in serialized
+    assert "content_sha256" not in serialized
+
+    metadata = episode["source_metadata"]
+    store.ack_file_graph_batch(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "acknowledgements": [
+                {
+                    "file_id": "F1",
+                    "conversation_id": "C1",
+                    "provider_message_id": "M1",
+                    "content_version": metadata["content_version"],
+                    "context_version": metadata["context_version"],
+                }
+            ],
+        }
+    )
+    second = store.file_graph_batch(request)
+
+    assert second["episodes"] == []
+
+
+def test_complete_reconcile_expires_old_share_and_unreferenced_content(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store.apply_file_command(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "operation": "upsert_share",
+            "file_id": "F-old",
+            "conversation_id": "C1",
+            "provider_message_id": "M-old",
+            "source_version": 1,
+            "content_version": 1,
+            "context_version": 1,
+            "processing_status": "indexed",
+            "shared_at": "2026-05-01T00:00:00+00:00",
+        }
+    )
+
+    result = store.reconcile_file_window(
+        {
+            "project_id": project_id,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "store_generation": store.store_generation,
+            "window_started_at": "2026-06-28T00:00:00+00:00",
+            "window_ended_at": "2026-07-28T00:00:00+00:00",
+            "allowed_source_ids": ["slack:T1:C1"],
+            "allowed_scope_revision": "scope-1",
+            "batch_limit": 10,
+            "processing_signature": "content-v1",
+        }
+    )
+
+    with store._connect() as conn:
+        share = conn.execute("SELECT * FROM file_shares").fetchone()
+        content_count = conn.execute(
+            "SELECT COUNT(*) FROM file_contents"
+        ).fetchone()[0]
+    assert result["status"] == "complete"
+    assert share["tombstoned_at"] is not None
+    assert content_count == 0
 
 
 def test_normalized_event_batch_applies_atomically_in_order(tmp_path, monkeypatch):
