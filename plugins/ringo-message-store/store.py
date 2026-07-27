@@ -30,7 +30,7 @@ from .file_processing import (
 
 
 logger = logging.getLogger(__name__)
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 PROTOCOL_VERSION = 1
 PROTOCOL_CAPABILITIES = (
     "acl_metadata",
@@ -49,6 +49,7 @@ MAX_BATCH_EVENTS = 500
 FILE_SEARCH_RETRIEVE_LIMIT = 50
 FILE_SEARCH_RERANK_LIMIT = 10
 FILE_SEARCH_IMAGE_INSPECT_LIMIT = 3
+MAX_FILE_PROCESSING_ATTEMPTS = 3
 
 
 _SCHEMA = """
@@ -295,12 +296,17 @@ CREATE TABLE IF NOT EXISTS file_graph_ingest_state (
 CREATE INDEX IF NOT EXISTS ix_file_graph_ingest_workspace
     ON file_graph_ingest_state(project_id, provider, workspace_id, ingested_at);
 """
+_MIGRATION_V6 = """
+ALTER TABLE file_contents
+    ADD COLUMN processing_attempts INTEGER NOT NULL DEFAULT 0;
+"""
 _MIGRATIONS = {
     1: _SCHEMA,
     2: _MIGRATION_V2,
     3: _MIGRATION_V3,
     4: _MIGRATION_V4,
     5: _MIGRATION_V5,
+    6: _MIGRATION_V6,
 }
 
 
@@ -349,6 +355,11 @@ class MessageStore:
                 script = _MIGRATIONS.get(version)
                 if script is None:
                     raise RuntimeError(f"missing message store migration {version}")
+                if version == 6 and any(
+                    str(row[1]) == "processing_attempts"
+                    for row in conn.execute("PRAGMA table_info(file_contents)")
+                ):
+                    script = ""
                 try:
                     conn.executescript(
                         "BEGIN IMMEDIATE;\n"
@@ -1206,7 +1217,8 @@ class MessageStore:
             return False
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT content_version, processing_status FROM file_contents "
+                "SELECT content_version, processing_status, processing_attempts "
+                "FROM file_contents "
                 "WHERE project_id=? AND provider=? AND workspace_id=? AND file_id=?",
                 (self.project_id, provider, workspace_id, file_id),
             ).fetchone()
@@ -1225,6 +1237,12 @@ class MessageStore:
             ),
         )
         now = datetime.now(timezone.utc).isoformat()
+        processing_status = str(result["processing_status"])
+        processing_attempts = 0
+        if processing_status == "metadata_only":
+            processing_attempts = int(row["processing_attempts"]) + 1
+            if processing_attempts >= MAX_FILE_PROCESSING_ATTEMPTS:
+                processing_status = "unavailable"
         text_embedding = result.get("text_content_embedding")
         image_embedding = result.get("image_embedding")
         with self._writer_lock, self._connect() as conn:
@@ -1239,7 +1257,8 @@ class MessageStore:
                 "image_embedding_json=?, caption_model=?, "
                 "caption_prompt_version=?, text_embedding_model=?, "
                 "text_embedding_dimension=?, image_embedding_model=?, "
-                "image_embedding_dimension=?, last_error_code=?, updated_at=? "
+                "image_embedding_dimension=?, last_error_code=?, "
+                "processing_attempts=?, updated_at=? "
                 "WHERE project_id=? AND provider=? AND workspace_id=? AND file_id=? "
                 "AND content_version=? AND processing_status='metadata_only'",
                 (
@@ -1249,7 +1268,7 @@ class MessageStore:
                     result.get("byte_size"),
                     result.get("uploaded_at"),
                     result.get("permalink"),
-                    str(result["processing_status"]),
+                    processing_status,
                     result.get("caption_ocr"),
                     json.dumps(text_embedding, separators=(",", ":"))
                     if text_embedding is not None
@@ -1264,6 +1283,7 @@ class MessageStore:
                     result.get("image_embedding_model"),
                     result.get("image_embedding_dimension"),
                     result.get("last_error_code"),
+                    processing_attempts,
                     now,
                     self.project_id,
                     provider,
@@ -1273,9 +1293,7 @@ class MessageStore:
                 ),
             ).rowcount
             conn.commit()
-        return bool(
-            updated and str(result.get("processing_status")) != "metadata_only"
-        )
+        return bool(updated and processing_status != "metadata_only")
 
     def _derived_content_by_hash(
         self,
@@ -1898,7 +1916,8 @@ class MessageStore:
             conn.execute(
                 "UPDATE file_contents SET content_version=?, "
                 "processing_status='metadata_only', last_error_code=NULL, "
-                "updated_at=? WHERE project_id=? AND provider=? "
+                "processing_attempts=0, updated_at=? "
+                "WHERE project_id=? AND provider=? "
                 "AND workspace_id=? AND file_id=?",
                 (source_version, applied_at, *file_scope),
             )
