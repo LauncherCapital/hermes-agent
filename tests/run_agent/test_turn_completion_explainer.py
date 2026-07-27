@@ -34,6 +34,14 @@ def _mock_response(content="Hello", finish_reason="stop", tool_calls=None):
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
 
+def _mock_tool_call(name="web_search", arguments="{}", call_id="call-1"):
+    return SimpleNamespace(
+        id=call_id,
+        function=SimpleNamespace(name=name, arguments=arguments),
+        type="function",
+    )
+
+
 def _make_agent(max_iterations: int = 10, config: dict | None = None) -> AIAgent:
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
@@ -179,3 +187,25 @@ def test_run_conversation_normal_reply_stays_quiet():
     assert result["turn_exit_reason"].startswith("text_response")
     assert result["final_response"] == "Done."
     assert "No reply:" not in result["final_response"]
+
+
+def test_max_iterations_preserves_exact_silent_control_token():
+    """A toolless summary can intentionally return the private no-reply token."""
+    agent = _make_agent(max_iterations=1)
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[_mock_tool_call()],
+    )
+
+    with (
+        patch("run_agent.handle_function_call", return_value="search result"),
+        patch.object(agent, "_handle_max_iterations", return_value="[SILENT]"),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("do something")
+
+    assert result["turn_exit_reason"] == "max_iterations_reached(1/1)"
+    assert result["final_response"] == "[SILENT]"

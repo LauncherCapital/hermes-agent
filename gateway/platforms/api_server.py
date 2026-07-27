@@ -2809,6 +2809,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
+                provider_error = result.get("provider_error") if isinstance(result, dict) else None
+                if isinstance(provider_error, dict):
+                    await queue.put(_event_payload("error", {
+                        "message": "Provider request failed",
+                        "provider_error": provider_error,
+                    }))
                 await queue.put(_event_payload("assistant.completed", {
                     "session_id": effective_session_id,
                     "message_id": message_id,
@@ -3231,6 +3237,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "partial": is_partial,
                 "failed": is_failed,
             }
+            provider_error = result.get("provider_error")
+            if isinstance(provider_error, dict):
+                err_body["error"]["hermes"]["provider_error"] = provider_error
             response_headers["X-Hermes-Completed"] = "false"
             response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"
             return web.json_response(err_body, status=502, headers=response_headers)

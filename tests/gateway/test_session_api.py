@@ -519,6 +519,46 @@ async def test_session_chat_stream_emits_lifecycle_events_and_keepalive_safe_sha
 
 
 @pytest.mark.asyncio
+async def test_session_chat_stream_preserves_safe_provider_error(adapter, session_db):
+    session_id = session_db.create_session("provider-error-session", "api_server")
+    provider_error = {
+        "provider": "openrouter",
+        "status_code": 403,
+        "code": "key_limit_exceeded",
+        "body": {
+            "message": "Key limit exceeded",
+            "limit_kind": "total",
+        },
+        "credential_fingerprint": "sha256:0123456789abcdef",
+    }
+
+    async def fake_run(**kwargs):
+        return {
+            "final_response": None,
+            "session_id": session_id,
+            "failed": True,
+            "error": "raw upstream error must stay server-side",
+            "provider_error": provider_error,
+        }, {}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "hello"},
+            )
+            assert resp.status == 200
+            body = await resp.text()
+
+    assert "event: error" in body
+    assert '"message": "Provider request failed"' in body
+    assert '"code": "key_limit_exceeded"' in body
+    assert '"credential_fingerprint": "sha256:0123456789abcdef"' in body
+    assert "raw upstream error must stay server-side" not in body
+
+
+@pytest.mark.asyncio
 async def test_session_chat_stream_run_completed_carries_turn_transcript(adapter, session_db):
     """run.completed must include the full interleaved turn transcript so a
     client that lost intermediate (pre-tool-call) assistant text from the live
