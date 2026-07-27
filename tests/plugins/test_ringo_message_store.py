@@ -1434,14 +1434,14 @@ def test_file_search_uses_fixed_acl_retrieve_rerank_inspect_limits(
             "Screenshot 2026-05-15 at 11.00.31 AM.png",
             "C1",
             "관련 없는 사진 ㅋㅋㅋ",
-            "Ringo2 app installer drag to Applications",
+            "generic employee profile screen",
         ),
         (
             "F2",
             "profile-option.png",
             "C1",
             "old unrelated profile draft 관련 없는 사진",
-            "blue abstract icon",
+            "일반 사용자 프로필 화면",
         ),
         (
             "F3",
@@ -1479,12 +1479,17 @@ def test_file_search_uses_fixed_acl_retrieve_rerank_inspect_limits(
                 "processing_status": "indexed",
                 "caption_ocr": caption,
                 "text_content_embedding": (
-                    [1.0, 0.0] if file_id == "F0" else [0.0, 1.0]
+                    [1.0, 0.0] if file_id == "F0" else [0.6, 0.8]
                 ),
                 "image_embedding": (
-                    [1.0, 0.0] if file_id == "F0" else [0.0, 1.0]
+                    [1.0, 0.0] if file_id == "F0" else [0.6, 0.8]
                 ),
                 "upload_text": upload_text,
+                "thread_context": (
+                    "링고 리브랜딩 논의 스레드지만 이 파일은 직원 온보딩 화면"
+                    if file_id == "F1"
+                    else None
+                ),
                 "shared_at": f"2026-07-21T00:00:0{index}+00:00",
             }
         )
