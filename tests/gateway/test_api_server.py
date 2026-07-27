@@ -446,6 +446,14 @@ class TestAgentExecution:
         mock_agent.session_total_tokens = 3
         mock_agent.session_cache_read_tokens = 4
         mock_agent.session_cache_write_tokens = 5
+        mock_agent.session_reasoning_tokens = 6
+        mock_agent.run_conversation.return_value = {
+            "final_response": "ok",
+            "estimated_cost_usd": 0.0123,
+            "cost_status": "estimated",
+            "cost_source": "openrouter_models",
+            "api_calls": 7,
+        }
 
         with patch.object(adapter, "_create_agent", return_value=mock_agent):
             result, usage = await adapter._run_agent(
@@ -466,6 +474,11 @@ class TestAgentExecution:
             "total_tokens": 3,
             "cache_read_tokens": 4,
             "cache_write_tokens": 5,
+            "reasoning_tokens": 6,
+            "estimated_cost_usd": 0.0123,
+            "cost_status": "estimated",
+            "cost_source": "openrouter_models",
+            "api_call_count": 7,
         }
         mock_agent.run_conversation.assert_called_once_with(
             user_message="hello",
