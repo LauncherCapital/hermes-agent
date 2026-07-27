@@ -949,6 +949,37 @@ def test_file_processing_deletes_transient_bytes_on_success_and_failure(
     }
 
 
+def test_image_caption_neuters_async_client_destructor_before_analysis(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    processing = sys.modules[module.MessageStore.apply_file_command.__globals__[
+        "process_slack_file"
+    ].__module__]
+    from agent import auxiliary_client
+    from tools import vision_tools
+
+    calls = []
+
+    def fake_neuter():
+        calls.append("neuter")
+
+    async def fake_vision(_path, _prompt, _model):
+        calls.append("vision")
+        return json.dumps({"success": True, "analysis": "yellow profile icon"})
+
+    monkeypatch.setattr(auxiliary_client, "neuter_async_httpx_del", fake_neuter)
+    monkeypatch.setattr(vision_tools, "vision_analyze_tool", fake_vision)
+
+    result = processing._caption_image(tmp_path / "profile.png")
+
+    assert result == ("yellow profile icon", "auxiliary-default")
+    assert calls == ["neuter", "vision"]
+
+
 def test_retryable_file_processing_stops_and_continues(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     project_id = str(uuid.uuid4())

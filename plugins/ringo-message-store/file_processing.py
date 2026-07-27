@@ -187,8 +187,10 @@ def _extract_text(path: Path) -> str:
 
 
 def _caption_image(path: Path) -> tuple[str, str]:
+    from agent.auxiliary_client import neuter_async_httpx_del
     from tools.vision_tools import vision_analyze_tool
 
+    neuter_async_httpx_del()
     model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
     prompt = (
         "Describe this workplace file precisely for search. Include all visible "
