@@ -4817,8 +4817,8 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         Create an agent and run a conversation in a thread executor.
 
-        Returns ``(result_dict, usage_dict)`` where *usage_dict* contains
-        ``input_tokens``, ``output_tokens`` and ``total_tokens``.
+        Returns ``(result_dict, usage_dict)`` where *usage_dict* contains the
+        turn's token buckets, provider request count, and cost telemetry.
 
         If *agent_ref* is a one-element list, the AIAgent instance is stored
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
@@ -4862,6 +4862,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
                 "cache_read_tokens": getattr(agent, "session_cache_read_tokens", 0) or 0,
                 "cache_write_tokens": getattr(agent, "session_cache_write_tokens", 0) or 0,
+                "reasoning_tokens": getattr(agent, "session_reasoning_tokens", 0) or 0,
+                "estimated_cost_usd": result.get("estimated_cost_usd"),
+                "cost_status": result.get("cost_status"),
+                "cost_source": result.get("cost_source"),
+                "api_call_count": result.get("api_calls", 0) or 0,
             }
             # Include the effective session ID in the result so callers
             # (e.g. X-Hermes-Session-Id header) can track compression-
