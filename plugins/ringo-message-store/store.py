@@ -49,7 +49,7 @@ MAX_BATCH_EVENTS = 500
 FILE_SEARCH_RETRIEVE_LIMIT = 50
 FILE_SEARCH_RERANK_LIMIT = 10
 FILE_SEARCH_IMAGE_INSPECT_LIMIT = 3
-FILE_SEARCH_MIN_SEMANTIC_SCORE = 0.72
+FILE_SEARCH_MIN_SEMANTIC_SCORE = 0.80
 # Search-intent words describe the operation or media, not the subject to match.
 FILE_SEARCH_GENERIC_QUERY_TOKENS = frozenset(
     {
@@ -1442,6 +1442,9 @@ class MessageStore:
             rows = conn.execute(
                 "SELECT fc.*, fs.conversation_id, fs.provider_message_id, "
                 "fs.uploader_id, fs.upload_text, fs.thread_context, fs.shared_at, "
+                "COUNT(*) OVER (PARTITION BY fs.project_id, fs.provider, "
+                "fs.workspace_id, fs.conversation_id, fs.provider_message_id) "
+                "AS message_file_count, "
                 "i.display_name AS uploader_name, c.title AS conversation_name "
                 "FROM file_contents fc JOIN file_shares fs ON "
                 "fc.project_id=fs.project_id AND fc.provider=fs.provider AND "
@@ -1515,6 +1518,7 @@ class MessageStore:
                     )
                 ):
                     continue
+            message_file_count = int(row["message_file_count"] or 1)
             fields = (
                 ("file_name", 4.0),
                 ("uploader_name", 2.5),
@@ -1523,7 +1527,7 @@ class MessageStore:
                 ("conversation_id", 1.0),
                 ("uploaded_at", 0.5),
                 ("shared_at", 0.5),
-                ("upload_text", 2.0),
+                ("upload_text", 2.0 if message_file_count == 1 else 0.5),
                 ("thread_context", 1.5),
                 ("caption_ocr", 1.0),
             )
@@ -1568,6 +1572,7 @@ class MessageStore:
                     "channel_id": row["conversation_id"],
                     "channel_name": row["conversation_name"],
                     "message_id": row["provider_message_id"],
+                    "message_file_count": message_file_count,
                     "permalink": row["permalink"],
                     "upload_text": row["upload_text"],
                     "thread_context": row["thread_context"],
@@ -1640,7 +1645,6 @@ class MessageStore:
             "uploader_id",
             "conversation_name",
             "conversation_id",
-            "upload_text",
             "caption_ocr",
             "image_inspection",
         )
@@ -1650,8 +1654,14 @@ class MessageStore:
         required_anchor_matches = min(2, len(anchor_tokens))
         relevant = []
         for item in reranked:
+            is_image = str(item.get("mimetype") or "").startswith("image/")
+            if is_image and access_token and not item["image_inspected"]:
+                continue
             direct_evidence_tokens: set[str] = set()
-            for key in direct_evidence_fields:
+            item_evidence_fields = direct_evidence_fields
+            if int(item.get("message_file_count") or 1) == 1:
+                item_evidence_fields = (*item_evidence_fields, "upload_text")
+            for key in item_evidence_fields:
                 direct_evidence_tokens.update(
                     self._file_search_tokens(item.get(key))
                 )
@@ -1686,6 +1696,7 @@ class MessageStore:
                         "upload_text",
                         "thread_context",
                         "caption_ocr",
+                        "message_file_count",
                         "retrieval_score",
                         "semantic_score",
                         "image_inspection",

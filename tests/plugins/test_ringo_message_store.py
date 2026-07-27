@@ -1433,21 +1433,21 @@ def test_file_search_uses_fixed_acl_retrieve_rerank_inspect_limits(
             "F1",
             "Screenshot 2026-05-15 at 11.00.31 AM.png",
             "C1",
-            "관련 없는 사진 ㅋㅋㅋ",
+            "링고 리브랜딩 관련 프로필 사진 피드백",
             "generic employee profile screen",
         ),
         (
             "F2",
             "profile-option.png",
             "C1",
-            "old unrelated profile draft 관련 없는 사진",
+            "링고 리브랜딩 관련 프로필 사진 피드백",
             "일반 사용자 프로필 화면",
         ),
         (
             "F3",
             "brand-notes.png",
             "C1",
-            "branding discussion 관련 없는 사진",
+            "링고 리브랜딩 관련 프로필 사진 피드백",
             "text notes",
         ),
         (
@@ -1470,7 +1470,11 @@ def test_file_search_uses_fixed_acl_retrieve_rerank_inspect_limits(
                 "operation": "upsert_share",
                 "file_id": file_id,
                 "conversation_id": channel_id,
-                "provider_message_id": f"M{index}",
+                "provider_message_id": (
+                    "M-multi"
+                    if file_id in {"F1", "F2", "F3"}
+                    else f"M{index}"
+                ),
                 "source_version": index + 1,
                 "content_version": index + 1,
                 "context_version": index + 1,
