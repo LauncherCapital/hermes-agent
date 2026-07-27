@@ -386,8 +386,10 @@ def inspect_slack_image(
             access_token=access_token,
             expected_size=byte_size,
         )
+        from agent.auxiliary_client import neuter_async_httpx_del
         from tools.vision_tools import vision_analyze_tool
 
+        neuter_async_httpx_del()
         # Keep the user query out of the shared vision tool's debug/log surface.
         # The caller compares this fresh, generic inspection with the query.
         prompt = (

@@ -980,6 +980,55 @@ def test_image_caption_neuters_async_client_destructor_before_analysis(
     assert calls == ["neuter", "vision"]
 
 
+def test_image_inspection_neuters_async_client_destructor_before_analysis(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    processing = sys.modules[module.MessageStore.apply_file_command.__globals__[
+        "process_slack_file"
+    ].__module__]
+    from agent import auxiliary_client
+    from tools import vision_tools
+
+    downloaded = tmp_path / "state" / "tmp" / "file-index" / "fi-inspect"
+    downloaded.parent.mkdir(parents=True, exist_ok=True)
+    calls = []
+
+    monkeypatch.setattr(
+        processing,
+        "_slack_file_info",
+        lambda _file_id, _token: {
+            "mimetype": "image/png",
+            "size": 3,
+            "url_private_download": "https://files.slack.test/F1",
+        },
+    )
+
+    def fake_download(**_kwargs):
+        downloaded.write_bytes(b"raw")
+        return downloaded, "abc", 3
+
+    def fake_neuter():
+        calls.append("neuter")
+
+    async def fake_vision(_path, _prompt, _model):
+        calls.append("vision")
+        return json.dumps({"success": True, "analysis": "yellow profile icon"})
+
+    monkeypatch.setattr(processing, "_download", fake_download)
+    monkeypatch.setattr(auxiliary_client, "neuter_async_httpx_del", fake_neuter)
+    monkeypatch.setattr(vision_tools, "vision_analyze_tool", fake_vision)
+
+    result = processing.inspect_slack_image("F1", "xoxb-secret", "profile")
+
+    assert result == "yellow profile icon"
+    assert calls == ["neuter", "vision"]
+    assert not downloaded.exists()
+
+
 def test_retryable_file_processing_stops_and_continues(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     project_id = str(uuid.uuid4())
