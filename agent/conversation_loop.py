@@ -4773,9 +4773,11 @@ def run_conversation(
                 _is_empty_terminal = _stripped == "" or _stripped == "(empty)"
                 # A short fragment that is not a normal text_response exit
                 # and lacks sentence-ending punctuation is treated as a
-                # truncated partial (the "The" case from #34452).
+                # truncated partial (the "The" case from #34452). Preserve
+                # the exact private no-reply token as a machine contract.
                 _is_partial_fragment = (
                     not _is_empty_terminal
+                    and _stripped != "[SILENT]"
                     and not str(_turn_exit_reason).startswith("text_response")
                     and len(_stripped) <= 24
                     and _stripped[-1:] not in {".", "!", "?", "。", "！", "？", "`", ")"}
