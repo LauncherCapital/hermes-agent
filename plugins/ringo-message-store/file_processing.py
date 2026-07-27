@@ -235,7 +235,17 @@ def process_slack_file(
 ) -> dict[str, Any]:
     """Download one file transiently and return encrypted-store-ready derivatives."""
     cleanup_stale_temp_files()
-    file_data = _slack_file_info(file_id, access_token)
+    try:
+        file_data = _slack_file_info(file_id, access_token)
+    except FileProcessingError as exc:
+        return {
+            "processing_status": (
+                "metadata_only"
+                if exc.code in _RETRYABLE_ERROR_CODES
+                else "unavailable"
+            ),
+            "last_error_code": exc.code,
+        }
     file_name = str(file_data.get("name") or file_data.get("title") or "")
     mime_type = str(file_data.get("mimetype") or "")
     size_value = file_data.get("size")

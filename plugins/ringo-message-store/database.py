@@ -129,6 +129,7 @@ class EncryptedDatabase:
     def _apply_key(conn: Any, key: str) -> None:
         # key is exactly 64 hex chars, validated before interpolation.
         conn.execute(f'PRAGMA key = "x\'{key}\'"')
+        conn.execute("PRAGMA cipher_log_level=ERROR")
         conn.execute("PRAGMA cipher_memory_security=ON")
 
     def _find_working_key_version(self) -> int:

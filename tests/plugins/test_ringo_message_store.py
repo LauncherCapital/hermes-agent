@@ -45,6 +45,10 @@ def _message_store_health(manager: PluginManager) -> dict:
     )
 
 
+def _message_store_schema_version(module: object) -> int:
+    return int(sys.modules[module.MessageStore.__module__].SCHEMA_VERSION)
+
+
 @pytest.mark.asyncio
 async def test_unclaimed_pool_instance_has_no_store_or_project_key(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -63,13 +67,13 @@ async def test_cold_claim_initializes_store_during_plugin_load(tmp_path, monkeyp
     project_id = str(uuid.uuid4())
     write_project_marker(project_id)
 
-    manager, _module = _load_service()
+    manager, module = _load_service()
 
     assert (tmp_path / "state/message_store.db").exists()
     assert (tmp_path / "state/keys/message-store-v1.pem").exists()
     health = _message_store_health(manager)
     assert health["project_id"] == project_id
-    assert health["schema_version"] == 5
+    assert health["schema_version"] == _message_store_schema_version(module)
 
 
 @pytest.mark.asyncio
@@ -144,7 +148,10 @@ async def test_claim_initializes_schema_key_and_idempotent_delivery(tmp_path, mo
             "file_index_runs",
             "file_graph_ingest_state",
         }.issubset(tables)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert (
+            conn.execute("PRAGMA user_version").fetchone()[0]
+            == _message_store_schema_version(module)
+        )
 
     original_key = private_path.read_bytes()
     reopened = module.MessageStore(project_id, path=db_path)
@@ -198,17 +205,63 @@ def test_schema_v5_upgrades_existing_v4_store_with_file_graph_cursor(
     store = module.MessageStore(project_id)
     with store._connect() as conn:
         conn.execute("DROP TABLE file_graph_ingest_state")
+        conn.execute("ALTER TABLE file_contents DROP COLUMN processing_attempts")
         conn.execute("PRAGMA user_version=4")
         conn.commit()
 
     reopened = module.MessageStore(project_id, path=store.path)
 
     with reopened._connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert (
+            conn.execute("PRAGMA user_version").fetchone()[0]
+            == _message_store_schema_version(module)
+        )
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' "
             "AND name='file_graph_ingest_state'"
         ).fetchone()
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(file_contents)")
+        }
+        assert "processing_attempts" in columns
+
+
+def test_schema_v6_upgrades_existing_v5_file_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store.apply_file_command(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "operation": "upsert_share",
+            "file_id": "F1",
+            "conversation_id": "C1",
+            "provider_message_id": "M1",
+            "source_version": 1,
+            "processing_status": "metadata_only",
+        }
+    )
+    with store._connect() as conn:
+        conn.execute("ALTER TABLE file_contents DROP COLUMN processing_attempts")
+        conn.execute("PRAGMA user_version=5")
+        conn.commit()
+
+    reopened = module.MessageStore(project_id, path=store.path)
+
+    with reopened._connect() as conn:
+        content = conn.execute(
+            "SELECT file_id, processing_attempts FROM file_contents"
+        ).fetchone()
+        assert (
+            conn.execute("PRAGMA user_version").fetchone()[0]
+            == _message_store_schema_version(module)
+        )
+    assert tuple(content) == ("F1", 0)
 
 
 def test_retention_removes_expired_messages_reactions_and_deliveries(
@@ -884,6 +937,79 @@ def test_file_processing_deletes_transient_bytes_on_success_and_failure(
     assert failed["processing_status"] == "metadata_only"
     assert failed["last_error_code"] == "image_caption_failed"
     assert not downloaded.exists()
+
+    def fail_file_info(_file_id, _token):
+        raise processing.FileProcessingError("slack_file_info_failed")
+
+    monkeypatch.setattr(processing, "_slack_file_info", fail_file_info)
+    metadata_failed = processing.process_slack_file("F1", "xoxb-secret")
+    assert metadata_failed == {
+        "processing_status": "metadata_only",
+        "last_error_code": "slack_file_info_failed",
+    }
+
+
+def test_retryable_file_processing_stops_and_continues(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    for version, file_id in enumerate(("F1", "F2"), start=1):
+        store.apply_file_command(
+            {
+                "project_id": project_id,
+                "store_generation": store.store_generation,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "operation": "upsert_share",
+                "file_id": file_id,
+                "conversation_id": "C1",
+                "provider_message_id": f"M{version}",
+                "source_version": version,
+                "processing_status": "metadata_only",
+            }
+        )
+    store_module = sys.modules[module.MessageStore.__module__]
+
+    def fake_process(file_id, _token, _reuse_by_sha=None):
+        return {
+            "processing_status": (
+                "metadata_only" if file_id == "F1" else "indexed"
+            ),
+            "content_sha256": "f2" if file_id == "F2" else None,
+            "last_error_code": (
+                "embedding_failed" if file_id == "F1" else None
+            ),
+        }
+
+    monkeypatch.setattr(
+        store_module,
+        "process_slack_file",
+        fake_process,
+    )
+
+    processed = [
+        store._process_pending_file_contents(
+            provider="slack",
+            workspace_id="T1",
+            access_token="xoxb-transient",
+            limit=1,
+        )
+        for _ in range(4)
+    ]
+
+    with store._connect() as conn:
+        contents = conn.execute(
+            "SELECT file_id, processing_status, processing_attempts, "
+            "last_error_code "
+            "FROM file_contents ORDER BY file_id"
+        ).fetchall()
+    assert processed == [0, 0, 1, 1]
+    assert [tuple(row) for row in contents] == [
+        ("F1", "unavailable", 3, "embedding_failed"),
+        ("F2", "indexed", 0, None),
+    ]
 
 
 def test_file_change_refreshes_content_without_rewriting_share_context(
