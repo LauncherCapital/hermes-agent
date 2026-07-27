@@ -49,6 +49,8 @@ MAX_BATCH_EVENTS = 500
 FILE_SEARCH_RETRIEVE_LIMIT = 50
 FILE_SEARCH_RERANK_LIMIT = 10
 FILE_SEARCH_IMAGE_INSPECT_LIMIT = 3
+FILE_SEARCH_MIN_TOKEN_COVERAGE = 0.34
+FILE_SEARCH_MIN_SEMANTIC_SCORE = 0.55
 MAX_FILE_PROCESSING_ATTEMPTS = 3
 
 
@@ -1587,9 +1589,40 @@ class MessageStore:
             ),
             reverse=True,
         )
+        evidence_fields = (
+            "name",
+            "uploader_name",
+            "uploader_id",
+            "conversation_name",
+            "conversation_id",
+            "uploaded_at",
+            "shared_at",
+            "upload_text",
+            "thread_context",
+            "caption_ocr",
+            "image_inspection",
+        )
+        relevant = []
+        for item in reranked:
+            evidence_tokens: set[str] = set()
+            for key in evidence_fields:
+                evidence_tokens.update(
+                    self._file_search_tokens(item.get(key))
+                )
+            token_coverage = (
+                len(query_tokens & evidence_tokens) / len(query_tokens)
+                if query_tokens
+                else 0.0
+            )
+            if (
+                token_coverage >= FILE_SEARCH_MIN_TOKEN_COVERAGE
+                or float(item.get("semantic_score") or 0.0)
+                >= FILE_SEARCH_MIN_SEMANTIC_SCORE
+            ):
+                relevant.append(item)
         limit = max(1, min(int(request.get("limit") or 3), 3))
         output = []
-        for item in reranked[:limit]:
+        for item in relevant[:limit]:
             evidence = []
             for label, key in (
                 ("upload", "upload_text"),

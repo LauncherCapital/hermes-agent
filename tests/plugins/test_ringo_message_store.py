@@ -1415,7 +1415,11 @@ def test_file_search_uses_fixed_acl_retrieve_rerank_inspect_limits(
     monkeypatch.setattr(
         store_module,
         "inspect_slack_image",
-        lambda _file_id, _token, _query: "Ringo rebrand profile icon",
+        lambda file_id, _token, _query: (
+            "링고 리브랜딩 프로필 사진"
+            if file_id == "F0"
+            else "unrelated application screenshot"
+        ),
     )
     fixtures = [
         (
@@ -1429,21 +1433,21 @@ def test_file_search_uses_fixed_acl_retrieve_rerank_inspect_limits(
             "F1",
             "Screenshot 2026-05-15 at 11.00.31 AM.png",
             "C1",
-            "ㅋㅋㅋ",
+            "관련 없는 사진 ㅋㅋㅋ",
             "Ringo2 app installer drag to Applications",
         ),
         (
             "F2",
             "profile-option.png",
             "C1",
-            "old unrelated profile draft",
+            "old unrelated profile draft 관련 없는 사진",
             "blue abstract icon",
         ),
         (
             "F3",
             "brand-notes.png",
             "C1",
-            "branding discussion",
+            "branding discussion 관련 없는 사진",
             "text notes",
         ),
         (
@@ -1474,8 +1478,12 @@ def test_file_search_uses_fixed_acl_retrieve_rerank_inspect_limits(
                 "mime_type": "image/png",
                 "processing_status": "indexed",
                 "caption_ocr": caption,
-                "text_content_embedding": [1.0, 0.0],
-                "image_embedding": [1.0, 0.0],
+                "text_content_embedding": (
+                    [1.0, 0.0] if file_id == "F0" else [0.0, 1.0]
+                ),
+                "image_embedding": (
+                    [1.0, 0.0] if file_id == "F0" else [0.0, 1.0]
+                ),
                 "upload_text": upload_text,
                 "shared_at": f"2026-07-21T00:00:0{index}+00:00",
             }
@@ -1498,8 +1506,8 @@ def test_file_search_uses_fixed_acl_retrieve_rerank_inspect_limits(
                 "mime_type": "text/plain",
                 "processing_status": "indexed",
                 "caption_ocr": "generic notes",
-                "text_content_embedding": [1.0, 0.0],
-                "upload_text": "unrelated notes",
+                "text_content_embedding": [0.0, 1.0],
+                "upload_text": "관련 없는 사진 notes",
                 "shared_at": f"2026-07-20T00:00:{index:02d}+00:00",
             }
         )
@@ -1541,11 +1549,63 @@ def test_file_search_uses_fixed_acl_retrieve_rerank_inspect_limits(
     assert result["retrieve_count"] == 14
     assert result["rerank_count"] == 10
     assert result["inspected_image_count"] == 3
-    assert len(result["files"]) == 3
+    assert len(result["files"]) == 1
     assert {item["channel_id"] for item in result["files"]} == {"C1"}
-    assert sum(item["image_inspected"] for item in result["files"]) == 3
+    assert sum(item["image_inspected"] for item in result["files"]) == 1
     assert result["files"][0]["file_id"] == "F0"
     assert "upload:" in result["files"][0]["why_matched"]
+
+
+def test_file_search_keeps_high_semantic_candidate_without_token_overlap(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+    monkeypatch.setattr(
+        store_module,
+        "embed_text",
+        lambda _text: ([1.0, 0.0], "embedding-test"),
+    )
+    store.apply_file_command(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "operation": "upsert_share",
+            "file_id": "F1",
+            "conversation_id": "C1",
+            "provider_message_id": "M1",
+            "source_version": 1,
+            "content_version": 1,
+            "context_version": 1,
+            "file_name": "image.png",
+            "mime_type": "image/png",
+            "processing_status": "indexed",
+            "caption_ocr": "조직 대표 이미지",
+            "text_content_embedding": [1.0, 0.0],
+            "image_embedding": [1.0, 0.0],
+            "shared_at": "2026-07-21T00:00:00+00:00",
+        }
+    )
+
+    result = store.search_file_index(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "query": "workspace avatar",
+            "allowed_source_ids": ["slack:T1:C1"],
+            "allowed_scope_revision": "scope-1",
+        }
+    )
+
+    assert [item["file_id"] for item in result["files"]] == ["F1"]
 
 
 def test_file_graph_batch_has_independent_ack_cursor_and_no_vectors(
