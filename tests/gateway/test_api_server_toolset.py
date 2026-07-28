@@ -112,7 +112,7 @@ class TestApiServerAdapterToolset:
                                         "provider": None, "api_mode": None,
                                         "command": None, "args": []}
             mock_model.return_value = "test/model"
-            # User overrides with just web and terminal
+            # User configurables survive alongside newly discovered plugins.
             mock_config.return_value = {
                 "platform_toolsets": {"api_server": ["web", "terminal"]}
             }
@@ -123,4 +123,8 @@ class TestApiServerAdapterToolset:
             mock_agent_cls.assert_called_once()
             call_kwargs = mock_agent_cls.call_args
             toolsets = call_kwargs.kwargs.get("enabled_toolsets")
-            assert sorted(toolsets) == ["terminal", "web"]
+            assert sorted(toolsets) == [
+                "ringo_entity_skills",
+                "terminal",
+                "web",
+            ]

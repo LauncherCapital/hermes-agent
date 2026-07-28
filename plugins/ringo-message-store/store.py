@@ -62,6 +62,7 @@ FILE_SEARCH_RERANK_LIMIT = 10
 FILE_SEARCH_IMAGE_INSPECT_LIMIT = 3
 FILE_SEARCH_MIN_SEMANTIC_SCORE = 0.80
 FILE_SEARCH_MIN_LEXICAL_COVERAGE = 0.25
+FILE_SEARCH_MIN_CONTEXT_FEATURES = 2
 FILE_SEARCH_RRF_K = 10
 MAX_FILE_PROCESSING_ATTEMPTS = 3
 MESSAGE_SEARCH_ADJACENCY_SECONDS = 10 * 60
@@ -1902,6 +1903,7 @@ class MessageStore:
             )
 
         query_tokens = self._file_search_tokens(query)
+        context_query_tokens = self._file_search_tokens(context_query)
         uploader_filter = str(request.get("uploader_id") or "")
         raw_types = request.get("file_types")
         file_types = {
@@ -1960,6 +1962,10 @@ class MessageStore:
                 * len(query_tokens & self._file_search_tokens(row[field]))
                 for field, weight in fields
             )
+            thread_tokens = self._file_search_tokens(row["thread_context"])
+            context_lexical_feature_count = len(
+                context_query_tokens & thread_tokens
+            )
             haystack = " ".join(
                 str(row[field] or "").lower() for field, _ in fields
             )
@@ -2005,6 +2011,8 @@ class MessageStore:
                 ) * 4.0
             else:
                 retrieval_score += semantic_signal * 4.0
+                if context_query and context_query != query:
+                    retrieval_score += context_lexical_feature_count * 1.5
             if not query:
                 retrieval_score = 1.0
             if retrieval_score <= 0:
@@ -2033,6 +2041,9 @@ class MessageStore:
                     "semantic_score": semantic,
                     "parent_semantic_score": parent_semantic,
                     "has_parent_embedding": has_parent_embedding,
+                    "context_lexical_feature_count": (
+                        context_lexical_feature_count
+                    ),
                 }
             )
         if not query:
@@ -2046,6 +2057,18 @@ class MessageStore:
             # scales. Rank fusion prevents a long exact-match thread from
             # crowding out a newer discussion found through parent context.
             fused: dict[int, float] = {}
+
+            def has_context_match(item: dict[str, Any]) -> bool:
+                return (
+                    item["has_parent_embedding"]
+                    and float(item.get("parent_semantic_score") or 0.0) >= 0.2
+                ) or (
+                    not item["has_parent_embedding"]
+                    and int(
+                        item.get("context_lexical_feature_count") or 0
+                    )
+                    >= FILE_SEARCH_MIN_CONTEXT_FEATURES
+                )
 
             def add_lane(
                 lane: list[dict[str, Any]],
@@ -2069,13 +2092,16 @@ class MessageStore:
             contextual = [
                 item
                 for item in candidates
-                if item["has_parent_embedding"]
-                and float(item.get("parent_semantic_score") or 0.0) >= 0.2
+                if has_context_match(item)
             ]
             parent_lane = sorted(
                 contextual,
                 key=lambda item: (
-                    item["parent_semantic_score"],
+                    (
+                        item["parent_semantic_score"]
+                        if item["has_parent_embedding"]
+                        else item["context_lexical_feature_count"]
+                    ),
                     str(item.get("shared_at") or ""),
                 ),
                 reverse=True,
@@ -2209,8 +2235,7 @@ class MessageStore:
                 if (
                     (
                         bool(context_query)
-                        and item["has_parent_embedding"]
-                        and float(item.get("parent_semantic_score") or 0.0) >= 0.2
+                        and has_context_match(item)
                     )
                     or direct_coverage >= FILE_SEARCH_MIN_LEXICAL_COVERAGE
                     or float(item.get("semantic_score") or 0.0)
@@ -2219,6 +2244,9 @@ class MessageStore:
                     relevant.append(item)
         limit = max(1, min(int(request.get("limit") or 3), 20))
         output = []
+        evidence_tokens = (
+            query_tokens | context_query_tokens if query else set()
+        )
         for item in relevant[:limit]:
             evidence = []
             for label, key in (
@@ -2228,7 +2256,7 @@ class MessageStore:
                 ("inspection", "image_inspection"),
             ):
                 value = str(item.get(key) or "").strip()
-                if value and query_tokens & self._file_search_tokens(value):
+                if value and evidence_tokens & self._file_search_tokens(value):
                     evidence.append(f"{label}: {value[:160]}")
             if item["has_parent_embedding"] and not evidence:
                 evidence.append("thread: semantic context match")
@@ -2249,6 +2277,7 @@ class MessageStore:
                         "semantic_score",
                         "parent_semantic_score",
                         "has_parent_embedding",
+                        "context_lexical_feature_count",
                         "image_inspection",
                     }
                 }
