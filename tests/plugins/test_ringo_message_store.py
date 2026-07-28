@@ -2204,6 +2204,33 @@ def test_file_search_finds_recent_profile_candidates_from_thread_context(
                 "'PROFILE-ROOT', 'U1', '프로필 후보 이미지', '{}', ?, ?, ?)",
                 (project_id, f"M-{index}", occurred_at, occurred_at, occurred_at),
             )
+        conn.execute(
+            "INSERT INTO messages(project_id, provider, workspace_id, "
+            "conversation_id, provider_message_id, sender_id, text, "
+            "provider_payload_json, occurred_at, inserted_at, updated_at) "
+            "VALUES (?, 'slack', 'T1', 'C1', 'OLDER-ROOT', 'U1', "
+            "'old Ringo settings screenshots', '{}', "
+            "'2026-07-10T00:00:00+00:00', '2026-07-10T00:00:00+00:00', "
+            "'2026-07-10T00:00:00+00:00')",
+            (project_id,),
+        )
+        for index in range(12):
+            occurred_at = f"2026-07-10T00:00:{index:02d}+00:00"
+            conn.execute(
+                "INSERT INTO messages(project_id, provider, workspace_id, "
+                "conversation_id, provider_message_id, parent_message_id, "
+                "sender_id, text, provider_payload_json, occurred_at, "
+                "inserted_at, updated_at) VALUES (?, 'slack', 'T1', 'C1', ?, "
+                "'OLDER-ROOT', 'U1', 'old profile settings screenshot', '{}', "
+                "?, ?, ?)",
+                (
+                    project_id,
+                    f"M-older-exact-{index}",
+                    occurred_at,
+                    occurred_at,
+                    occurred_at,
+                ),
+            )
     for index, (
         file_id,
         name,
@@ -2271,7 +2298,7 @@ def test_file_search_finds_recent_profile_candidates_from_thread_context(
                 "text_content_embedding": [1.0, 0.0],
                 "image_embedding": [1.0, 0.0],
                 "upload_text": "링고 프로필 아이콘 후보",
-                "thread_context": "older exact-match onboarding discussion",
+                "thread_context": "링고 프로필 설정 화면",
                 "parent_embedding": [0.2, 0.979796],
                 "parent_embedding_model": "embedding-test",
                 "parent_embedding_dimension": 2,
@@ -2294,8 +2321,19 @@ def test_file_search_finds_recent_profile_candidates_from_thread_context(
         }
     )
 
-    returned = {item["file_id"] for item in result["files"]}
-    assert target_ids <= returned
+    returned = [item["file_id"] for item in result["files"]]
+    assert target_ids <= set(returned)
+    first_old = next(
+        index
+        for index, file_id in enumerate(returned)
+        if file_id.startswith("F-older-exact-")
+    )
+    assert all(
+        returned.index(file_id) < first_old for file_id in target_ids
+    ), "\n".join(
+        f"{item['file_id']}={item['rerank_score']}"
+        for item in result["files"]
+    )
     assert all(
         item["description"]
         for item in result["files"]

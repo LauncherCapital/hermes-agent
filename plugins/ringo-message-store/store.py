@@ -65,6 +65,8 @@ FILE_SEARCH_MIN_PARENT_SEMANTIC_SCORE = 0.25
 FILE_SEARCH_RRF_K = 60
 FILE_SEARCH_MAX_INDEX_MATCHES = 5_000
 FILE_SEARCH_DIRECT_LEXICAL_LANE_WEIGHT = 0.25
+FILE_SEARCH_CONTEXTUAL_DIRECT_LEXICAL_LANE_WEIGHT = 0.10
+FILE_SEARCH_CONTEXTUAL_DIRECT_DENSE_LANE_WEIGHT = 0.25
 FILE_SEARCH_CONTEXT_LANE_WEIGHT = 1.0
 FILE_SEARCH_CONTEXT_DENSE_LANE_WEIGHT = 2.0
 FILE_EMBEDDING_BACKFILL_LIMIT = 20
@@ -2601,7 +2603,11 @@ class MessageStore:
                             lane,
                             FILE_SEARCH_CONTEXT_LANE_WEIGHT
                             if name.startswith("thread_")
-                            else FILE_SEARCH_DIRECT_LEXICAL_LANE_WEIGHT,
+                            else (
+                                FILE_SEARCH_CONTEXTUAL_DIRECT_LEXICAL_LANE_WEIGHT
+                                if context_query
+                                else FILE_SEARCH_DIRECT_LEXICAL_LANE_WEIGHT
+                            ),
                         )
                     )
             semantic_lane = sorted(
@@ -2632,7 +2638,14 @@ class MessageStore:
                 reverse=True,
             )[:FILE_SEARCH_RETRIEVE_LIMIT]
             if semantic_lane:
-                lanes.append((semantic_lane, 1.0))
+                lanes.append(
+                    (
+                        semantic_lane,
+                        FILE_SEARCH_CONTEXTUAL_DIRECT_DENSE_LANE_WEIGHT
+                        if context_query
+                        else 1.0,
+                    )
+                )
             if parent_lane:
                 lanes.append(
                     (parent_lane, FILE_SEARCH_CONTEXT_DENSE_LANE_WEIGHT)
