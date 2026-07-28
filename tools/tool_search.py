@@ -10,8 +10,9 @@ for the full rationale):
 * Core tools defined in ``toolsets._HERMES_CORE_TOOLS`` are *never* deferred.
   Always-load means always-load. No exceptions.
 * The threshold gate runs every assembly: when deferrable tools would consume
-  less than ``threshold_pct`` of the model's context window (default 10%),
-  tool search is a no-op and the tools array passes through unchanged.
+  less than both ``threshold_pct`` of the model's context window (default 10%)
+  and ``threshold_tokens`` (default 20K), tool search is a no-op and the tools
+  array passes through unchanged.
 * The catalog is stateless across turns and tools-array assemblies. It is
   rebuilt from the current tool-defs list every time. This is the lesson
   from OpenClaw's cron regression (openclaw/openclaw#84141): a session-keyed
@@ -53,6 +54,7 @@ BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_N
 # positives (activated when not needed). 4.0 errs slightly toward
 # underestimating, which is the safer default.
 CHARS_PER_TOKEN = 4.0
+DEFAULT_THRESHOLD_TOKENS = 20_000
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +68,7 @@ class ToolSearchConfig:
 
     enabled: str  # "auto" | "on" | "off"
     threshold_pct: float  # 0..100 — only used when enabled == "auto"
+    threshold_tokens: int  # absolute schema-token budget used in "auto"
     search_default_limit: int
     max_search_limit: int
 
@@ -81,12 +84,15 @@ class ToolSearchConfig:
         """
         if raw is True:
             return cls(enabled="auto", threshold_pct=10.0,
+                       threshold_tokens=DEFAULT_THRESHOLD_TOKENS,
                        search_default_limit=5, max_search_limit=20)
         if raw is False:
             return cls(enabled="off", threshold_pct=10.0,
+                       threshold_tokens=DEFAULT_THRESHOLD_TOKENS,
                        search_default_limit=5, max_search_limit=20)
         if not isinstance(raw, dict):
             return cls(enabled="auto", threshold_pct=10.0,
+                       threshold_tokens=DEFAULT_THRESHOLD_TOKENS,
                        search_default_limit=5, max_search_limit=20)
 
         enabled_raw = str(raw.get("enabled", "auto")).strip().lower()
@@ -101,6 +107,10 @@ class ToolSearchConfig:
 
         threshold_pct = _safe_float(raw.get("threshold_pct"), 10.0)
         threshold_pct = max(0.0, min(100.0, threshold_pct))
+        threshold_tokens = max(
+            1,
+            _safe_int(raw.get("threshold_tokens"), DEFAULT_THRESHOLD_TOKENS),
+        )
 
         max_search_limit = max(1, min(50, _safe_int(raw.get("max_search_limit"), 20)))
         search_default_limit = max(1, min(max_search_limit,
@@ -109,6 +119,7 @@ class ToolSearchConfig:
         return cls(
             enabled=enabled,
             threshold_pct=threshold_pct,
+            threshold_tokens=threshold_tokens,
             search_default_limit=search_default_limit,
             max_search_limit=max_search_limit,
         )
@@ -241,7 +252,8 @@ def should_activate(
     ``"off"`` skips unconditionally. ``"on"`` activates unconditionally
     (as long as there is at least one deferrable tool — there's no point
     swapping a no-op). ``"auto"`` activates when the deferrable schemas
-    would consume ``threshold_pct`` of context or more.
+    reach either the context-relative threshold or the absolute schema-token
+    budget.
     """
     if config.enabled == "off":
         return False
@@ -249,13 +261,18 @@ def should_activate(
         return False
     if config.enabled == "on":
         return True
-    # auto
+    return deferrable_tokens >= _auto_activation_threshold_tokens(config, context_length)
+
+
+def _auto_activation_threshold_tokens(
+    config: ToolSearchConfig,
+    context_length: Optional[int],
+) -> int:
+    """Return the first auto-mode threshold the schema surface can reach."""
     if not context_length or context_length <= 0:
-        # Without a known context size, fall back to a fixed 20K-token cutoff
-        # — the cliff above which Anthropic and OpenAI both saw quality drops.
-        return deferrable_tokens >= 20_000
-    threshold_tokens = int(context_length * (config.threshold_pct / 100.0))
-    return deferrable_tokens >= threshold_tokens
+        return config.threshold_tokens
+    relative_threshold = int(context_length * (config.threshold_pct / 100.0))
+    return min(relative_threshold, config.threshold_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -556,23 +573,33 @@ def assemble_tool_defs(
         return AssemblyResult(tool_defs=incoming, activated=False)
 
     deferrable_tokens = estimate_tokens_from_schemas(deferrable)
-    if not should_activate(config, deferrable_tokens, context_length):
+    activated = should_activate(config, deferrable_tokens, context_length)
+    threshold_tokens = (
+        _auto_activation_threshold_tokens(config, context_length)
+        if config.enabled == "auto"
+        else 0
+    )
+    logger.info(
+        "tool_search assembly: activated=%s visible=%d deferred=%d "
+        "deferred_schema_tokens_estimate=%d activation_threshold_tokens=%d",
+        activated,
+        len(visible),
+        len(deferrable),
+        deferrable_tokens,
+        threshold_tokens,
+    )
+
+    if not activated:
         return AssemblyResult(
             tool_defs=incoming,
             activated=False,
             deferred_count=len(deferrable),
             deferred_tokens=deferrable_tokens,
-            threshold_tokens=int((context_length or 0) * (config.threshold_pct / 100.0)),
+            threshold_tokens=threshold_tokens,
         )
 
     bridge = bridge_tool_schemas(len(deferrable))
     result = visible + bridge
-    threshold_tokens = int((context_length or 0) * (config.threshold_pct / 100.0))
-
-    logger.info(
-        "tool_search activated: %d core/visible tools kept, %d deferred (~%d tokens, threshold ~%d)",
-        len(visible), len(deferrable), deferrable_tokens, threshold_tokens,
-    )
 
     return AssemblyResult(
         tool_defs=result,
