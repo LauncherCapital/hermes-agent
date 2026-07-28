@@ -62,6 +62,7 @@ FILE_SEARCH_RERANK_LIMIT = 10
 FILE_SEARCH_IMAGE_INSPECT_LIMIT = 3
 FILE_SEARCH_MIN_SEMANTIC_SCORE = 0.80
 FILE_SEARCH_MIN_LEXICAL_COVERAGE = 0.25
+FILE_SEARCH_RRF_K = 10
 MAX_FILE_PROCESSING_ATTEMPTS = 3
 MESSAGE_SEARCH_ADJACENCY_SECONDS = 10 * 60
 MESSAGE_SEARCH_CANDIDATE_LIMIT = 200
@@ -2032,14 +2033,72 @@ class MessageStore:
                     "has_parent_embedding": has_parent_embedding,
                 }
             )
-        retrieved = sorted(
-            candidates,
-            key=lambda item: (
-                item["retrieval_score"],
-                str(item.get("shared_at") or ""),
-            ),
-            reverse=True,
-        )[:FILE_SEARCH_RETRIEVE_LIMIT]
+        if context_query:
+            # Direct lexical scores and embedding cosine scores have unrelated
+            # scales. Rank fusion prevents a long exact-match thread from
+            # crowding out a newer discussion found through parent context.
+            fused: dict[int, float] = {}
+
+            def add_lane(
+                lane: list[dict[str, Any]],
+                *,
+                weight: float,
+            ) -> None:
+                for rank, item in enumerate(lane):
+                    key = id(item)
+                    fused[key] = fused.get(key, 0.0) + weight / (
+                        FILE_SEARCH_RRF_K + rank + 1
+                    )
+
+            direct_lane = sorted(
+                candidates,
+                key=lambda item: (
+                    item["rerank_score"],
+                    str(item.get("shared_at") or ""),
+                ),
+                reverse=True,
+            )
+            contextual = [
+                item
+                for item in candidates
+                if item["has_parent_embedding"]
+                and float(item.get("parent_semantic_score") or 0.0) >= 0.2
+            ]
+            parent_lane = sorted(
+                contextual,
+                key=lambda item: (
+                    item["parent_semantic_score"],
+                    str(item.get("shared_at") or ""),
+                ),
+                reverse=True,
+            )
+            recent_context_lane = sorted(
+                contextual,
+                key=lambda item: str(item.get("shared_at") or ""),
+                reverse=True,
+            )
+            add_lane(direct_lane, weight=1.0)
+            add_lane(parent_lane, weight=2.0)
+            add_lane(recent_context_lane, weight=1.0)
+            for item in candidates:
+                item["rerank_score"] = fused.get(id(item), 0.0) * 100.0
+            retrieved = sorted(
+                candidates,
+                key=lambda item: (
+                    item["rerank_score"],
+                    str(item.get("shared_at") or ""),
+                ),
+                reverse=True,
+            )[:FILE_SEARCH_RETRIEVE_LIMIT]
+        else:
+            retrieved = sorted(
+                candidates,
+                key=lambda item: (
+                    item["retrieval_score"],
+                    str(item.get("shared_at") or ""),
+                ),
+                reverse=True,
+            )[:FILE_SEARCH_RETRIEVE_LIMIT]
         reranked = sorted(
             retrieved,
             key=lambda item: (
