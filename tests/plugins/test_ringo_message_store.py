@@ -271,6 +271,49 @@ def test_schema_v6_upgrades_existing_v5_file_rows(tmp_path, monkeypatch):
     assert reopened.store_generation != old_generation
 
 
+def test_schema_v8_backfills_existing_messages_into_search_index(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    with store._connect() as conn:
+        for trigger in (
+            "message_search_insert",
+            "message_search_delete",
+            "message_search_update",
+        ):
+            conn.execute(f"DROP TRIGGER {trigger}")
+        conn.execute("DROP TABLE message_search_fts")
+        conn.execute("DROP TABLE message_search_trigram")
+        conn.execute(
+            "DELETE FROM schema_meta WHERE key='message_search_index_version'"
+        )
+        conn.execute(
+            "INSERT INTO messages(project_id, provider, workspace_id, "
+            "conversation_id, provider_message_id, text, occurred_at, "
+            "inserted_at, updated_at) VALUES (?, 'slack', 'T1', 'C1', 'M1', "
+            "'月文堂の料金を変更', '2026-07-27T00:00:00+00:00', "
+            "'2026-07-27T00:00:00+00:00', '2026-07-27T00:00:00+00:00')",
+            (project_id,),
+        )
+        conn.execute("PRAGMA user_version=7")
+
+    reopened = module.MessageStore(project_id, path=store.path)
+
+    with reopened._connect() as conn:
+        assert (
+            conn.execute(
+                "SELECT count(*) FROM message_search_trigram "
+                "WHERE message_search_trigram MATCH '\"料金を変更\"'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
+
+
 def test_retention_removes_expired_messages_reactions_and_deliveries(
     tmp_path, monkeypatch
 ):
@@ -1624,6 +1667,25 @@ def test_file_search_keeps_high_semantic_candidate_without_token_overlap(
     assert [item["file_id"] for item in result["files"]] == ["F1"]
 
 
+def test_file_search_lexical_features_are_unicode_script_agnostic(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+
+    for query, document in (
+        ("料金を変更", "月文堂の料金を変更してください"),
+        ("价格调整", "月文堂订阅价格调整说明"),
+        ("تعديل السعر", "طلب تعديل السعر الشهري"),
+        ("тариф обновлён", "Тариф обновлён для подписки"),
+        ("résumé tarif", "Résumé du tarif révisé"),
+    ):
+        assert store._file_search_tokens(query) & store._file_search_tokens(document)
+
+
 def test_parent_context_embedding_is_reused_across_thread_attachments(
     tmp_path, monkeypatch
 ):
@@ -2640,6 +2702,137 @@ def test_message_search_recovers_price_change_thread_without_cross_thread_noise(
         "1784869142.677289",
         "1784869200.000001",
     }
+
+
+def test_message_search_supports_unicode_scripts_without_language_dictionaries(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    fixtures = (
+        ("ja", "月文堂の料金を変更してください", "料金を変更"),
+        ("zh", "月文堂订阅价格调整说明", "价格调整"),
+        ("ar", "طلب تعديل السعر الشهري", "تعديل السعر"),
+        ("ru", "Тариф обновлён для подписки", "тариф обновлён"),
+        ("fr", "Résumé du tarif révisé", "résumé tarif"),
+        ("ko", "월문당가격조정요청", "가격조정"),
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO conversations(project_id, provider, workspace_id, "
+            "conversation_id, title, updated_at) VALUES (?, 'slack', 'T1', "
+            "'C1', 'pricing', '2026-07-28T00:00:00+00:00')",
+            (project_id,),
+        )
+        conn.execute(
+            "INSERT INTO coverage(project_id, provider, workspace_id, "
+            "conversation_id, contiguous_since, last_sequence, last_event_at, state) "
+            "VALUES (?, 'slack', 'T1', 'C1', '2026-07-20T00:00:00+00:00', "
+            "1, '2026-07-28T00:00:00+00:00', 'COLLECTING')",
+            (project_id,),
+        )
+        for index, (message_id, text, _query) in enumerate(fixtures):
+            occurred_at = f"2026-07-27T00:00:{index:02d}+00:00"
+            conn.execute(
+                "INSERT INTO messages(project_id, provider, workspace_id, "
+                "conversation_id, provider_message_id, sender_id, text, "
+                "provider_payload_json, occurred_at, inserted_at, updated_at) "
+                "VALUES (?, 'slack', 'T1', 'C1', ?, 'U1', ?, '{}', ?, ?, ?)",
+                (project_id, message_id, text, occurred_at, occurred_at, occurred_at),
+            )
+
+    request = {
+        "operation": "search",
+        "start": "2026-07-20T00:00:00+00:00",
+        "end": "2026-07-28T00:00:00+00:00",
+        "providers": ["slack"],
+        "workspace_ids": ["T1"],
+        "allowed_source_ids": ["slack:T1:C1"],
+        "limit": 3,
+    }
+    for message_id, _text, query in fixtures:
+        result = store.query({**request, "query": query})
+        assert result["hits"], query
+        assert result["hits"][0]["message"]["provider_message_id"] == message_id
+    compound = store.query({**request, "query": "가격 조정"})
+    assert compound["hits"][0]["message"]["provider_message_id"] == "ko"
+
+
+def test_message_search_uses_bounded_relevance_candidates_not_recent_row_limit(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO conversations(project_id, provider, workspace_id, "
+            "conversation_id, title, updated_at) VALUES (?, 'slack', 'T1', "
+            "'C1', 'search', '2026-07-28T00:00:00+00:00')",
+            (project_id,),
+        )
+        conn.execute(
+            "INSERT INTO coverage(project_id, provider, workspace_id, "
+            "conversation_id, contiguous_since, last_sequence, last_event_at, state) "
+            "VALUES (?, 'slack', 'T1', 'C1', '2026-07-20T00:00:00+00:00', "
+            "1, '2026-07-28T00:00:00+00:00', 'COLLECTING')",
+            (project_id,),
+        )
+        conn.execute(
+            "INSERT INTO messages(project_id, provider, workspace_id, "
+            "conversation_id, provider_message_id, sender_id, text, "
+            "provider_payload_json, occurred_at, inserted_at, updated_at) "
+            "VALUES (?, 'slack', 'T1', 'C1', 'target', 'U1', "
+            "'희귀검색어 rare-search-target', '{}', "
+            "'2026-07-20T00:00:01+00:00', '2026-07-20T00:00:01+00:00', "
+            "'2026-07-20T00:00:01+00:00')",
+            (project_id,),
+        )
+        for index in range(1200):
+            occurred_at = f"2026-07-27T{index // 3600:02d}:{index // 60 % 60:02d}:{index % 60:02d}+00:00"
+            conn.execute(
+                "INSERT INTO messages(project_id, provider, workspace_id, "
+                "conversation_id, provider_message_id, sender_id, text, "
+                "provider_payload_json, occurred_at, inserted_at, updated_at) "
+                "VALUES (?, 'slack', 'T1', 'C1', ?, 'U1', "
+                "'ordinary unrelated activity', '{}', ?, ?, ?)",
+                (project_id, f"noise-{index}", occurred_at, occurred_at, occurred_at),
+            )
+
+    store_module = sys.modules[module.MessageStore.__module__]
+    original_rank = store_module._rank_message_rows
+    ranked_row_counts = []
+
+    def capture_rows(rows, *, query, limit):
+        ranked_row_counts.append(len(rows))
+        return original_rank(rows, query=query, limit=limit)
+
+    monkeypatch.setattr(store_module, "_rank_message_rows", capture_rows)
+    result = store.query(
+        {
+            "operation": "search",
+            "query": "희귀검색어",
+            "start": "2026-07-20T00:00:00+00:00",
+            "end": "2026-07-28T00:00:00+00:00",
+            "providers": ["slack"],
+            "workspace_ids": ["T1"],
+            "allowed_source_ids": ["slack:T1:C1"],
+            "limit": 3,
+        }
+    )
+
+    assert result["hits"][0]["message"]["provider_message_id"] == "target"
+    assert ranked_row_counts
+    assert (
+        ranked_row_counts[0]
+        <= store_module.MESSAGE_SEARCH_CONTEXT_ROW_LIMIT
+    )
+    assert ranked_row_counts[0] < 1201
 
 
 def test_message_edit_preserves_history_time_and_order(tmp_path, monkeypatch):

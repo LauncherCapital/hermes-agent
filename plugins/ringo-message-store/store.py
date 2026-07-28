@@ -9,7 +9,6 @@ import os
 import re
 import threading
 import time
-import unicodedata
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,10 +29,17 @@ from .file_processing import (
     inspect_slack_image,
     process_slack_file,
 )
+from .search_text import (
+    normalize_search_text,
+    search_feature_set,
+    search_features,
+    search_index_terms,
+    search_segments,
+)
 
 
 logger = logging.getLogger(__name__)
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 PROTOCOL_VERSION = 2
 PROTOCOL_CAPABILITIES = (
     "acl_metadata",
@@ -58,22 +64,19 @@ FILE_SEARCH_MIN_SEMANTIC_SCORE = 0.80
 FILE_SEARCH_MIN_LEXICAL_COVERAGE = 0.25
 MAX_FILE_PROCESSING_ATTEMPTS = 3
 MESSAGE_SEARCH_ADJACENCY_SECONDS = 10 * 60
-MESSAGE_SEARCH_MIN_TERM_COVERAGE = 0.6
+MESSAGE_SEARCH_CANDIDATE_LIMIT = 200
+MESSAGE_SEARCH_CONTEXT_ROW_LIMIT = 5_000
+MESSAGE_SEARCH_MAX_ROWS_PER_ROOT = 100
+MESSAGE_SEARCH_MIN_FEATURE_COVERAGE = 0.30
+MESSAGE_SEARCH_MAX_QUERY_TERMS = 96
 
 
 def _search_words(text: str) -> list[str]:
-    normalized = unicodedata.normalize("NFKC", text).casefold()
-    return re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
+    return search_segments(text)
 
 
 def _search_features(text: str) -> Counter[str]:
-    features: Counter[str] = Counter()
-    for word in _search_words(text):
-        features[f"w:{word}"] += 1
-        if len(word) >= 3:
-            for index in range(len(word) - 2):
-                features[f"c:{word[index : index + 3]}"] += 1
-    return features
+    return search_features(text)
 
 
 def _row_search_text(row: Any) -> str:
@@ -174,7 +177,6 @@ def _rank_message_rows(
             units.append(unit)
 
     document_features: list[Counter[str]] = []
-    document_words: list[set[str]] = []
     for unit in units:
         core_text = " ".join(_row_search_text(row) for row in unit["core"])
         adjacent_text = " ".join(_row_search_text(row) for row in unit["adjacent"])
@@ -182,7 +184,6 @@ def _rank_message_rows(
         for feature, count in _search_features(adjacent_text).items():
             features[feature] += count * 0.35
         document_features.append(features)
-        document_words.append(set(_search_words(f"{core_text} {adjacent_text}")))
 
     document_count = len(units)
     if not document_count:
@@ -193,21 +194,20 @@ def _rank_message_rows(
     }
     lengths = [sum(features.values()) for features in document_features]
     average_length = sum(lengths) / document_count or 1.0
-    required_terms = math.ceil(len(query_words) * MESSAGE_SEARCH_MIN_TERM_COVERAGE)
     ranked: list[tuple[float, dict[str, Any]]] = []
-    normalized_query = unicodedata.normalize("NFKC", query).casefold()
+    normalized_query = normalize_search_text(query)
+    total_query_features = sum(query_features.values())
     for index, unit in enumerate(units):
-        matched_terms = {
-            word
-            for word in query_words
-            if word in document_words[index]
-            or word
-            in unicodedata.normalize(
-                "NFKC",
-                " ".join(_row_search_text(row) for row in unit["context"]),
-            ).casefold()
-        }
-        if len(matched_terms) < required_terms:
+        matched_feature_count = sum(
+            min(count, document_features[index][feature])
+            for feature, count in query_features.items()
+        )
+        feature_coverage = (
+            matched_feature_count / total_query_features
+            if total_query_features
+            else 0.0
+        )
+        if feature_coverage < MESSAGE_SEARCH_MIN_FEATURE_COVERAGE:
             continue
         score = 0.0
         for feature, query_count in query_features.items():
@@ -224,14 +224,12 @@ def _rank_message_rows(
             score += (
                 inverse_frequency * (term_frequency * 2.2 / denominator) * query_count
             )
-        core_text = unicodedata.normalize(
-            "NFKC",
-            " ".join(_row_search_text(row) for row in unit["core"]),
-        ).casefold()
-        context_text = unicodedata.normalize(
-            "NFKC",
-            " ".join(_row_search_text(row) for row in unit["context"]),
-        ).casefold()
+        core_text = normalize_search_text(
+            " ".join(_row_search_text(row) for row in unit["core"])
+        )
+        context_text = normalize_search_text(
+            " ".join(_row_search_text(row) for row in unit["context"])
+        )
         if normalized_query in core_text:
             score += 2.0
         elif normalized_query in context_text:
@@ -551,6 +549,7 @@ ALTER TABLE file_shares
 ALTER TABLE file_shares
     ADD COLUMN parent_embedding_error TEXT;
 """
+_MIGRATION_V8 = ""
 _MIGRATIONS = {
     1: _SCHEMA,
     2: _MIGRATION_V2,
@@ -559,7 +558,42 @@ _MIGRATIONS = {
     5: _MIGRATION_V5,
     6: _MIGRATION_V6,
     7: _MIGRATION_V7,
+    8: _MIGRATION_V8,
 }
+
+_MESSAGE_SEARCH_INDEX_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS message_search_fts USING fts5(
+    text,
+    tokenize='unicode61 remove_diacritics 2'
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS message_search_trigram USING fts5(
+    text,
+    tokenize='trigram'
+);
+CREATE TRIGGER IF NOT EXISTS message_search_insert
+AFTER INSERT ON messages WHEN new.deleted_at IS NULL BEGIN
+    INSERT INTO message_search_fts(rowid, text)
+    VALUES (new.rowid, ringo_search_index_text(new.text));
+    INSERT INTO message_search_trigram(rowid, text)
+    VALUES (new.rowid, ringo_search_normalize(new.text));
+END;
+CREATE TRIGGER IF NOT EXISTS message_search_delete
+AFTER DELETE ON messages BEGIN
+    DELETE FROM message_search_fts WHERE rowid = old.rowid;
+    DELETE FROM message_search_trigram WHERE rowid = old.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS message_search_update
+AFTER UPDATE OF text, deleted_at ON messages BEGIN
+    DELETE FROM message_search_fts WHERE rowid = old.rowid;
+    DELETE FROM message_search_trigram WHERE rowid = old.rowid;
+    INSERT INTO message_search_fts(rowid, text)
+    SELECT new.rowid, ringo_search_index_text(new.text)
+    WHERE new.deleted_at IS NULL;
+    INSERT INTO message_search_trigram(rowid, text)
+    SELECT new.rowid, ringo_search_normalize(new.text)
+    WHERE new.deleted_at IS NULL;
+END;
+"""
 
 
 class MessageStore:
@@ -583,6 +617,7 @@ class MessageStore:
         self.database = EncryptedDatabase(self.path)
         self.database.prepare()
         ensure_project_encryption_key(self.project_id, self.key_version)
+        self.message_search_index_available = False
         self._migrate()
         cleanup_stale_temp_files()
 
@@ -660,10 +695,48 @@ class MessageStore:
                     "WHERE key='file_index_store_generation'"
                 ).fetchone()[0]
             )
+            self.message_search_index_available = (
+                self._ensure_message_search_index(conn)
+            )
         try:
             os.chmod(self.path, 0o600)
         except OSError:
             pass
+
+    @staticmethod
+    def _ensure_message_search_index(conn: Any) -> bool:
+        """Create and backfill optional FTS indexes without risking store startup."""
+        try:
+            conn.executescript(_MESSAGE_SEARCH_INDEX_SQL)
+            version = conn.execute(
+                "SELECT value FROM schema_meta "
+                "WHERE key='message_search_index_version'"
+            ).fetchone()
+            if version is None or str(version[0]) != "2":
+                conn.execute("DELETE FROM message_search_fts")
+                conn.execute("DELETE FROM message_search_trigram")
+                conn.execute(
+                    "INSERT INTO message_search_fts(rowid, text) "
+                    "SELECT rowid, ringo_search_index_text(text) FROM messages "
+                    "WHERE deleted_at IS NULL"
+                )
+                conn.execute(
+                    "INSERT INTO message_search_trigram(rowid, text) "
+                    "SELECT rowid, ringo_search_normalize(text) FROM messages "
+                    "WHERE deleted_at IS NULL"
+                )
+                conn.execute(
+                    "INSERT INTO schema_meta(key, value) VALUES "
+                    "('message_search_index_version', '2') "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+                )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Message search index unavailable; local search will fail open: %s",
+                type(exc).__name__,
+            )
+            return False
 
     def record_envelope(self, envelope: dict[str, Any], body_sha256: str) -> dict:
         """Commit delivery metadata and cursor atomically; duplicates are harmless."""
@@ -1734,14 +1807,7 @@ class MessageStore:
 
     @staticmethod
     def _file_search_tokens(value: Any) -> set[str]:
-        return {
-            token
-            for token in re.findall(
-                r"[0-9A-Za-z가-힣_]+",
-                str(value or "").lower(),
-            )
-            if token
-        }
+        return search_feature_set(value)
 
     @staticmethod
     def _file_search_cosine(left: list[float], right: list[float]) -> float:
@@ -2953,6 +3019,172 @@ class MessageStore:
             ),
         )
 
+    @staticmethod
+    def _message_search_match_query(segments: list[str]) -> str:
+        return " OR ".join(
+            f'"{segment.replace(chr(34), chr(34) * 2)}"'
+            for segment in list(dict.fromkeys(segments))[
+                :MESSAGE_SEARCH_MAX_QUERY_TERMS
+            ]
+            if segment
+        )
+
+    def _message_search_candidate_rowids(
+        self,
+        conn: Any,
+        *,
+        query: str,
+        start: str,
+        end: str,
+        providers: set[str],
+        workspaces: set[str],
+        conversations: set[str],
+        allowed: set[tuple[str, str, str]] | None,
+    ) -> list[int]:
+        """Retrieve a relevance-bounded candidate set inside SQLite."""
+        segments = search_segments(query)
+        ranked: dict[int, float] = {}
+
+        def collect_fts(table: str, match_query: str) -> None:
+            if not match_query:
+                return
+            sql = (
+                f"SELECT m.rowid AS message_rowid, bm25({table}) AS search_rank "
+                f"FROM {table} JOIN messages m ON m.rowid={table}.rowid "
+                f"WHERE {table} MATCH ? AND m.project_id=? "
+                "AND m.occurred_at>=? AND m.occurred_at<=? "
+                "AND m.deleted_at IS NULL"
+            )
+            params: list[Any] = [match_query, self.project_id, start, end]
+            sql, params = self._query_filters(
+                sql,
+                params,
+                providers=providers,
+                workspaces=workspaces,
+                conversations=conversations,
+                prefix="m.",
+                allowed=allowed,
+            )
+            sql += f" ORDER BY bm25({table}), m.occurred_at DESC LIMIT ?"
+            params.append(MESSAGE_SEARCH_CANDIDATE_LIMIT)
+            for row in conn.execute(sql, params).fetchall():
+                rowid = int(row["message_rowid"])
+                rank = float(row["search_rank"] or 0.0)
+                ranked[rowid] = min(ranked.get(rowid, rank), rank)
+
+        collect_fts(
+            "message_search_fts",
+            self._message_search_match_query(
+                [*segments, *search_index_terms(query)]
+            ),
+        )
+        collect_fts(
+            "message_search_trigram",
+            self._message_search_match_query(
+                [segment for segment in segments if len(segment) >= 3]
+            ),
+        )
+
+        # Single-character substring search cannot be represented by either
+        # trigrams or the language-neutral bigram terms.
+        single_character_segments = list(
+            dict.fromkeys(segment for segment in segments if len(segment) < 2)
+        )
+        if single_character_segments:
+            sql = (
+                "SELECT m.rowid AS message_rowid FROM messages m "
+                "WHERE m.project_id=? AND m.occurred_at>=? AND m.occurred_at<=? "
+                "AND m.deleted_at IS NULL AND ("
+                + " OR ".join(
+                    "instr(ringo_search_normalize(m.text), ?) > 0"
+                    for _segment in single_character_segments
+                )
+                + ")"
+            )
+            params = [self.project_id, start, end, *single_character_segments]
+            sql, params = self._query_filters(
+                sql,
+                params,
+                providers=providers,
+                workspaces=workspaces,
+                conversations=conversations,
+                prefix="m.",
+                allowed=allowed,
+            )
+            sql += " ORDER BY m.occurred_at DESC LIMIT ?"
+            params.append(MESSAGE_SEARCH_CANDIDATE_LIMIT)
+            for row in conn.execute(sql, params).fetchall():
+                ranked.setdefault(int(row["message_rowid"]), 1_000.0)
+
+        return [
+            rowid
+            for rowid, _rank in sorted(
+                ranked.items(),
+                key=lambda item: (item[1], item[0]),
+            )[:MESSAGE_SEARCH_CANDIDATE_LIMIT]
+        ]
+
+    def _message_search_context_rows(
+        self,
+        conn: Any,
+        *,
+        candidate_rowids: list[int],
+        start: str,
+        end: str,
+    ) -> list[Any]:
+        """Fetch bounded whole-thread context for the indexed candidates."""
+        if not candidate_rowids:
+            return []
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS message_search_candidates("
+            "message_rowid INTEGER PRIMARY KEY, priority INTEGER NOT NULL)"
+        )
+        conn.execute("DELETE FROM message_search_candidates")
+        conn.executemany(
+            "INSERT INTO message_search_candidates(message_rowid, priority) "
+            "VALUES (?, ?)",
+            [(rowid, priority) for priority, rowid in enumerate(candidate_rowids)],
+        )
+        sql = (
+            "WITH candidate_roots AS (SELECT m.project_id, m.provider, "
+            "m.workspace_id, m.conversation_id, COALESCE("
+            "m.parent_message_id, m.provider_message_id) AS root_id, "
+            "MIN(candidate.priority) AS priority "
+            "FROM message_search_candidates candidate "
+            "JOIN messages m ON m.rowid=candidate.message_rowid "
+            "GROUP BY m.project_id, m.provider, m.workspace_id, "
+            "m.conversation_id, COALESCE("
+            "m.parent_message_id, m.provider_message_id)), "
+            "scoped AS (SELECT m.*, c.title AS conversation_title, "
+            "i.display_name AS sender_display_name, root.priority, "
+            "ROW_NUMBER() OVER (PARTITION BY m.provider, m.workspace_id, "
+            "m.conversation_id, root.root_id ORDER BY m.occurred_at) "
+            "AS root_row_number FROM messages m JOIN candidate_roots root "
+            "ON root.project_id=m.project_id AND root.provider=m.provider "
+            "AND root.workspace_id=m.workspace_id "
+            "AND root.conversation_id=m.conversation_id "
+            "AND root.root_id=COALESCE("
+            "m.parent_message_id, m.provider_message_id) "
+            "LEFT JOIN conversations c ON c.project_id=m.project_id AND "
+            "c.provider=m.provider AND c.workspace_id=m.workspace_id AND "
+            "c.conversation_id=m.conversation_id LEFT JOIN identities i ON "
+            "i.project_id=m.project_id AND i.provider=m.provider AND "
+            "i.workspace_id=m.workspace_id AND i.external_user_id=m.sender_id "
+            "WHERE m.project_id=? AND m.occurred_at>=? AND m.occurred_at<=? "
+            "AND m.deleted_at IS NULL) SELECT * FROM scoped "
+            "WHERE root_row_number<=? ORDER BY priority, occurred_at LIMIT ?"
+        )
+        return conn.execute(
+            sql,
+            (
+                self.project_id,
+                start,
+                end,
+                MESSAGE_SEARCH_MAX_ROWS_PER_ROOT,
+                MESSAGE_SEARCH_CONTEXT_ROW_LIMIT,
+            ),
+        ).fetchall()
+
     def query(self, request: dict[str, Any]) -> dict[str, Any]:
         """Bounded project-local read after IE has resolved current ACL."""
         operation = str(request.get("operation") or "")
@@ -3175,7 +3407,28 @@ class MessageStore:
                 "m.provider_message_id DESC"
             )
             if operation == "search":
-                rows = conn.execute(sql, params).fetchall()
+                if not self.message_search_index_available:
+                    return {
+                        "hits": [],
+                        "coverage_complete": False,
+                        "reason": "search_index_unavailable",
+                    }
+                candidate_rowids = self._message_search_candidate_rowids(
+                    conn,
+                    query=search_query,
+                    start=start,
+                    end=end,
+                    providers=providers,
+                    workspaces=workspaces,
+                    conversations=conversations,
+                    allowed=allowed,
+                )
+                rows = self._message_search_context_rows(
+                    conn,
+                    candidate_rowids=candidate_rowids,
+                    start=start,
+                    end=end,
+                )
                 floor = max(str(row["contiguous_since"]) for row in coverage_rows)
                 return {
                     "hits": _rank_message_rows(

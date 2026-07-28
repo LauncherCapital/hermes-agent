@@ -75,7 +75,7 @@ class TestConfigParsing:
     def test_default_when_missing(self):
         from tools.tool_search import ToolSearchConfig
         cfg = ToolSearchConfig.from_raw(None)
-        assert cfg.enabled == "auto"
+        assert cfg.enabled == "off"
         assert cfg.threshold_pct == 10.0
         assert cfg.threshold_tokens == 20_000
 
@@ -94,10 +94,10 @@ class TestConfigParsing:
         cfg = ToolSearchConfig.from_raw({"enabled": "on"})
         assert cfg.enabled == "on"
 
-    def test_invalid_enabled_falls_back_to_auto(self):
+    def test_invalid_enabled_falls_back_to_off(self):
         from tools.tool_search import ToolSearchConfig
         cfg = ToolSearchConfig.from_raw({"enabled": "maybe"})
-        assert cfg.enabled == "auto"
+        assert cfg.enabled == "off"
 
     def test_threshold_clamped(self):
         from tools.tool_search import ToolSearchConfig
@@ -300,7 +300,7 @@ class TestAssembly:
             result = assemble_tool_defs(
                 defs,
                 context_length=1_000_000,
-                config=ToolSearchConfig.from_raw(None),
+                config=ToolSearchConfig.from_raw({"enabled": "auto"}),
             )
 
         assert 80_500 <= result.deferred_tokens <= 80_900

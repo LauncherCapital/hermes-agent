@@ -9,10 +9,10 @@ for the full rationale):
 
 * Core tools defined in ``toolsets._HERMES_CORE_TOOLS`` are *never* deferred.
   Always-load means always-load. No exceptions.
-* The threshold gate runs every assembly: when deferrable tools would consume
-  less than both ``threshold_pct`` of the model's context window (default 10%)
-  and ``threshold_tokens`` (default 20K), tool search is a no-op and the tools
-  array passes through unchanged.
+* Tool search is disabled unless config explicitly enables the rollout. In
+  ``auto`` mode, the threshold gate runs every assembly: when deferrable tools
+  would consume less than both ``threshold_pct`` of the model's context window
+  (default 10%) and ``threshold_tokens`` (default 20K), tool search is a no-op.
 * The catalog is stateless across turns and tools-array assemblies. It is
   rebuilt from the current tool-defs list every time. This is the lesson
   from OpenClaw's cron regression (openclaw/openclaw#84141): a session-keyed
@@ -91,11 +91,11 @@ class ToolSearchConfig:
                        threshold_tokens=DEFAULT_THRESHOLD_TOKENS,
                        search_default_limit=5, max_search_limit=20)
         if not isinstance(raw, dict):
-            return cls(enabled="auto", threshold_pct=10.0,
+            return cls(enabled="off", threshold_pct=10.0,
                        threshold_tokens=DEFAULT_THRESHOLD_TOKENS,
                        search_default_limit=5, max_search_limit=20)
 
-        enabled_raw = str(raw.get("enabled", "auto")).strip().lower()
+        enabled_raw = str(raw.get("enabled", "off")).strip().lower()
         if enabled_raw in ("true", "1", "yes"):
             enabled = "on"
         elif enabled_raw in ("false", "0", "no"):
@@ -103,7 +103,7 @@ class ToolSearchConfig:
         elif enabled_raw in ("auto", "on", "off"):
             enabled = enabled_raw
         else:
-            enabled = "auto"
+            enabled = "off"
 
         threshold_pct = _safe_float(raw.get("threshold_pct"), 10.0)
         threshold_pct = max(0.0, min(100.0, threshold_pct))

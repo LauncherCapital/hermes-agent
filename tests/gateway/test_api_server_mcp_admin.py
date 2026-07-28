@@ -236,6 +236,26 @@ class TestAdminConfig:
             assert resp.status == 400
 
     @pytest.mark.asyncio
+    async def test_tool_search_canary_config_applies_live(self, adapter):
+        from hermes_cli.config import load_config
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/admin/config",
+                json={"tools": {"tool_search": {"enabled": "auto"}}},
+            )
+            assert resp.status == 200
+            assert (await resp.json())["applied"]["tool_search"] == "auto"
+            assert load_config()["tools"]["tool_search"]["enabled"] == "auto"
+
+            resp = await cli.post(
+                "/admin/config",
+                json={"tools": {"tool_search": {"enabled": "invalid"}}},
+            )
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
     async def test_mcp_addition_uses_incremental_discovery(self, adapter):
         """Adding a server must not drop live connections (no full shutdown)."""
         from hermes_cli.config import load_config

@@ -2079,7 +2079,7 @@ DEFAULT_CONFIG = {
     # openclaw-tool-search-report PDF in this PR for the rationale.
     "tools": {
         "tool_search": {
-            # "auto" (default) — activate only when deferrable tool schemas
+            # "auto" — activate only when deferrable tool schemas
             #   reach either ``threshold_pct`` of the active model's context
             #   length or the absolute ``threshold_tokens`` budget, so small
             #   toolsets pay no overhead on large-context models.
@@ -2087,7 +2087,8 @@ DEFAULT_CONFIG = {
             #   tool. Use when you have many MCP servers and want maximum
             #   token reduction unconditionally.
             # "off" — disable entirely. Tools-array assembly is a pass-through.
-            "enabled": "auto",
+            # Default off: Ringo enables auto only for project-scoped canaries.
+            "enabled": "off",
             # Percentage of context length at which "auto" mode kicks in.
             # 10 matches the Claude Code default. Range 0..100.
             "threshold_pct": 10,
