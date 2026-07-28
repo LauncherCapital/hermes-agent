@@ -1835,8 +1835,8 @@ class MessageStore:
         context_query = str(request.get("context_query") or "").strip()
         scope_revision = str(request.get("allowed_scope_revision") or "")
         window_started_at = str(request.get("window_started_at") or "")
-        if not provider or not workspace_id or not query or not scope_revision:
-            raise ValueError("file search scope and query are required")
+        if not provider or not workspace_id or not scope_revision:
+            raise ValueError("file search scope is required")
         conversations = self._allowed_file_sources(
             request.get("allowed_source_ids"),
             provider=provider,
@@ -1911,13 +1911,13 @@ class MessageStore:
         } if isinstance(raw_types, list) else set()
         query_embedding: list[float] = []
         context_query_embedding: list[float] = []
-        if context_query:
+        if query and context_query:
             try:
                 embeddings, _ = embed_texts([query, context_query])
                 query_embedding, context_query_embedding = embeddings
             except FileProcessingError:
                 pass
-        else:
+        elif query:
             try:
                 query_embedding, _ = embed_text(query)
             except FileProcessingError:
@@ -2005,6 +2005,8 @@ class MessageStore:
                 ) * 4.0
             else:
                 retrieval_score += semantic_signal * 4.0
+            if not query:
+                retrieval_score = 1.0
             if retrieval_score <= 0:
                 continue
             candidates.append(
@@ -2033,7 +2035,13 @@ class MessageStore:
                     "has_parent_embedding": has_parent_embedding,
                 }
             )
-        if context_query:
+        if not query:
+            retrieved = sorted(
+                candidates,
+                key=lambda item: str(item.get("shared_at") or ""),
+                reverse=True,
+            )[:FILE_SEARCH_RETRIEVE_LIMIT]
+        elif context_query:
             # Direct lexical scores and embedding cosine scores have unrelated
             # scales. Rank fusion prevents a long exact-match thread from
             # crowding out a newer discussion found through parent context.
@@ -2184,30 +2192,31 @@ class MessageStore:
             for token in query_tokens
         }
         total_query_weight = sum(query_token_weights.values())
-        relevant = []
-        for item, direct_evidence_tokens in zip(
-            reranked, direct_token_sets, strict=True
-        ):
-            direct_coverage = (
-                sum(
-                    query_token_weights[token]
-                    for token in query_tokens & direct_evidence_tokens
-                )
-                / total_query_weight
-                if total_query_weight
-                else 0.0
-            )
-            if (
-                (
-                    bool(context_query)
-                    and item["has_parent_embedding"]
-                    and float(item.get("parent_semantic_score") or 0.0) >= 0.2
-                )
-                or direct_coverage >= FILE_SEARCH_MIN_LEXICAL_COVERAGE
-                or float(item.get("semantic_score") or 0.0)
-                >= FILE_SEARCH_MIN_SEMANTIC_SCORE
+        relevant = list(reranked) if not query else []
+        if query:
+            for item, direct_evidence_tokens in zip(
+                reranked, direct_token_sets, strict=True
             ):
-                relevant.append(item)
+                direct_coverage = (
+                    sum(
+                        query_token_weights[token]
+                        for token in query_tokens & direct_evidence_tokens
+                    )
+                    / total_query_weight
+                    if total_query_weight
+                    else 0.0
+                )
+                if (
+                    (
+                        bool(context_query)
+                        and item["has_parent_embedding"]
+                        and float(item.get("parent_semantic_score") or 0.0) >= 0.2
+                    )
+                    or direct_coverage >= FILE_SEARCH_MIN_LEXICAL_COVERAGE
+                    or float(item.get("semantic_score") or 0.0)
+                    >= FILE_SEARCH_MIN_SEMANTIC_SCORE
+                ):
+                    relevant.append(item)
         limit = max(1, min(int(request.get("limit") or 3), 20))
         output = []
         for item in relevant[:limit]:
@@ -2246,7 +2255,11 @@ class MessageStore:
                 | {
                     "description": description[:2_000] or None,
                     "why_matched": " | ".join(evidence)[:320]
-                    or "metadata match",
+                    or (
+                        "recent file in selected scope"
+                        if not query
+                        else "metadata match"
+                    ),
                 }
             )
         return {
