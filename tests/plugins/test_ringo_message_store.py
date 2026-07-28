@@ -189,6 +189,7 @@ async def test_claim_initializes_schema_key_and_idempotent_delivery(tmp_path, mo
         "event_batch",
         "file_index_v1",
         "ingest_window",
+        "message_search_v1",
         "reconciliation_events",
         "stable_cursor",
     } <= set(health["capabilities"])
@@ -232,6 +233,7 @@ def test_schema_v6_upgrades_existing_v5_file_rows(tmp_path, monkeypatch):
     write_project_marker(project_id)
     _manager, module = _load_service()
     store = module.MessageStore(project_id)
+    old_generation = store.store_generation
     store.apply_file_command(
         {
             "project_id": project_id,
@@ -257,11 +259,59 @@ def test_schema_v6_upgrades_existing_v5_file_rows(tmp_path, monkeypatch):
         content = conn.execute(
             "SELECT file_id, processing_attempts FROM file_contents"
         ).fetchone()
+        share_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(file_shares)")
+        }
         assert (
             conn.execute("PRAGMA user_version").fetchone()[0]
             == _message_store_schema_version(module)
         )
     assert tuple(content) == ("F1", 0)
+    assert "parent_embedding_json" in share_columns
+    assert reopened.store_generation != old_generation
+
+
+def test_schema_v8_backfills_existing_messages_into_search_index(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    with store._connect() as conn:
+        for trigger in (
+            "message_search_insert",
+            "message_search_delete",
+            "message_search_update",
+        ):
+            conn.execute(f"DROP TRIGGER {trigger}")
+        conn.execute("DROP TABLE message_search_fts")
+        conn.execute("DROP TABLE message_search_trigram")
+        conn.execute(
+            "DELETE FROM schema_meta WHERE key='message_search_index_version'"
+        )
+        conn.execute(
+            "INSERT INTO messages(project_id, provider, workspace_id, "
+            "conversation_id, provider_message_id, text, occurred_at, "
+            "inserted_at, updated_at) VALUES (?, 'slack', 'T1', 'C1', 'M1', "
+            "'月文堂の料金を変更', '2026-07-27T00:00:00+00:00', "
+            "'2026-07-27T00:00:00+00:00', '2026-07-27T00:00:00+00:00')",
+            (project_id,),
+        )
+        conn.execute("PRAGMA user_version=7")
+
+    reopened = module.MessageStore(project_id, path=store.path)
+
+    with reopened._connect() as conn:
+        assert (
+            conn.execute(
+                "SELECT count(*) FROM message_search_trigram "
+                "WHERE message_search_trigram MATCH '\"料金を変更\"'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
 
 
 def test_retention_removes_expired_messages_reactions_and_deliveries(
@@ -1617,6 +1667,332 @@ def test_file_search_keeps_high_semantic_candidate_without_token_overlap(
     assert [item["file_id"] for item in result["files"]] == ["F1"]
 
 
+def test_file_search_lexical_features_are_unicode_script_agnostic(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+
+    for query, document in (
+        ("料金を変更", "月文堂の料金を変更してください"),
+        ("价格调整", "月文堂订阅价格调整说明"),
+        ("تعديل السعر", "طلب تعديل السعر الشهري"),
+        ("тариф обновлён", "Тариф обновлён для подписки"),
+        ("résumé tarif", "Résumé du tarif révisé"),
+    ):
+        assert store._file_search_tokens(query) & store._file_search_tokens(document)
+
+
+def test_parent_context_embedding_is_reused_across_thread_attachments(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+    embedded = []
+
+    def fake_embed(text):
+        embedded.append(text)
+        return [0.6, 0.8], "embedding-test"
+
+    monkeypatch.setattr(store_module, "embed_text", fake_embed)
+    for index in range(2):
+        store.apply_file_command(
+            {
+                "project_id": project_id,
+                "store_generation": store.store_generation,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "operation": "upsert_share",
+                "file_id": f"F{index}",
+                "conversation_id": "C1",
+                "provider_message_id": f"M{index}",
+                "source_version": index + 1,
+                "processing_status": "indexed",
+                "thread_context": "shared design discussion",
+                "upload_text": f"option {index}",
+            }
+        )
+
+    processed = store._process_pending_parent_embeddings(
+        provider="slack",
+        workspace_id="T1",
+        limit=3,
+    )
+
+    with store._connect() as conn:
+        rows = conn.execute(
+            "SELECT parent_embedding_json, parent_embedding_model "
+            "FROM file_shares ORDER BY file_id"
+        ).fetchall()
+    assert processed == 2
+    assert embedded == ["shared design discussion"]
+    assert [json.loads(row["parent_embedding_json"]) for row in rows] == [
+        [0.6, 0.8],
+        [0.6, 0.8],
+    ]
+    assert {row["parent_embedding_model"] for row in rows} == {
+        "embedding-test"
+    }
+
+
+def test_direct_file_search_does_not_promote_unrequested_thread_context(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+    monkeypatch.setattr(
+        store_module,
+        "embed_text",
+        lambda _text: ([1.0, 0.0], "embedding-test"),
+    )
+    for file_id, child_embedding, parent_embedding in (
+        ("F-direct", [0.9, 0.43589], [0.1, 0.994987]),
+        ("F-context", [0.1, 0.994987], [0.8, 0.6]),
+    ):
+        store.apply_file_command(
+            {
+                "project_id": project_id,
+                "store_generation": store.store_generation,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "operation": "upsert_share",
+                "file_id": file_id,
+                "conversation_id": "C1",
+                "provider_message_id": file_id,
+                "source_version": 1,
+                "processing_status": "indexed",
+                "caption_ocr": file_id,
+                "text_content_embedding": child_embedding,
+                "parent_embedding": parent_embedding,
+                "shared_at": "2026-07-28T00:00:00+00:00",
+            }
+        )
+
+    result = store.search_file_index(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "query": "exact attachment content",
+            "allowed_source_ids": ["slack:T1:C1"],
+            "allowed_scope_revision": "scope-1",
+        }
+    )
+
+    assert [item["file_id"] for item in result["files"]] == ["F-direct"]
+
+
+def test_file_search_finds_recent_profile_candidates_from_thread_context(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+    monkeypatch.setattr(
+        store_module,
+        "embed_text",
+        lambda _text: ([1.0, 0.0], "embedding-test"),
+    )
+    monkeypatch.setattr(
+        store_module,
+        "embed_texts",
+        lambda texts: ([[1.0, 0.0] for _text in texts], "embedding-test"),
+    )
+    thread_context = (
+        "링고방\n"
+        "앱 아이콘 후보입니다\n"
+        "귀엽던지, 문학적이던지, 기술적인 느낌이 아니면 좋겠다"
+    )
+    target_ids = {
+        "F0BKBRY7HV2",
+        "F0BKBS29JAY",
+        "F0BK89G6USE",
+        "F0BK69PV6EA",
+        "F0BJT4LMWFR",
+        "F0BK8FFEM42",
+    }
+    fixtures = [
+        (
+            "F0BKBRY7HV2",
+            "image.png",
+            "image/png",
+            "Logo and app icon exploration board with green apple variations.",
+            [0.18, 0.983666],
+            thread_context,
+            "2026-07-23T05:22:37+00:00",
+        ),
+        (
+            "F0BKBS29JAY",
+            "image.png",
+            "image/png",
+            "Monochrome mascot reference with radial light.",
+            [0.18, 0.983666],
+            thread_context,
+            "2026-07-23T05:23:27+00:00",
+        ),
+        (
+            "F0BK89G6USE",
+            "image.png",
+            "image/png",
+            "Simple green apple app icon.",
+            [0.18, 0.983666],
+            thread_context,
+            "2026-07-23T05:49:20+00:00",
+        ),
+        (
+            "F0BK69PV6EA",
+            "image.png",
+            "image/png",
+            "Green apple app icon on a blue rounded-square background.",
+            [0.18, 0.983666],
+            thread_context,
+            "2026-07-23T05:49:40+00:00",
+        ),
+        (
+            "F0BJT4LMWFR",
+            "image.png",
+            "image/png",
+            "White ghost mascot logo on a purple software page.",
+            [0.18, 0.983666],
+            thread_context,
+            "2026-07-23T06:25:01+00:00",
+        ),
+        (
+            "F0BK8FFEM42",
+            "image.png",
+            "image/png",
+            "Small white cartoon ghost app icon.",
+            [0.18, 0.983666],
+            thread_context,
+            "2026-07-23T06:25:14+00:00",
+        ),
+        (
+            "FNEWS",
+            "image.png",
+            "image/png",
+            "Newsletter screenshot with paragraphs and a chart.",
+            [0.10, 0.994987],
+            thread_context,
+            "2026-07-23T06:30:00+00:00",
+        ),
+        (
+            "F0BJMR92ENA",
+            "HANDOFF_AUTO_PIPELINE.md",
+            "text/plain",
+            "AI agent pipeline handoff and implementation instructions.",
+            [0.82, 0.572364],
+            "캐릭터 카드 자동화 작업",
+            "2026-07-21T08:01:35+00:00",
+        ),
+        (
+            "F0BDLGY9X39",
+            "image.png",
+            "image/png",
+            "Korean explanatory document with headings and bullet lists.",
+            [0.81, 0.58643],
+            "제품 개발 문서",
+            "2026-06-30T03:31:32+00:00",
+        ),
+    ]
+    inspections = {
+        file_id: caption
+        for file_id, _name, mimetype, caption, _embedding, _context, _shared_at
+        in fixtures
+        if mimetype == "image/png" and file_id != "F0BDLGY9X39"
+    }
+    monkeypatch.setattr(
+        store_module,
+        "inspect_slack_image",
+        lambda file_id, _token, _query: inspections.get(
+            file_id, "Unrelated workplace document."
+        ),
+    )
+    for index, (
+        file_id,
+        name,
+        mimetype,
+        caption,
+        embedding,
+        context,
+        shared_at,
+    ) in enumerate(fixtures):
+        store.apply_file_command(
+            {
+                "project_id": project_id,
+                "store_generation": store.store_generation,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "operation": "upsert_share",
+                "file_id": file_id,
+                "conversation_id": "C1",
+                "provider_message_id": f"M-{index}",
+                "source_version": index + 1,
+                "content_version": index + 1,
+                "context_version": index + 1,
+                "file_name": name,
+                "mime_type": mimetype,
+                "processing_status": "indexed",
+                "caption_ocr": caption,
+                "text_content_embedding": embedding,
+                "image_embedding": embedding,
+                "upload_text": (
+                    "새 시안입니다"
+                    if file_id in target_ids
+                    else "참고 자료"
+                ),
+                "thread_context": context,
+                "parent_embedding": (
+                    [0.363, 0.93179]
+                    if context == thread_context
+                    else [0.165, 0.98629]
+                    if file_id == "F0BJMR92ENA"
+                    else [0.131, 0.99138]
+                ),
+                "parent_embedding_model": "embedding-test",
+                "parent_embedding_dimension": 2,
+                "shared_at": shared_at,
+            }
+        )
+
+    result = store.search_file_index(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "query": "링고 프로필 아이콘 후보",
+            "context_query": "링고 리브랜딩 프로필 사진 논의",
+            "allowed_source_ids": ["slack:T1:C1"],
+            "allowed_scope_revision": "scope-1",
+            "limit": 20,
+            "provider_access_token": "xoxb-transient",
+        }
+    )
+
+    returned = {item["file_id"] for item in result["files"]}
+    assert target_ids <= returned
+    assert all(
+        item["description"]
+        for item in result["files"]
+        if item["file_id"] in target_ids
+    )
+
+
 def test_file_graph_batch_has_independent_ack_cursor_and_no_vectors(
     tmp_path, monkeypatch
 ):
@@ -2213,6 +2589,250 @@ def test_bounded_query_enforces_exact_acl_tuples_and_complete_coverage(
         "allowed-one",
         "allowed-two",
     }
+
+
+def test_message_search_recovers_price_change_thread_without_cross_thread_noise(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    messages = (
+        (
+            "C099U109ZM4",
+            "1784869080.000001",
+            None,
+            "월문당/CallMe 가격 변경 논의",
+            "2026-07-24T09:38:00+00:00",
+        ),
+        (
+            "C099U109ZM4",
+            "1784869142.677289",
+            None,
+            "단건 26,700원 -> 31,900원, 구독 26,000원 -> 33,900원",
+            "2026-07-24T09:39:02+00:00",
+        ),
+        (
+            "C099U109ZM4",
+            "1784869200.000001",
+            "1784869142.677289",
+            "Stripe 신규 Price 생성 방식입니다.",
+            "2026-07-24T09:40:00+00:00",
+        ),
+        (
+            "COTHER",
+            "1784869260.000001",
+            None,
+            "다른 서비스 가격 변경은 다음 분기에 검토합니다.",
+            "2026-07-24T09:41:00+00:00",
+        ),
+        (
+            "CSECRET",
+            "1784869320.000001",
+            None,
+            "월문당 가격 변경 Stripe 전체 키워드가 있지만 ACL 밖입니다.",
+            "2026-07-24T09:42:00+00:00",
+        ),
+    )
+    with store._connect() as conn:
+        for conversation_id in {"C099U109ZM4", "COTHER", "CSECRET"}:
+            conn.execute(
+                "INSERT INTO conversations(project_id, provider, workspace_id, "
+                "conversation_id, title, updated_at) VALUES (?, 'slack', 'T1', ?, ?, ?)",
+                (
+                    project_id,
+                    conversation_id,
+                    "billing" if conversation_id == "C099U109ZM4" else "random",
+                    "2026-07-24T10:00:00+00:00",
+                ),
+            )
+            conn.execute(
+                "INSERT INTO coverage(project_id, provider, workspace_id, "
+                "conversation_id, contiguous_since, last_sequence, last_event_at, state) "
+                "VALUES (?, 'slack', 'T1', ?, '2026-07-20T00:00:00+00:00', 6673, "
+                "'2026-07-26T00:00:00+00:00', 'COLLECTING')",
+                (project_id, conversation_id),
+            )
+        for conversation_id, message_id, parent_id, text, occurred_at in messages:
+            conn.execute(
+                "INSERT INTO messages(project_id, provider, workspace_id, "
+                "conversation_id, provider_message_id, parent_message_id, sender_id, "
+                "text, provider_payload_json, occurred_at, inserted_at, updated_at) "
+                "VALUES (?, 'slack', 'T1', ?, ?, ?, 'U1', ?, '{}', ?, ?, ?)",
+                (
+                    project_id,
+                    conversation_id,
+                    message_id,
+                    parent_id,
+                    text,
+                    occurred_at,
+                    occurred_at,
+                    occurred_at,
+                ),
+            )
+
+    scoped = {
+        "operation": "search",
+        "start": "2026-07-20T00:00:00+00:00",
+        "end": "2026-07-28T00:00:00+00:00",
+        "providers": ["slack"],
+        "workspace_ids": ["T1"],
+        "allowed_source_ids": ["slack:T1:C099U109ZM4", "slack:T1:COTHER"],
+        "limit": 10,
+    }
+    regression = store.query({**scoped, "query": "월문당 가격 변경 Stripe"})
+    direct = store.query({**scoped, "query": "31,900원"})
+    reply = store.query({**scoped, "query": "Stripe 신규 Price"})
+
+    assert regression["coverage_complete"] is True
+    assert len(regression["hits"]) == 1
+    assert regression["hits"][0]["message"]["conversation_id"] == "C099U109ZM4"
+    assert {
+        item["provider_message_id"] for item in regression["hits"][0]["context"]
+    } >= {"1784869142.677289", "1784869200.000001"}
+    assert all(
+        hit["message"]["conversation_id"] not in {"COTHER", "CSECRET"}
+        for hit in regression["hits"]
+    )
+    assert direct["hits"][0]["message"]["provider_message_id"] == "1784869142.677289"
+    assert reply["hits"][0]["message"]["provider_message_id"] == "1784869200.000001"
+    assert {item["provider_message_id"] for item in reply["hits"][0]["context"]} >= {
+        "1784869142.677289",
+        "1784869200.000001",
+    }
+
+
+def test_message_search_supports_unicode_scripts_without_language_dictionaries(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    fixtures = (
+        ("ja", "月文堂の料金を変更してください", "料金を変更"),
+        ("zh", "月文堂订阅价格调整说明", "价格调整"),
+        ("ar", "طلب تعديل السعر الشهري", "تعديل السعر"),
+        ("ru", "Тариф обновлён для подписки", "тариф обновлён"),
+        ("fr", "Résumé du tarif révisé", "résumé tarif"),
+        ("ko", "월문당가격조정요청", "가격조정"),
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO conversations(project_id, provider, workspace_id, "
+            "conversation_id, title, updated_at) VALUES (?, 'slack', 'T1', "
+            "'C1', 'pricing', '2026-07-28T00:00:00+00:00')",
+            (project_id,),
+        )
+        conn.execute(
+            "INSERT INTO coverage(project_id, provider, workspace_id, "
+            "conversation_id, contiguous_since, last_sequence, last_event_at, state) "
+            "VALUES (?, 'slack', 'T1', 'C1', '2026-07-20T00:00:00+00:00', "
+            "1, '2026-07-28T00:00:00+00:00', 'COLLECTING')",
+            (project_id,),
+        )
+        for index, (message_id, text, _query) in enumerate(fixtures):
+            occurred_at = f"2026-07-27T00:00:{index:02d}+00:00"
+            conn.execute(
+                "INSERT INTO messages(project_id, provider, workspace_id, "
+                "conversation_id, provider_message_id, sender_id, text, "
+                "provider_payload_json, occurred_at, inserted_at, updated_at) "
+                "VALUES (?, 'slack', 'T1', 'C1', ?, 'U1', ?, '{}', ?, ?, ?)",
+                (project_id, message_id, text, occurred_at, occurred_at, occurred_at),
+            )
+
+    request = {
+        "operation": "search",
+        "start": "2026-07-20T00:00:00+00:00",
+        "end": "2026-07-28T00:00:00+00:00",
+        "providers": ["slack"],
+        "workspace_ids": ["T1"],
+        "allowed_source_ids": ["slack:T1:C1"],
+        "limit": 3,
+    }
+    for message_id, _text, query in fixtures:
+        result = store.query({**request, "query": query})
+        assert result["hits"], query
+        assert result["hits"][0]["message"]["provider_message_id"] == message_id
+    compound = store.query({**request, "query": "가격 조정"})
+    assert compound["hits"][0]["message"]["provider_message_id"] == "ko"
+
+
+def test_message_search_uses_bounded_relevance_candidates_not_recent_row_limit(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO conversations(project_id, provider, workspace_id, "
+            "conversation_id, title, updated_at) VALUES (?, 'slack', 'T1', "
+            "'C1', 'search', '2026-07-28T00:00:00+00:00')",
+            (project_id,),
+        )
+        conn.execute(
+            "INSERT INTO coverage(project_id, provider, workspace_id, "
+            "conversation_id, contiguous_since, last_sequence, last_event_at, state) "
+            "VALUES (?, 'slack', 'T1', 'C1', '2026-07-20T00:00:00+00:00', "
+            "1, '2026-07-28T00:00:00+00:00', 'COLLECTING')",
+            (project_id,),
+        )
+        conn.execute(
+            "INSERT INTO messages(project_id, provider, workspace_id, "
+            "conversation_id, provider_message_id, sender_id, text, "
+            "provider_payload_json, occurred_at, inserted_at, updated_at) "
+            "VALUES (?, 'slack', 'T1', 'C1', 'target', 'U1', "
+            "'희귀검색어 rare-search-target', '{}', "
+            "'2026-07-20T00:00:01+00:00', '2026-07-20T00:00:01+00:00', "
+            "'2026-07-20T00:00:01+00:00')",
+            (project_id,),
+        )
+        for index in range(1200):
+            occurred_at = f"2026-07-27T{index // 3600:02d}:{index // 60 % 60:02d}:{index % 60:02d}+00:00"
+            conn.execute(
+                "INSERT INTO messages(project_id, provider, workspace_id, "
+                "conversation_id, provider_message_id, sender_id, text, "
+                "provider_payload_json, occurred_at, inserted_at, updated_at) "
+                "VALUES (?, 'slack', 'T1', 'C1', ?, 'U1', "
+                "'ordinary unrelated activity', '{}', ?, ?, ?)",
+                (project_id, f"noise-{index}", occurred_at, occurred_at, occurred_at),
+            )
+
+    store_module = sys.modules[module.MessageStore.__module__]
+    original_rank = store_module._rank_message_rows
+    ranked_row_counts = []
+
+    def capture_rows(rows, *, query, limit):
+        ranked_row_counts.append(len(rows))
+        return original_rank(rows, query=query, limit=limit)
+
+    monkeypatch.setattr(store_module, "_rank_message_rows", capture_rows)
+    result = store.query(
+        {
+            "operation": "search",
+            "query": "희귀검색어",
+            "start": "2026-07-20T00:00:00+00:00",
+            "end": "2026-07-28T00:00:00+00:00",
+            "providers": ["slack"],
+            "workspace_ids": ["T1"],
+            "allowed_source_ids": ["slack:T1:C1"],
+            "limit": 3,
+        }
+    )
+
+    assert result["hits"][0]["message"]["provider_message_id"] == "target"
+    assert ranked_row_counts
+    assert (
+        ranked_row_counts[0]
+        <= store_module.MESSAGE_SEARCH_CONTEXT_ROW_LIMIT
+    )
+    assert ranked_row_counts[0] < 1201
 
 
 def test_message_edit_preserves_history_time_and_order(tmp_path, monkeypatch):

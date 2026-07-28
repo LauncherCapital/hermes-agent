@@ -8,6 +8,7 @@ guard that would have caught that specific failure mode.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 from typing import List, Dict, Any
@@ -34,6 +35,37 @@ def _td(name: str, description: str = "", properties: Dict[str, Any] | None = No
     }
 
 
+@pytest.fixture
+def production_scale_mcp_catalog():
+    """Synthetic 16-server/243-tool catalog matching production schema size."""
+    from tools.registry import registry
+
+    tool_defs = []
+    registered_names = []
+    for index in range(243):
+        server_index = index % 16
+        name = f"mcp_fixture_s{server_index:02d}_tool_{index:03d}"
+        tool_def = _td(
+            name,
+            "Synthetic MCP schema field semantics. " + "field semantics " * 68 + "details ",
+            {"query": {"type": "string", "description": "Synthetic query input."}},
+        )
+        registry.register(
+            name=name,
+            handler=lambda args, **kwargs: json.dumps({"ok": True}),
+            schema=tool_def["function"],
+            toolset=f"mcp-fixture-s{server_index:02d}",
+        )
+        tool_defs.append(tool_def)
+        registered_names.append(name)
+
+    try:
+        yield tool_defs
+    finally:
+        for name in registered_names:
+            registry.deregister(name)
+
+
 # ---------------------------------------------------------------------------
 # Config parsing
 # ---------------------------------------------------------------------------
@@ -43,8 +75,9 @@ class TestConfigParsing:
     def test_default_when_missing(self):
         from tools.tool_search import ToolSearchConfig
         cfg = ToolSearchConfig.from_raw(None)
-        assert cfg.enabled == "auto"
+        assert cfg.enabled == "off"
         assert cfg.threshold_pct == 10.0
+        assert cfg.threshold_tokens == 20_000
 
     def test_bool_true_maps_to_auto(self):
         from tools.tool_search import ToolSearchConfig
@@ -61,10 +94,10 @@ class TestConfigParsing:
         cfg = ToolSearchConfig.from_raw({"enabled": "on"})
         assert cfg.enabled == "on"
 
-    def test_invalid_enabled_falls_back_to_auto(self):
+    def test_invalid_enabled_falls_back_to_off(self):
         from tools.tool_search import ToolSearchConfig
         cfg = ToolSearchConfig.from_raw({"enabled": "maybe"})
-        assert cfg.enabled == "auto"
+        assert cfg.enabled == "off"
 
     def test_threshold_clamped(self):
         from tools.tool_search import ToolSearchConfig
@@ -72,6 +105,8 @@ class TestConfigParsing:
         assert cfg.threshold_pct == 100.0
         cfg = ToolSearchConfig.from_raw({"threshold_pct": -5})
         assert cfg.threshold_pct == 0.0
+        cfg = ToolSearchConfig.from_raw({"threshold_tokens": -5})
+        assert cfg.threshold_tokens == 1
 
     def test_search_limits_clamped(self):
         from tools.tool_search import ToolSearchConfig
@@ -168,6 +203,16 @@ class TestThresholdGate:
         assert not should_activate(cfg, deferrable_tokens=10_000, context_length=0)
         assert should_activate(cfg, deferrable_tokens=25_000, context_length=0)
 
+    def test_auto_uses_absolute_budget_on_large_context(self):
+        from tools.tool_search import ToolSearchConfig, should_activate
+        cfg = ToolSearchConfig.from_raw({
+            "enabled": "auto",
+            "threshold_pct": 10,
+            "threshold_tokens": 15_000,
+        })
+        assert not should_activate(cfg, deferrable_tokens=14_999, context_length=1_000_000)
+        assert should_activate(cfg, deferrable_tokens=15_000, context_length=1_000_000)
+
     def test_token_estimate_proportional_to_schema_size(self):
         from tools.tool_search import estimate_tokens_from_schemas
         small = [_td("a", "x")]
@@ -238,6 +283,76 @@ class TestRetrieval:
 
 
 class TestAssembly:
+    def test_auto_activates_for_production_scale_catalog(
+        self,
+        production_scale_mcp_catalog,
+        caplog,
+    ):
+        """A 1M context must not expose ~80.7K tokens of deferrable schemas."""
+        from tools.tool_search import (
+            BRIDGE_TOOL_NAMES,
+            ToolSearchConfig,
+            assemble_tool_defs,
+        )
+
+        defs = [_td("terminal", "Run shell commands"), *production_scale_mcp_catalog]
+        with caplog.at_level(logging.INFO, logger="tools.tool_search"):
+            result = assemble_tool_defs(
+                defs,
+                context_length=1_000_000,
+                config=ToolSearchConfig.from_raw({"enabled": "auto"}),
+            )
+
+        assert 80_500 <= result.deferred_tokens <= 80_900
+        assert result.deferred_count == 243
+        assert result.activated
+        visible_names = {td["function"]["name"] for td in result.tool_defs}
+        assert "terminal" in visible_names
+        assert BRIDGE_TOOL_NAMES <= visible_names
+        assert not {
+            td["function"]["name"] for td in production_scale_mcp_catalog
+        } & visible_names
+        log_text = caplog.text
+        assert "visible=1 deferred=243" in log_text
+        assert "deferred_schema_tokens_estimate=80676" in log_text
+        assert "activation_threshold_tokens=20000" in log_text
+        assert "mcp_fixture" not in log_text
+
+    def test_assembly_error_fails_open_with_direct_tools(self, monkeypatch):
+        """Tool Search failure must not make an otherwise available tool disappear."""
+        import model_tools
+        from tools import tool_search
+        from tools.registry import registry
+
+        name = "mcp_fail_open_fixture_tool"
+        registry.register(
+            name=name,
+            handler=lambda args, **kwargs: json.dumps({"ok": True}),
+            schema=_td(name, "Fail-open fixture")["function"],
+            toolset="mcp-fail-open-fixture",
+        )
+        monkeypatch.setattr(
+            tool_search,
+            "load_config",
+            lambda: tool_search.ToolSearchConfig.from_raw({"enabled": "auto"}),
+        )
+
+        def _raise_unavailable(*args, **kwargs):
+            raise RuntimeError("tool search unavailable")
+
+        monkeypatch.setattr(tool_search, "assemble_tool_defs", _raise_unavailable)
+        model_tools._clear_tool_defs_cache()
+        try:
+            result = model_tools.get_tool_definitions(
+                enabled_toolsets=["mcp-fail-open-fixture"],
+                quiet_mode=True,
+            )
+        finally:
+            registry.deregister(name)
+            model_tools._clear_tool_defs_cache()
+
+        assert {td["function"]["name"] for td in result} == {name}
+
     def test_no_deferrable_returns_unchanged(self):
         """Pure-core toolset: pass-through, no bridge tools added."""
         from tools.tool_search import assemble_tool_defs, ToolSearchConfig
@@ -469,6 +584,22 @@ class TestRegression_ToolsetScoping:
         hit_names = {m["name"] for m in parsed["matches"]}
         assert "scoped_oos_plugin" not in hit_names
 
+    def test_disabled_toolset_stays_out_of_deferred_catalog(self):
+        import model_tools
+
+        self._register("mcp_scope_kept_op", "mcp-scope-kept")
+        self._register("mcp_scope_disabled_op", "mcp-scope-disabled")
+
+        result = model_tools.handle_function_call(
+            function_name="tool_search",
+            function_args={"query": "mcp_scope", "limit": 5},
+            enabled_toolsets=["mcp-scope-kept", "mcp-scope-disabled"],
+            disabled_toolsets=["mcp-scope-disabled"],
+        )
+        parsed = json.loads(result)
+        assert parsed["total_available"] == 1
+        assert {match["name"] for match in parsed["matches"]} == {"mcp_scope_kept_op"}
+
     def test_tool_call_rejects_out_of_scope_tool(self):
         import model_tools
 
@@ -535,4 +666,3 @@ class TestRegression_ToolsetScoping:
         assert "mcp_helper_op" in names
         # core tools are never deferrable
         assert "terminal" not in names
-

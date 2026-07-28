@@ -207,8 +207,9 @@ def _caption_image(path: Path) -> tuple[str, str]:
     return str(result["analysis"]).strip()[:MAX_TEXT_CHARS], model or "auxiliary-default"
 
 
-def embed_text(text: str) -> tuple[list[float], str]:
-    if not text.strip():
+def embed_texts(texts: list[str]) -> tuple[list[list[float]], str]:
+    normalized = [text.strip()[:MAX_TEXT_CHARS] for text in texts]
+    if not normalized or any(not text for text in normalized):
         raise FileProcessingError("empty_embedding_input")
     model = (
         os.getenv("FILE_INDEX_EMBEDDING_MODEL", "").strip()
@@ -220,14 +221,22 @@ def embed_text(text: str) -> tuple[list[float], str]:
         client, _ = resolve_provider_client("openrouter", async_mode=False)
         if client is None:
             raise RuntimeError("embedding client unavailable")
-        response = client.embeddings.create(model=model, input=[text[:MAX_TEXT_CHARS]])
-        vector = [float(value) for value in response.data[0].embedding]
+        response = client.embeddings.create(model=model, input=normalized)
+        vectors = [
+            [float(value) for value in item.embedding]
+            for item in response.data
+        ]
     except Exception as exc:
         logger.warning("File embedding failed: %s", type(exc).__name__)
         raise FileProcessingError("embedding_failed") from None
-    if not vector:
+    if len(vectors) != len(normalized) or any(not vector for vector in vectors):
         raise FileProcessingError("embedding_empty")
-    return vector, model
+    return vectors, model
+
+
+def embed_text(text: str) -> tuple[list[float], str]:
+    vectors, model = embed_texts([text])
+    return vectors[0], model
 
 
 def process_slack_file(

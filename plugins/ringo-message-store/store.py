@@ -10,6 +10,7 @@ import re
 import threading
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -24,21 +25,31 @@ from .file_processing import (
     FileProcessingError,
     cleanup_stale_temp_files,
     embed_text,
+    embed_texts,
     inspect_slack_image,
     process_slack_file,
+)
+from .search_text import (
+    normalize_search_text,
+    search_feature_set,
+    search_features,
+    search_index_terms,
+    search_segments,
 )
 
 
 logger = logging.getLogger(__name__)
-SCHEMA_VERSION = 6
-PROTOCOL_VERSION = 1
+SCHEMA_VERSION = 8
+PROTOCOL_VERSION = 2
 PROTOCOL_CAPABILITIES = (
     "acl_metadata",
     "allowed_source_ids",
     "detailed_health",
     "event_batch",
+    "file_index_parent_context_v1",
     "file_index_v1",
     "ingest_window",
+    "message_search_v1",
     "reconciliation_events",
     "stable_cursor",
 )
@@ -50,51 +61,232 @@ FILE_SEARCH_RETRIEVE_LIMIT = 50
 FILE_SEARCH_RERANK_LIMIT = 10
 FILE_SEARCH_IMAGE_INSPECT_LIMIT = 3
 FILE_SEARCH_MIN_SEMANTIC_SCORE = 0.80
-# Search-intent words describe the operation or media, not the subject to match.
-FILE_SEARCH_GENERIC_QUERY_TOKENS = frozenset(
-    {
-        "관련",
-        "거",
-        "것",
-        "좀",
-        "파일",
-        "사진",
-        "이미지",
-        "스크린샷",
-        "첨부",
-        "첨부파일",
-        "업로드",
-        "올린",
-        "올린거",
-        "올려",
-        "올렸",
-        "찾아",
-        "찾아줘",
-        "주세요",
-        "줘",
-        "보여",
-        "보여줘",
-        "related",
-        "file",
-        "files",
-        "image",
-        "images",
-        "photo",
-        "photos",
-        "picture",
-        "pictures",
-        "screenshot",
-        "screenshots",
-        "attachment",
-        "attached",
-        "upload",
-        "uploaded",
-        "find",
-        "show",
-        "please",
-    }
-)
+FILE_SEARCH_MIN_LEXICAL_COVERAGE = 0.25
 MAX_FILE_PROCESSING_ATTEMPTS = 3
+MESSAGE_SEARCH_ADJACENCY_SECONDS = 10 * 60
+MESSAGE_SEARCH_CANDIDATE_LIMIT = 200
+MESSAGE_SEARCH_CONTEXT_ROW_LIMIT = 5_000
+MESSAGE_SEARCH_MAX_ROWS_PER_ROOT = 100
+MESSAGE_SEARCH_MIN_FEATURE_COVERAGE = 0.30
+MESSAGE_SEARCH_MAX_QUERY_TERMS = 96
+
+
+def _search_words(text: str) -> list[str]:
+    return search_segments(text)
+
+
+def _search_features(text: str) -> Counter[str]:
+    return search_features(text)
+
+
+def _row_search_text(row: Any) -> str:
+    return " ".join(
+        value
+        for value in (
+            str(row["text"] or ""),
+            str(row["conversation_title"] or ""),
+            str(row["sender_display_name"] or ""),
+        )
+        if value
+    )
+
+
+def _row_timestamp(row: Any) -> float:
+    try:
+        return datetime.fromisoformat(str(row["occurred_at"])).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _search_message(row: Any) -> dict[str, Any]:
+    try:
+        provider_payload = json.loads(row["provider_payload_json"] or "{}")
+    except json.JSONDecodeError:
+        provider_payload = {}
+    return {
+        "provider": row["provider"],
+        "workspace_id": row["workspace_id"],
+        "conversation_id": row["conversation_id"],
+        "conversation_title": row["conversation_title"],
+        "provider_message_id": row["provider_message_id"],
+        "parent_message_id": row["parent_message_id"],
+        "sender_id": row["sender_id"],
+        "sender_display_name": row["sender_display_name"],
+        "text": row["text"],
+        "occurred_at": row["occurred_at"],
+        "changed_at": row["updated_at"],
+        "edited_at": row["edited_at"],
+        "provider_payload": provider_payload,
+        "reactions": [],
+    }
+
+
+def _rank_message_rows(
+    rows: list[Any],
+    *,
+    query: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    query_words = set(_search_words(query))
+    query_features = _search_features(query)
+    if not query_words or not query_features:
+        return []
+
+    units: list[dict[str, Any]] = []
+    by_conversation: dict[tuple[str, str, str], list[Any]] = {}
+    for row in rows:
+        by_conversation.setdefault(
+            (
+                str(row["provider"]),
+                str(row["workspace_id"]),
+                str(row["conversation_id"]),
+            ),
+            [],
+        ).append(row)
+    for conversation_rows in by_conversation.values():
+        grouped: dict[str, list[Any]] = {}
+        for row in conversation_rows:
+            root_id = str(row["parent_message_id"] or row["provider_message_id"])
+            grouped.setdefault(root_id, []).append(row)
+        conversation_units = [
+            {
+                "core": sorted(group, key=_row_timestamp),
+                "context": sorted(group, key=_row_timestamp),
+            }
+            for group in grouped.values()
+        ]
+        conversation_units.sort(key=lambda item: _row_timestamp(item["core"][0]))
+        for index, unit in enumerate(conversation_units):
+            adjacent: list[Any] = []
+            for neighbor_index in (index - 1, index + 1):
+                if not 0 <= neighbor_index < len(conversation_units):
+                    continue
+                neighbor = conversation_units[neighbor_index]
+                gap = min(
+                    abs(_row_timestamp(left) - _row_timestamp(right))
+                    for left in unit["core"]
+                    for right in neighbor["core"]
+                )
+                if gap <= MESSAGE_SEARCH_ADJACENCY_SECONDS:
+                    adjacent.extend(neighbor["core"])
+            unit["adjacent"] = adjacent
+            unit["context"] = sorted(
+                [*unit["core"], *adjacent],
+                key=_row_timestamp,
+            )
+            units.append(unit)
+
+    document_features: list[Counter[str]] = []
+    for unit in units:
+        core_text = " ".join(_row_search_text(row) for row in unit["core"])
+        adjacent_text = " ".join(_row_search_text(row) for row in unit["adjacent"])
+        features = _search_features(core_text)
+        for feature, count in _search_features(adjacent_text).items():
+            features[feature] += count * 0.35
+        document_features.append(features)
+
+    document_count = len(units)
+    if not document_count:
+        return []
+    document_frequency = {
+        feature: sum(1 for features in document_features if features[feature] > 0)
+        for feature in query_features
+    }
+    lengths = [sum(features.values()) for features in document_features]
+    average_length = sum(lengths) / document_count or 1.0
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    normalized_query = normalize_search_text(query)
+    total_query_features = sum(query_features.values())
+    for index, unit in enumerate(units):
+        matched_feature_count = sum(
+            min(count, document_features[index][feature])
+            for feature, count in query_features.items()
+        )
+        feature_coverage = (
+            matched_feature_count / total_query_features
+            if total_query_features
+            else 0.0
+        )
+        if feature_coverage < MESSAGE_SEARCH_MIN_FEATURE_COVERAGE:
+            continue
+        score = 0.0
+        for feature, query_count in query_features.items():
+            term_frequency = document_features[index][feature]
+            if term_frequency <= 0:
+                continue
+            frequency = document_frequency[feature]
+            inverse_frequency = math.log(
+                1.0 + (document_count - frequency + 0.5) / (frequency + 0.5)
+            )
+            denominator = term_frequency + 1.2 * (
+                0.25 + 0.75 * lengths[index] / average_length
+            )
+            score += (
+                inverse_frequency * (term_frequency * 2.2 / denominator) * query_count
+            )
+        core_text = normalize_search_text(
+            " ".join(_row_search_text(row) for row in unit["core"])
+        )
+        context_text = normalize_search_text(
+            " ".join(_row_search_text(row) for row in unit["context"])
+        )
+        if normalized_query in core_text:
+            score += 2.0
+        elif normalized_query in context_text:
+            score += 0.7
+        primary = max(
+            unit["context"],
+            key=lambda row: (
+                sum(
+                    min(count, _search_features(_row_search_text(row))[feature])
+                    for feature, count in query_features.items()
+                ),
+                _row_timestamp(row),
+            ),
+        )
+        ranked.append((
+            score,
+            {
+                "score": round(score, 6),
+                "message": _search_message(primary),
+                "context": [_search_message(row) for row in unit["context"]],
+            },
+        ))
+
+    ranked.sort(
+        key=lambda item: (
+            item[0],
+            _row_timestamp(
+                next(
+                    row
+                    for unit in units
+                    for row in unit["context"]
+                    if str(row["provider_message_id"])
+                    == str(item[1]["message"]["provider_message_id"])
+                    and str(row["conversation_id"])
+                    == str(item[1]["message"]["conversation_id"])
+                )
+            ),
+        ),
+        reverse=True,
+    )
+    selected: list[dict[str, Any]] = []
+    selected_contexts: list[set[tuple[str, str]]] = []
+    for _score, hit in ranked:
+        context_keys = {
+            (
+                str(message["conversation_id"]),
+                str(message["provider_message_id"]),
+            )
+            for message in hit["context"]
+        }
+        if any(context_keys & existing for existing in selected_contexts):
+            continue
+        selected.append(hit)
+        selected_contexts.append(context_keys)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 _SCHEMA = """
@@ -345,6 +537,19 @@ _MIGRATION_V6 = """
 ALTER TABLE file_contents
     ADD COLUMN processing_attempts INTEGER NOT NULL DEFAULT 0;
 """
+_MIGRATION_V7 = """
+ALTER TABLE file_shares
+    ADD COLUMN parent_embedding_json TEXT;
+ALTER TABLE file_shares
+    ADD COLUMN parent_embedding_model TEXT;
+ALTER TABLE file_shares
+    ADD COLUMN parent_embedding_dimension INTEGER;
+ALTER TABLE file_shares
+    ADD COLUMN parent_embedding_attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE file_shares
+    ADD COLUMN parent_embedding_error TEXT;
+"""
+_MIGRATION_V8 = ""
 _MIGRATIONS = {
     1: _SCHEMA,
     2: _MIGRATION_V2,
@@ -352,7 +557,43 @@ _MIGRATIONS = {
     4: _MIGRATION_V4,
     5: _MIGRATION_V5,
     6: _MIGRATION_V6,
+    7: _MIGRATION_V7,
+    8: _MIGRATION_V8,
 }
+
+_MESSAGE_SEARCH_INDEX_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS message_search_fts USING fts5(
+    text,
+    tokenize='unicode61 remove_diacritics 2'
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS message_search_trigram USING fts5(
+    text,
+    tokenize='trigram'
+);
+CREATE TRIGGER IF NOT EXISTS message_search_insert
+AFTER INSERT ON messages WHEN new.deleted_at IS NULL BEGIN
+    INSERT INTO message_search_fts(rowid, text)
+    VALUES (new.rowid, ringo_search_index_text(new.text));
+    INSERT INTO message_search_trigram(rowid, text)
+    VALUES (new.rowid, ringo_search_normalize(new.text));
+END;
+CREATE TRIGGER IF NOT EXISTS message_search_delete
+AFTER DELETE ON messages BEGIN
+    DELETE FROM message_search_fts WHERE rowid = old.rowid;
+    DELETE FROM message_search_trigram WHERE rowid = old.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS message_search_update
+AFTER UPDATE OF text, deleted_at ON messages BEGIN
+    DELETE FROM message_search_fts WHERE rowid = old.rowid;
+    DELETE FROM message_search_trigram WHERE rowid = old.rowid;
+    INSERT INTO message_search_fts(rowid, text)
+    SELECT new.rowid, ringo_search_index_text(new.text)
+    WHERE new.deleted_at IS NULL;
+    INSERT INTO message_search_trigram(rowid, text)
+    SELECT new.rowid, ringo_search_normalize(new.text)
+    WHERE new.deleted_at IS NULL;
+END;
+"""
 
 
 class MessageStore:
@@ -376,6 +617,7 @@ class MessageStore:
         self.database = EncryptedDatabase(self.path)
         self.database.prepare()
         ensure_project_encryption_key(self.project_id, self.key_version)
+        self.message_search_index_available = False
         self._migrate()
         cleanup_stale_temp_files()
 
@@ -391,6 +633,7 @@ class MessageStore:
                 self.journal_mode = "delete"
                 conn.execute("PRAGMA journal_mode=DELETE")
             current_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            rotate_file_index_generation = 0 < current_version < 7
             if current_version > SCHEMA_VERSION:
                 raise RuntimeError(
                     f"message store schema {current_version} is newer than supported "
@@ -405,6 +648,13 @@ class MessageStore:
                     for row in conn.execute("PRAGMA table_info(file_contents)")
                 ):
                     script = ""
+                if version == 7:
+                    existing_columns = {
+                        str(row[1])
+                        for row in conn.execute("PRAGMA table_info(file_shares)")
+                    }
+                    if "parent_embedding_json" in existing_columns:
+                        script = ""
                 try:
                     conn.executescript(
                         "BEGIN IMMEDIATE;\n"
@@ -425,21 +675,68 @@ class MessageStore:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (str(self.database.active_key_version),),
             )
-            conn.execute(
-                "INSERT INTO schema_meta(key, value) VALUES "
-                "('file_index_store_generation', ?) ON CONFLICT(key) DO NOTHING",
-                (str(uuid.uuid4()),),
-            )
+            generation = str(uuid.uuid4())
+            if rotate_file_index_generation:
+                conn.execute(
+                    "INSERT INTO schema_meta(key, value) VALUES "
+                    "('file_index_store_generation', ?) ON CONFLICT(key) "
+                    "DO UPDATE SET value=excluded.value",
+                    (generation,),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO schema_meta(key, value) VALUES "
+                    "('file_index_store_generation', ?) ON CONFLICT(key) DO NOTHING",
+                    (generation,),
+                )
             self.store_generation = str(
                 conn.execute(
                     "SELECT value FROM schema_meta "
                     "WHERE key='file_index_store_generation'"
                 ).fetchone()[0]
             )
+            self.message_search_index_available = (
+                self._ensure_message_search_index(conn)
+            )
         try:
             os.chmod(self.path, 0o600)
         except OSError:
             pass
+
+    @staticmethod
+    def _ensure_message_search_index(conn: Any) -> bool:
+        """Create and backfill optional FTS indexes without risking store startup."""
+        try:
+            conn.executescript(_MESSAGE_SEARCH_INDEX_SQL)
+            version = conn.execute(
+                "SELECT value FROM schema_meta "
+                "WHERE key='message_search_index_version'"
+            ).fetchone()
+            if version is None or str(version[0]) != "2":
+                conn.execute("DELETE FROM message_search_fts")
+                conn.execute("DELETE FROM message_search_trigram")
+                conn.execute(
+                    "INSERT INTO message_search_fts(rowid, text) "
+                    "SELECT rowid, ringo_search_index_text(text) FROM messages "
+                    "WHERE deleted_at IS NULL"
+                )
+                conn.execute(
+                    "INSERT INTO message_search_trigram(rowid, text) "
+                    "SELECT rowid, ringo_search_normalize(text) FROM messages "
+                    "WHERE deleted_at IS NULL"
+                )
+                conn.execute(
+                    "INSERT INTO schema_meta(key, value) VALUES "
+                    "('message_search_index_version', '2') "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+                )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Message search index unavailable; local search will fail open: %s",
+                type(exc).__name__,
+            )
+            return False
 
     def record_envelope(self, envelope: dict[str, Any], body_sha256: str) -> dict:
         """Commit delivery metadata and cursor atomically; duplicates are harmless."""
@@ -684,6 +981,12 @@ class MessageStore:
                     access_token=access_token,
                 )
             )
+            if str(hydrated.get("operation") or "") == "upsert_share":
+                self._process_pending_parent_embeddings(
+                    provider=str(hydrated.get("provider") or ""),
+                    workspace_id=str(hydrated.get("workspace_id") or ""),
+                    limit=1,
+                )
             if not indexed:
                 with self._connect() as conn:
                     content = conn.execute(
@@ -1098,7 +1401,13 @@ class MessageStore:
             )
             conn.commit()
         processed = 0
+        contextualized = self._process_pending_parent_embeddings(
+            provider=provider,
+            workspace_id=workspace_id,
+            limit=3,
+        )
         pending = 0
+        pending_parent_embeddings = 0
         if access_token:
             processed = self._process_pending_file_contents(
                 provider=provider,
@@ -1125,7 +1434,27 @@ class MessageStore:
                     ).fetchone()
                     is not None
                 )
-                complete = scan_complete and pending == 0
+                pending_parent_embeddings = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM file_shares WHERE project_id=? "
+                        "AND provider=? AND workspace_id=? "
+                        "AND tombstoned_at IS NULL "
+                        "AND parent_embedding_json IS NULL "
+                        "AND parent_embedding_attempts<? "
+                        "AND (thread_context IS NOT NULL OR upload_text IS NOT NULL)",
+                        (
+                            self.project_id,
+                            provider,
+                            workspace_id,
+                            MAX_FILE_PROCESSING_ATTEMPTS,
+                        ),
+                    ).fetchone()[0]
+                )
+                complete = (
+                    scan_complete
+                    and pending == 0
+                    and pending_parent_embeddings == 0
+                )
                 conn.execute(
                     "UPDATE file_index_runs SET status=?, "
                     "indexed_contents=indexed_contents+?, updated_at=?, "
@@ -1155,6 +1484,8 @@ class MessageStore:
                 "discovered_shares": discovered,
                 "indexed_contents": processed,
                 "pending_contents": pending,
+                "contextualized_shares": contextualized,
+                "pending_parent_embeddings": pending_parent_embeddings,
             }
         if complete:
             self._expire_file_window(
@@ -1169,6 +1500,8 @@ class MessageStore:
             "discovered_shares": discovered,
             "indexed_contents": processed,
             "pending_contents": pending,
+            "contextualized_shares": contextualized,
+            "pending_parent_embeddings": pending_parent_embeddings,
         }
 
     def _expire_file_window(
@@ -1340,6 +1673,93 @@ class MessageStore:
             conn.commit()
         return bool(updated and processing_status != "metadata_only")
 
+    def _process_pending_parent_embeddings(
+        self,
+        *,
+        provider: str,
+        workspace_id: str,
+        limit: int,
+    ) -> int:
+        """Embed a bounded set of unique thread/upload parent contexts."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT MAX(thread_context) AS thread_context, "
+                "MAX(upload_text) AS upload_text FROM file_shares "
+                "WHERE project_id=? AND provider=? AND workspace_id=? "
+                "AND tombstoned_at IS NULL AND parent_embedding_json IS NULL "
+                "AND parent_embedding_attempts<? "
+                "AND (thread_context IS NOT NULL OR upload_text IS NOT NULL) "
+                "GROUP BY CASE WHEN thread_context IS NOT NULL "
+                "THEN 'thread:' || thread_context ELSE 'upload:' || upload_text END "
+                "ORDER BY MIN(shared_at), MIN(file_id) LIMIT ?",
+                (
+                    self.project_id,
+                    provider,
+                    workspace_id,
+                    MAX_FILE_PROCESSING_ATTEMPTS,
+                    max(1, min(limit, 10)),
+                ),
+            ).fetchall()
+        processed = 0
+        for row in rows:
+            thread_context = str(row["thread_context"] or "")
+            upload_text = str(row["upload_text"] or "")
+            parent_text = thread_context or upload_text
+            if thread_context:
+                match_sql = "thread_context=?"
+                match_params = (thread_context,)
+            else:
+                match_sql = "thread_context IS NULL AND upload_text=?"
+                match_params = (upload_text,)
+            try:
+                vector, model = embed_text(parent_text)
+            except FileProcessingError as exc:
+                with self._writer_lock, self._connect() as conn:
+                    conn.execute(
+                        "UPDATE file_shares SET "
+                        "parent_embedding_attempts=parent_embedding_attempts+1, "
+                        "parent_embedding_error=?, updated_at=? "
+                        "WHERE project_id=? AND provider=? AND workspace_id=? "
+                        "AND tombstoned_at IS NULL AND "
+                        + match_sql
+                        + " AND parent_embedding_json IS NULL",
+                        (
+                            exc.code,
+                            datetime.now(timezone.utc).isoformat(),
+                            self.project_id,
+                            provider,
+                            workspace_id,
+                            *match_params,
+                        ),
+                    )
+                    conn.commit()
+                continue
+            encoded = json.dumps(vector, separators=(",", ":"))
+            now = datetime.now(timezone.utc).isoformat()
+            with self._writer_lock, self._connect() as conn:
+                updated = conn.execute(
+                    "UPDATE file_shares SET parent_embedding_json=?, "
+                    "parent_embedding_model=?, parent_embedding_dimension=?, "
+                    "parent_embedding_attempts=0, parent_embedding_error=NULL, "
+                    "updated_at=? WHERE project_id=? AND provider=? "
+                    "AND workspace_id=? AND tombstoned_at IS NULL AND "
+                    + match_sql
+                    + " AND parent_embedding_json IS NULL",
+                    (
+                        encoded,
+                        model,
+                        len(vector),
+                        now,
+                        self.project_id,
+                        provider,
+                        workspace_id,
+                        *match_params,
+                    ),
+                ).rowcount
+                conn.commit()
+            processed += int(updated)
+        return processed
+
     def _derived_content_by_hash(
         self,
         *,
@@ -1387,14 +1807,7 @@ class MessageStore:
 
     @staticmethod
     def _file_search_tokens(value: Any) -> set[str]:
-        return {
-            token
-            for token in re.findall(
-                r"[0-9A-Za-z가-힣_]+",
-                str(value or "").lower(),
-            )
-            if token
-        }
+        return search_feature_set(value)
 
     @staticmethod
     def _file_search_cosine(left: list[float], right: list[float]) -> float:
@@ -1408,7 +1821,7 @@ class MessageStore:
         return dot / (left_norm * right_norm)
 
     def search_file_index(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Run the fixed retrieve-50, rerank-10, inspect-3, return-1..3 flow."""
+        """Run the fixed retrieve-50, rerank-10, inspect-3 flow."""
         request = dict(request)
         access_token = str(request.pop("provider_access_token", "") or "")
         if str(request.get("project_id") or "") != self.project_id:
@@ -1418,6 +1831,7 @@ class MessageStore:
         provider = str(request.get("provider") or "")
         workspace_id = str(request.get("workspace_id") or "")
         query = str(request.get("query") or "").strip()
+        context_query = str(request.get("context_query") or "").strip()
         scope_revision = str(request.get("allowed_scope_revision") or "")
         window_started_at = str(request.get("window_started_at") or "")
         if not provider or not workspace_id or not query or not scope_revision:
@@ -1442,6 +1856,7 @@ class MessageStore:
             rows = conn.execute(
                 "SELECT fc.*, fs.conversation_id, fs.provider_message_id, "
                 "fs.uploader_id, fs.upload_text, fs.thread_context, fs.shared_at, "
+                "fs.parent_embedding_json, "
                 "COUNT(*) OVER (PARTITION BY fs.project_id, fs.provider, "
                 "fs.workspace_id, fs.conversation_id, fs.provider_message_id) "
                 "AS message_file_count, "
@@ -1494,10 +1909,18 @@ class MessageStore:
             if str(value or "").strip()
         } if isinstance(raw_types, list) else set()
         query_embedding: list[float] = []
-        try:
-            query_embedding, _ = embed_text(query)
-        except FileProcessingError:
-            pass
+        context_query_embedding: list[float] = []
+        if context_query:
+            try:
+                embeddings, _ = embed_texts([query, context_query])
+                query_embedding, context_query_embedding = embeddings
+            except FileProcessingError:
+                pass
+        else:
+            try:
+                query_embedding, _ = embed_text(query)
+            except FileProcessingError:
+                pass
         candidates: list[dict[str, Any]] = []
         for row in rows:
             if uploader_filter and str(row["uploader_id"] or "") != uploader_filter:
@@ -1541,6 +1964,8 @@ class MessageStore:
             )
             phrase = 3.0 if query.lower() in haystack else 0.0
             semantic = 0.0
+            parent_semantic = 0.0
+            has_parent_embedding = False
             if query_embedding:
                 for column in (
                     "text_content_embedding_json",
@@ -1555,8 +1980,30 @@ class MessageStore:
                             semantic,
                             self._file_search_cosine(query_embedding, vector),
                         )
+                try:
+                    parent_vector = json.loads(
+                        row["parent_embedding_json"] or "[]"
+                    )
+                except json.JSONDecodeError:
+                    parent_vector = []
+                if (
+                    context_query_embedding
+                    and isinstance(parent_vector, list)
+                    and parent_vector
+                ):
+                    has_parent_embedding = True
+                    parent_semantic = self._file_search_cosine(
+                        context_query_embedding,
+                        parent_vector,
+                    )
             semantic_signal = semantic if semantic >= 0.2 else 0.0
-            retrieval_score = lexical + semantic_signal * 4.0
+            retrieval_score = lexical
+            if has_parent_embedding:
+                retrieval_score += max(semantic, 0.0) + max(
+                    parent_semantic, 0.0
+                ) * 4.0
+            else:
+                retrieval_score += semantic_signal * 4.0
             if retrieval_score <= 0:
                 continue
             candidates.append(
@@ -1581,6 +2028,8 @@ class MessageStore:
                     "retrieval_score": retrieval_score,
                     "rerank_score": retrieval_score + phrase,
                     "semantic_score": semantic,
+                    "parent_semantic_score": parent_semantic,
+                    "has_parent_embedding": has_parent_embedding,
                 }
             )
         retrieved = sorted(
@@ -1637,8 +2086,8 @@ class MessageStore:
             ),
             reverse=True,
         )
-        # Thread context helps rank a shortlist, but cannot qualify every
-        # attachment in the same thread as a relevant file.
+        # Thread context qualifies children only when the caller explicitly
+        # supplied a context query. Direct searches remain content-scoped.
         direct_evidence_fields = (
             "name",
             "uploader_name",
@@ -1648,15 +2097,8 @@ class MessageStore:
             "caption_ocr",
             "image_inspection",
         )
-        anchor_tokens = query_tokens - FILE_SEARCH_GENERIC_QUERY_TOKENS
-        if not anchor_tokens:
-            anchor_tokens = query_tokens
-        required_anchor_matches = min(2, len(anchor_tokens))
-        relevant = []
+        direct_token_sets = []
         for item in reranked:
-            is_image = str(item.get("mimetype") or "").startswith("image/")
-            if is_image and access_token and not item["image_inspected"]:
-                continue
             direct_evidence_tokens: set[str] = set()
             item_evidence_fields = direct_evidence_fields
             if int(item.get("message_file_count") or 1) == 1:
@@ -1665,16 +2107,49 @@ class MessageStore:
                 direct_evidence_tokens.update(
                     self._file_search_tokens(item.get(key))
                 )
-            direct_anchor_matches = len(
-                anchor_tokens & direct_evidence_tokens
+            direct_token_sets.append(direct_evidence_tokens)
+        document_count = max(1, len(direct_token_sets))
+        query_token_weights = {
+            token: math.log(
+                1.0
+                + (
+                    document_count
+                    - sum(token in tokens for tokens in direct_token_sets)
+                    + 0.5
+                )
+                / (
+                    sum(token in tokens for tokens in direct_token_sets)
+                    + 0.5
+                )
+            )
+            for token in query_tokens
+        }
+        total_query_weight = sum(query_token_weights.values())
+        relevant = []
+        for item, direct_evidence_tokens in zip(
+            reranked, direct_token_sets, strict=True
+        ):
+            direct_coverage = (
+                sum(
+                    query_token_weights[token]
+                    for token in query_tokens & direct_evidence_tokens
+                )
+                / total_query_weight
+                if total_query_weight
+                else 0.0
             )
             if (
-                direct_anchor_matches >= required_anchor_matches > 0
+                (
+                    bool(context_query)
+                    and item["has_parent_embedding"]
+                    and float(item.get("parent_semantic_score") or 0.0) >= 0.2
+                )
+                or direct_coverage >= FILE_SEARCH_MIN_LEXICAL_COVERAGE
                 or float(item.get("semantic_score") or 0.0)
                 >= FILE_SEARCH_MIN_SEMANTIC_SCORE
             ):
                 relevant.append(item)
-        limit = max(1, min(int(request.get("limit") or 3), 3))
+        limit = max(1, min(int(request.get("limit") or 3), 20))
         output = []
         for item in relevant[:limit]:
             evidence = []
@@ -1687,6 +2162,11 @@ class MessageStore:
                 value = str(item.get(key) or "").strip()
                 if value and query_tokens & self._file_search_tokens(value):
                     evidence.append(f"{label}: {value[:160]}")
+            if item["has_parent_embedding"] and not evidence:
+                evidence.append("thread: semantic context match")
+            description = str(
+                item.get("image_inspection") or item.get("caption_ocr") or ""
+            ).strip()
             output.append(
                 {
                     key: value
@@ -1699,10 +2179,16 @@ class MessageStore:
                         "message_file_count",
                         "retrieval_score",
                         "semantic_score",
+                        "parent_semantic_score",
+                        "has_parent_embedding",
                         "image_inspection",
                     }
                 }
-                | {"why_matched": " | ".join(evidence)[:320] or "metadata match"}
+                | {
+                    "description": description[:2_000] or None,
+                    "why_matched": " | ".join(evidence)[:320]
+                    or "metadata match",
+                }
             )
         return {
             "status": "complete",
@@ -2077,7 +2563,10 @@ class MessageStore:
             raise ValueError("file content and context versions must be integers")
 
         existing_share = conn.execute(
-            "SELECT tombstone_version FROM file_shares WHERE project_id=? "
+            "SELECT tombstone_version, upload_text, thread_context, "
+            "parent_embedding_json, parent_embedding_model, "
+            "parent_embedding_dimension, parent_embedding_attempts, "
+            "parent_embedding_error FROM file_shares WHERE project_id=? "
             "AND provider=? AND workspace_id=? AND file_id=? AND conversation_id=? "
             "AND provider_message_id=?",
             share_scope,
@@ -2102,6 +2591,39 @@ class MessageStore:
             raise ValueError("invalid file processing status")
         text_embedding = request.get("text_content_embedding")
         image_embedding = request.get("image_embedding")
+        parent_embedding = request.get("parent_embedding")
+        upload_text = str(request.get("upload_text") or "") or None
+        thread_context = str(request.get("thread_context") or "") or None
+        parent_embedding_json = (
+            json.dumps(parent_embedding, separators=(",", ":"))
+            if parent_embedding is not None
+            else None
+        )
+        parent_embedding_model = (
+            str(request.get("parent_embedding_model") or "") or None
+        )
+        parent_embedding_dimension = (
+            int(request["parent_embedding_dimension"])
+            if request.get("parent_embedding_dimension") is not None
+            else None
+        )
+        parent_embedding_attempts = 0
+        parent_embedding_error = None
+        if (
+            existing_share is not None
+            and parent_embedding is None
+            and existing_share["upload_text"] == upload_text
+            and existing_share["thread_context"] == thread_context
+        ):
+            parent_embedding_json = existing_share["parent_embedding_json"]
+            parent_embedding_model = existing_share["parent_embedding_model"]
+            parent_embedding_dimension = existing_share[
+                "parent_embedding_dimension"
+            ]
+            parent_embedding_attempts = int(
+                existing_share["parent_embedding_attempts"] or 0
+            )
+            parent_embedding_error = existing_share["parent_embedding_error"]
         existing_content = conn.execute(
             "SELECT content_version FROM file_contents WHERE project_id=? "
             "AND provider=? AND workspace_id=? AND file_id=?",
@@ -2182,12 +2704,21 @@ class MessageStore:
         conn.execute(
             "INSERT INTO file_shares(project_id, provider, workspace_id, file_id, "
             "conversation_id, provider_message_id, uploader_id, upload_text, "
-            "thread_context, context_version, shared_at, tombstone_version, "
+            "thread_context, context_version, shared_at, parent_embedding_json, "
+            "parent_embedding_model, parent_embedding_dimension, "
+            "parent_embedding_attempts, parent_embedding_error, tombstone_version, "
             "tombstoned_at, inserted_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "NULL, NULL, ?, ?) "
             "ON CONFLICT(project_id, provider, workspace_id, file_id, "
             "conversation_id, provider_message_id) DO UPDATE SET "
-            "uploader_id=excluded.uploader_id, upload_text=excluded.upload_text, "
+            "uploader_id=excluded.uploader_id, "
+            "parent_embedding_json=excluded.parent_embedding_json, "
+            "parent_embedding_model=excluded.parent_embedding_model, "
+            "parent_embedding_dimension=excluded.parent_embedding_dimension, "
+            "parent_embedding_attempts=excluded.parent_embedding_attempts, "
+            "parent_embedding_error=excluded.parent_embedding_error, "
+            "upload_text=excluded.upload_text, "
             "thread_context=excluded.thread_context, "
             "context_version=excluded.context_version, shared_at=excluded.shared_at, "
             "tombstone_version=NULL, tombstoned_at=NULL, updated_at=excluded.updated_at "
@@ -2195,10 +2726,15 @@ class MessageStore:
             (
                 *share_scope,
                 str(request.get("uploader_id") or "") or None,
-                str(request.get("upload_text") or "") or None,
-                str(request.get("thread_context") or "") or None,
+                upload_text,
+                thread_context,
                 context_version,
                 str(request.get("shared_at") or "") or None,
+                parent_embedding_json,
+                parent_embedding_model,
+                parent_embedding_dimension,
+                parent_embedding_attempts,
+                parent_embedding_error,
                 applied_at,
                 applied_at,
             ),
@@ -2483,6 +3019,172 @@ class MessageStore:
             ),
         )
 
+    @staticmethod
+    def _message_search_match_query(segments: list[str]) -> str:
+        return " OR ".join(
+            f'"{segment.replace(chr(34), chr(34) * 2)}"'
+            for segment in list(dict.fromkeys(segments))[
+                :MESSAGE_SEARCH_MAX_QUERY_TERMS
+            ]
+            if segment
+        )
+
+    def _message_search_candidate_rowids(
+        self,
+        conn: Any,
+        *,
+        query: str,
+        start: str,
+        end: str,
+        providers: set[str],
+        workspaces: set[str],
+        conversations: set[str],
+        allowed: set[tuple[str, str, str]] | None,
+    ) -> list[int]:
+        """Retrieve a relevance-bounded candidate set inside SQLite."""
+        segments = search_segments(query)
+        ranked: dict[int, float] = {}
+
+        def collect_fts(table: str, match_query: str) -> None:
+            if not match_query:
+                return
+            sql = (
+                f"SELECT m.rowid AS message_rowid, bm25({table}) AS search_rank "
+                f"FROM {table} JOIN messages m ON m.rowid={table}.rowid "
+                f"WHERE {table} MATCH ? AND m.project_id=? "
+                "AND m.occurred_at>=? AND m.occurred_at<=? "
+                "AND m.deleted_at IS NULL"
+            )
+            params: list[Any] = [match_query, self.project_id, start, end]
+            sql, params = self._query_filters(
+                sql,
+                params,
+                providers=providers,
+                workspaces=workspaces,
+                conversations=conversations,
+                prefix="m.",
+                allowed=allowed,
+            )
+            sql += f" ORDER BY bm25({table}), m.occurred_at DESC LIMIT ?"
+            params.append(MESSAGE_SEARCH_CANDIDATE_LIMIT)
+            for row in conn.execute(sql, params).fetchall():
+                rowid = int(row["message_rowid"])
+                rank = float(row["search_rank"] or 0.0)
+                ranked[rowid] = min(ranked.get(rowid, rank), rank)
+
+        collect_fts(
+            "message_search_fts",
+            self._message_search_match_query(
+                [*segments, *search_index_terms(query)]
+            ),
+        )
+        collect_fts(
+            "message_search_trigram",
+            self._message_search_match_query(
+                [segment for segment in segments if len(segment) >= 3]
+            ),
+        )
+
+        # Single-character substring search cannot be represented by either
+        # trigrams or the language-neutral bigram terms.
+        single_character_segments = list(
+            dict.fromkeys(segment for segment in segments if len(segment) < 2)
+        )
+        if single_character_segments:
+            sql = (
+                "SELECT m.rowid AS message_rowid FROM messages m "
+                "WHERE m.project_id=? AND m.occurred_at>=? AND m.occurred_at<=? "
+                "AND m.deleted_at IS NULL AND ("
+                + " OR ".join(
+                    "instr(ringo_search_normalize(m.text), ?) > 0"
+                    for _segment in single_character_segments
+                )
+                + ")"
+            )
+            params = [self.project_id, start, end, *single_character_segments]
+            sql, params = self._query_filters(
+                sql,
+                params,
+                providers=providers,
+                workspaces=workspaces,
+                conversations=conversations,
+                prefix="m.",
+                allowed=allowed,
+            )
+            sql += " ORDER BY m.occurred_at DESC LIMIT ?"
+            params.append(MESSAGE_SEARCH_CANDIDATE_LIMIT)
+            for row in conn.execute(sql, params).fetchall():
+                ranked.setdefault(int(row["message_rowid"]), 1_000.0)
+
+        return [
+            rowid
+            for rowid, _rank in sorted(
+                ranked.items(),
+                key=lambda item: (item[1], item[0]),
+            )[:MESSAGE_SEARCH_CANDIDATE_LIMIT]
+        ]
+
+    def _message_search_context_rows(
+        self,
+        conn: Any,
+        *,
+        candidate_rowids: list[int],
+        start: str,
+        end: str,
+    ) -> list[Any]:
+        """Fetch bounded whole-thread context for the indexed candidates."""
+        if not candidate_rowids:
+            return []
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS message_search_candidates("
+            "message_rowid INTEGER PRIMARY KEY, priority INTEGER NOT NULL)"
+        )
+        conn.execute("DELETE FROM message_search_candidates")
+        conn.executemany(
+            "INSERT INTO message_search_candidates(message_rowid, priority) "
+            "VALUES (?, ?)",
+            [(rowid, priority) for priority, rowid in enumerate(candidate_rowids)],
+        )
+        sql = (
+            "WITH candidate_roots AS (SELECT m.project_id, m.provider, "
+            "m.workspace_id, m.conversation_id, COALESCE("
+            "m.parent_message_id, m.provider_message_id) AS root_id, "
+            "MIN(candidate.priority) AS priority "
+            "FROM message_search_candidates candidate "
+            "JOIN messages m ON m.rowid=candidate.message_rowid "
+            "GROUP BY m.project_id, m.provider, m.workspace_id, "
+            "m.conversation_id, COALESCE("
+            "m.parent_message_id, m.provider_message_id)), "
+            "scoped AS (SELECT m.*, c.title AS conversation_title, "
+            "i.display_name AS sender_display_name, root.priority, "
+            "ROW_NUMBER() OVER (PARTITION BY m.provider, m.workspace_id, "
+            "m.conversation_id, root.root_id ORDER BY m.occurred_at) "
+            "AS root_row_number FROM messages m JOIN candidate_roots root "
+            "ON root.project_id=m.project_id AND root.provider=m.provider "
+            "AND root.workspace_id=m.workspace_id "
+            "AND root.conversation_id=m.conversation_id "
+            "AND root.root_id=COALESCE("
+            "m.parent_message_id, m.provider_message_id) "
+            "LEFT JOIN conversations c ON c.project_id=m.project_id AND "
+            "c.provider=m.provider AND c.workspace_id=m.workspace_id AND "
+            "c.conversation_id=m.conversation_id LEFT JOIN identities i ON "
+            "i.project_id=m.project_id AND i.provider=m.provider AND "
+            "i.workspace_id=m.workspace_id AND i.external_user_id=m.sender_id "
+            "WHERE m.project_id=? AND m.occurred_at>=? AND m.occurred_at<=? "
+            "AND m.deleted_at IS NULL) SELECT * FROM scoped "
+            "WHERE root_row_number<=? ORDER BY priority, occurred_at LIMIT ?"
+        )
+        return conn.execute(
+            sql,
+            (
+                self.project_id,
+                start,
+                end,
+                MESSAGE_SEARCH_MAX_ROWS_PER_ROOT,
+                MESSAGE_SEARCH_CONTEXT_ROW_LIMIT,
+            ),
+        ).fetchall()
+
     def query(self, request: dict[str, Any]) -> dict[str, Any]:
         """Bounded project-local read after IE has resolved current ACL."""
         operation = str(request.get("operation") or "")
@@ -2491,8 +3193,12 @@ class MessageStore:
             "fetch_history",
             "fetch_snapshot",
             "ingest_window",
+            "search",
         }:
             raise ValueError("unsupported message store query operation")
+        search_query = str(request.get("query") or "").strip()
+        if operation == "search" and not search_query:
+            raise ValueError("search query is required")
         start = str(request.get("start") or "")
         end = str(request.get("end") or "")
         if not start or not end or start > end:
@@ -2698,8 +3404,49 @@ class MessageStore:
             sql += (
                 f" ORDER BY {time_column} DESC, m.provider DESC, "
                 "m.workspace_id DESC, m.conversation_id DESC, "
-                "m.provider_message_id DESC LIMIT ?"
+                "m.provider_message_id DESC"
             )
+            if operation == "search":
+                if not self.message_search_index_available:
+                    return {
+                        "hits": [],
+                        "coverage_complete": False,
+                        "reason": "search_index_unavailable",
+                    }
+                candidate_rowids = self._message_search_candidate_rowids(
+                    conn,
+                    query=search_query,
+                    start=start,
+                    end=end,
+                    providers=providers,
+                    workspaces=workspaces,
+                    conversations=conversations,
+                    allowed=allowed,
+                )
+                rows = self._message_search_context_rows(
+                    conn,
+                    candidate_rowids=candidate_rowids,
+                    start=start,
+                    end=end,
+                )
+                floor = max(str(row["contiguous_since"]) for row in coverage_rows)
+                return {
+                    "hits": _rank_message_rows(
+                        rows,
+                        query=search_query,
+                        limit=limit,
+                    ),
+                    "coverage_complete": True,
+                    "covered_since": floor,
+                    "last_sequence": max(
+                        int(row["last_sequence"] or 0)
+                        for row in conn.execute(
+                            "SELECT last_sequence FROM coverage WHERE project_id=?",
+                            (self.project_id,),
+                        ).fetchall()
+                    ),
+                }
+            sql += " LIMIT ?"
             params.append(
                 limit * 10
                 if operation == "recent_activity"

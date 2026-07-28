@@ -13,6 +13,8 @@ from typing import Any, Mapping
 
 from sqlcipher3 import dbapi2 as sqlcipher
 
+from .search_text import normalize_search_text, search_index_text
+
 
 KEYRING_ENV = "RINGO_MESSAGE_STORE_DB_KEYS"
 ACTIVE_KEY_VERSION_ENV = "RINGO_MESSAGE_STORE_DB_KEY_VERSION"
@@ -116,6 +118,18 @@ class EncryptedDatabase:
         conn.row_factory = sqlcipher.Row
         try:
             self._apply_key(conn, key)
+            conn.create_function(
+                "ringo_search_normalize",
+                1,
+                normalize_search_text,
+                deterministic=True,
+            )
+            conn.create_function(
+                "ringo_search_index_text",
+                1,
+                search_index_text,
+                deterministic=True,
+            )
             conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=5000")

@@ -2035,6 +2035,8 @@ class APIServerAdapter(BasePlatformAdapter):
                        (selective tool loading); additions connect via incremental
                        discovery, removals/updates trigger a full reload
           toolsets:    [names] → platform_toolsets.api_server (next turn)
+          tools:       {"tool_search": {"enabled": "off"|"auto"|"on"}} →
+                       project-scoped progressive-disclosure rollout (next turn)
           web:         shallow-merged into config.yaml web.* (read per call)
           env:         {KEY: value | null} → ~/.hermes/.env + in-process
                        reload_env(); null blanks the value (deletion only
@@ -2057,6 +2059,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "memory",
             "mcp_servers",
             "toolsets",
+            "tools",
             "web",
             "env",
             "project",
@@ -2227,6 +2230,35 @@ class APIServerAdapter(BasePlatformAdapter):
                     config["platform_toolsets"] = platform_toolsets
                     config_dirty = True
                     applied["toolsets"] = names
+
+            tools_spec = body.get("tools")
+            if isinstance(tools_spec, dict) and "tool_search" in tools_spec:
+                tool_search_spec = tools_spec.get("tool_search")
+                if not isinstance(tool_search_spec, dict):
+                    return web.json_response(
+                        _openai_error("tools.tool_search must be an object"),
+                        status=400,
+                    )
+                enabled = str(tool_search_spec.get("enabled") or "").strip().lower()
+                if enabled not in {"off", "auto", "on"}:
+                    return web.json_response(
+                        _openai_error(
+                            "tools.tool_search.enabled must be off, auto, or on"
+                        ),
+                        status=400,
+                    )
+                tools_cfg = config.get("tools")
+                if not isinstance(tools_cfg, dict):
+                    tools_cfg = {}
+                tool_search_cfg = tools_cfg.get("tool_search")
+                if not isinstance(tool_search_cfg, dict):
+                    tool_search_cfg = {}
+                if tool_search_cfg.get("enabled") != enabled:
+                    tool_search_cfg["enabled"] = enabled
+                    tools_cfg["tool_search"] = tool_search_cfg
+                    config["tools"] = tools_cfg
+                    config_dirty = True
+                applied["tool_search"] = enabled
 
             web_spec = body.get("web")
             if isinstance(web_spec, dict) and web_spec:
