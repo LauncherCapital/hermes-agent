@@ -276,7 +276,7 @@ def _auto_activation_threshold_tokens(
 
 
 # ---------------------------------------------------------------------------
-# Catalog + BM25 retrieval
+# Catalog + fielded BM25 retrieval with reciprocal-rank fusion
 # ---------------------------------------------------------------------------
 
 
@@ -294,7 +294,7 @@ class CatalogEntry:
     _tokens: List[str] = field(default_factory=list)
 
 
-_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 
 
 def _tokenize(text: str) -> List[str]:
@@ -392,14 +392,91 @@ def _bm25_score(query_tokens: List[str], doc_tokens: List[str],
     return score
 
 
-def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5) -> List[CatalogEntry]:
-    """Return the top-``limit`` catalog entries for ``query`` by BM25.
+def _field_tokens(entry: CatalogEntry) -> Tuple[List[str], List[str], List[str], List[str]]:
+    """Return name, description, parameter, and combined token streams."""
+    fn = entry.schema.get("function") or {}
+    name = str(fn.get("name") or entry.name)
+    name_words = (
+        name.replace("_", " ")
+        .replace(".", " ")
+        .replace("-", " ")
+        .replace(":", " ")
+    )
+    description = str(fn.get("description") or entry.description or "")
+    properties = ((fn.get("parameters") or {}).get("properties") or {})
+    parameter_names = " ".join(str(key) for key in properties)
+    return (
+        _tokenize(name_words),
+        _tokenize(description),
+        _tokenize(parameter_names),
+        entry._tokens
+        or _tokenize(f"{name_words} {description} {parameter_names}"),
+    )
 
-    Falls back to a stable name-substring match when BM25 yields no hits
-    above zero. That ensures a query like ``"github"`` against a catalog
-    where every tool is named ``github_*`` still returns results — BM25
-    can underperform when query and document share only one token that
-    appears in every document (zero IDF).
+
+def _bm25_ranking(
+    catalog: List[CatalogEntry],
+    query_tokens: List[str],
+    documents: List[List[str]],
+) -> List[CatalogEntry]:
+    """Rank one catalog field with BM25, excluding zero-score documents."""
+    doc_lengths = [len(tokens) for tokens in documents]
+    avg_dl = sum(doc_lengths) / max(len(doc_lengths), 1)
+    doc_freq: Dict[str, int] = {}
+    for tokens in documents:
+        for token in set(tokens):
+            doc_freq[token] = doc_freq.get(token, 0) + 1
+
+    scored: List[Tuple[float, CatalogEntry]] = []
+    for entry, tokens in zip(catalog, documents):
+        score = _bm25_score(
+            query_tokens,
+            tokens,
+            doc_lengths,
+            avg_dl,
+            doc_freq,
+            len(catalog),
+        )
+        if score > 0:
+            scored.append((score, entry))
+    scored.sort(key=lambda item: (-item[0], item[1].name))
+    return [entry for _, entry in scored]
+
+
+def _reciprocal_rank_fusion(
+    rankings: List[List[CatalogEntry]],
+    *,
+    rank_constant: int = 60,
+) -> List[CatalogEntry]:
+    """Fuse independent field rankings without comparing unlike BM25 scores."""
+    scores: Dict[str, float] = {}
+    best_rank: Dict[str, int] = {}
+    entries: Dict[str, CatalogEntry] = {}
+    for ranking in rankings:
+        for rank, entry in enumerate(ranking, start=1):
+            entries[entry.name] = entry
+            scores[entry.name] = scores.get(entry.name, 0.0) + (
+                1.0 / (rank_constant + rank)
+            )
+            best_rank[entry.name] = min(best_rank.get(entry.name, rank), rank)
+    return sorted(
+        entries.values(),
+        key=lambda entry: (
+            -scores[entry.name],
+            best_rank[entry.name],
+            entry.name,
+        ),
+    )
+
+
+def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5) -> List[CatalogEntry]:
+    """Return top catalog entries using fielded BM25 and reciprocal-rank fusion.
+
+    Tool names, descriptions, and combined schema text are ranked separately.
+    Parameter names remain searchable through the combined text, but do not
+    receive an independent RRF vote: a generic argument such as ``file_id``
+    should not outrank a tool whose name and description match the intent.
+    A stable name-substring fallback covers punctuation-only or unusual names.
     """
     if not catalog or limit <= 0:
         return []
@@ -407,32 +484,22 @@ def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5) -> L
     if not query_tokens:
         return []
 
-    # Precompute doc statistics.
-    doc_lengths = [len(e._tokens) for e in catalog]
-    avg_dl = sum(doc_lengths) / max(len(doc_lengths), 1)
-    doc_freq: Dict[str, int] = {}
-    for e in catalog:
-        seen = set(e._tokens)
-        for t in seen:
-            doc_freq[t] = doc_freq.get(t, 0) + 1
-    n_docs = len(catalog)
+    fields = [_field_tokens(entry) for entry in catalog]
+    rankings = [
+        _bm25_ranking(catalog, query_tokens, [field[index] for field in fields])
+        for index in (0, 1, 3)
+    ]
+    fused = _reciprocal_rank_fusion(rankings)
 
-    scored: List[Tuple[float, CatalogEntry]] = []
-    for entry in catalog:
-        s = _bm25_score(query_tokens, entry._tokens, doc_lengths, avg_dl,
-                        doc_freq, n_docs)
-        if s > 0:
-            scored.append((s, entry))
-
-    if not scored:
+    if not fused:
         # Substring fallback against the original tool name.
         ql = query.lower()
-        for entry in catalog:
-            if ql in entry.name.lower():
-                scored.append((0.1, entry))
+        fused = sorted(
+            (entry for entry in catalog if ql in entry.name.lower()),
+            key=lambda entry: entry.name,
+        )
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [e for _, e in scored[:limit]]
+    return fused[:limit]
 
 
 # ---------------------------------------------------------------------------

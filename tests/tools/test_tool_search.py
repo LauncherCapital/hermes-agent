@@ -225,7 +225,7 @@ class TestThresholdGate:
 
 
 # ---------------------------------------------------------------------------
-# Retrieval (BM25 + substring fallback)
+# Retrieval (fielded BM25 + RRF + substring fallback)
 # ---------------------------------------------------------------------------
 
 
@@ -275,6 +275,123 @@ class TestRetrieval:
         from tools.tool_search import search_catalog
         hits = search_catalog(self._fake_catalog(), "github", limit=1)
         assert len(hits) <= 1
+
+    def test_tokenizer_keeps_unicode_terms(self):
+        from tools.tool_search import _tokenize
+
+        assert _tokenize("공개 아티팩트 artifact_id") == [
+            "공개",
+            "아티팩트",
+            "artifact",
+            "id",
+        ]
+
+    def test_rrf_rewards_matches_across_name_description_and_combined_schema(self):
+        from tools.tool_search import build_catalog, search_catalog
+
+        catalog = build_catalog(
+            [
+                _td(
+                    "artifact_set_access",
+                    "Change an artifact between private, team, and public access.",
+                    {
+                        "artifact_id": {"type": "string"},
+                        "access": {"type": "string"},
+                    },
+                ),
+                _td(
+                    "web_publish",
+                    "Publish public artifact access. " * 20,
+                    {"payload": {"type": "string"}},
+                ),
+                _td(
+                    "artifact_get",
+                    "Read one artifact.",
+                    {"artifact_id": {"type": "string"}},
+                ),
+            ]
+        )
+
+        hits = search_catalog(catalog, "artifact public access", limit=3)
+
+        assert hits[0].name == "artifact_set_access"
+
+    def test_artifact_publish_intent_returns_both_workflow_tools(self):
+        from tools.tool_search import build_catalog, search_catalog
+
+        catalog = build_catalog(
+            [
+                _td(
+                    "artifact_create",
+                    "Save a generated artifact for durable browser preview. "
+                    "This never creates a public share link.",
+                    {
+                        "filename": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                ),
+                _td(
+                    "artifact_set_access",
+                    "Change an artifact to public access and create a no-login URL.",
+                    {
+                        "artifact_id": {"type": "string"},
+                        "access": {"type": "string"},
+                    },
+                ),
+                _td(
+                    "slack_upload_file",
+                    "Upload a generated text file into Slack.",
+                    {"filename": {"type": "string"}},
+                ),
+                _td(
+                    "connector_search",
+                    "Search connectable applications.",
+                    {"query": {"type": "string"}},
+                ),
+            ]
+        )
+
+        hits = search_catalog(
+            catalog,
+            "create a generated artifact and publish a public no-login link",
+            limit=3,
+        )
+
+        assert {hit.name for hit in hits[:2]} == {
+            "artifact_create",
+            "artifact_set_access",
+        }
+
+    def test_parameter_only_matches_do_not_outrank_upload_intent(self):
+        from tools.tool_search import build_catalog, search_catalog
+
+        catalog = build_catalog(
+            [
+                _td(
+                    "slack_upload_file",
+                    "Upload a generated text file into Slack.",
+                    {
+                        "filename": {"type": "string"},
+                        "content": {"type": "string"},
+                        "channel": {"type": "string"},
+                    },
+                ),
+                _td(
+                    "slack_view_file",
+                    "Read the contents of an existing Slack file.",
+                    {"file_id": {"type": "string"}},
+                ),
+                _td(
+                    "get_user_by_slack_id",
+                    "Look up a Slack user.",
+                    {"slack_user_id": {"type": "string"}},
+                ),
+            ]
+        )
+
+        hits = search_catalog(catalog, "upload a generated text file to slack", limit=3)
+
+        assert hits[0].name == "slack_upload_file"
 
 
 # ---------------------------------------------------------------------------

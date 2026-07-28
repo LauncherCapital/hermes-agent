@@ -207,10 +207,10 @@ class TestSkillManageCrossProfileErrorUX:
         # Switch-profiles hint
         assert "hermes -p" in err
 
-    def test_genuinely_missing_skill_keeps_helpful_hint(
+    def test_genuinely_missing_skill_handles_stale_session_without_recreate(
         self, fake_hermes, monkeypatch
     ):
-        """When no profile has the skill, error falls back to skills_list hint."""
+        """Automatic maintenance of a removed skill must end without recreation."""
         import importlib
         import tools.skill_manager_tool
         importlib.reload(tools.skill_manager_tool)
@@ -219,6 +219,10 @@ class TestSkillManageCrossProfileErrorUX:
         err = _skill_not_found_error("totally-imaginary-skill")
         assert "not found in active profile 'hermes-security'" in err
         assert "skills_list" in err
+        assert "stale session state" in err
+        assert "do not recreate it" in err
+        assert "infer a different source" in err
+        assert "continue the user's primary task" in err
 
 
 # ---------------------------------------------------------------------------
