@@ -1083,6 +1083,39 @@ def test_channel_context_defaults_to_index_and_expands_references_on_demand(
     assert "PRIVATE_DETAILED_REFERENCE" in detailed["context"]
 
 
+def test_control_plane_preview_reuses_encrypted_store_and_exact_identity(tmp_path):
+    service_mod = _load_service_module()
+    service = _service(service_mod, tmp_path)
+    service.prepare(request=_request())
+    content = "---\nname: channel-C1\n---\n\nSAFE_CHANNEL_CONTEXT\n"
+    service.documents.put(PROJECT_ID, "channels", "C1", content)
+
+    result = service.preview(
+        request={
+            "project_id": PROJECT_ID,
+            "payload": {
+                "agent_id": AGENT_ID,
+                "path": "skills/channels/C1/SKILL.md",
+            },
+        }
+    )
+
+    assert result["content"] == content
+    assert "SAFE_CHANNEL_CONTEXT" not in (
+        tmp_path / "skills/channels/C1/SKILL.md"
+    ).read_text()
+    with pytest.raises(service_mod.EntitySkillError, match="identity"):
+        service.preview(
+            request={
+                "project_id": PROJECT_ID,
+                "payload": {
+                    "agent_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    "path": "skills/channels/C1/SKILL.md",
+                },
+            }
+        )
+
+
 def test_private_acl_response_with_wrong_principal_fails_closed(tmp_path):
     service_mod = _load_service_module()
 

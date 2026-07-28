@@ -24,6 +24,10 @@ def _context(*, request: dict, **_: object) -> dict:
     return _service.context(request=request)
 
 
+def _preview(*, request: dict, **_: object) -> dict:
+    return _service.preview(request=request)
+
+
 def _pre_llm_call(**kwargs: object) -> dict | None:
     return _service.inject_context(**kwargs)
 
@@ -48,6 +52,7 @@ def register(ctx) -> None:
     ctx.register_action("ringo.entity_skills.prepare", _prepare)
     ctx.register_action("ringo.entity_skills.finish", _finish)
     ctx.register_action("ringo.entity_skills.context", _context)
+    ctx.register_action("ringo.entity_skills.preview", _preview)
     ctx.register_hook("pre_llm_call", _pre_llm_call)
     ctx.register_hook("pre_tool_call", _pre_tool_call)
     ctx.register_hook("post_tool_call", _post_tool_call)

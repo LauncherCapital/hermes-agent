@@ -899,6 +899,53 @@ class EntitySkillService:
             session_id=_component(payload.get("session_id"), "session_id"),
         )
 
+    def preview(self, *, request: dict[str, Any]) -> dict[str, Any]:
+        """Decrypt one canonical channel skill for the control-plane inspector."""
+        if not isinstance(request, dict):
+            raise EntitySkillError("invalid preview request")
+        project_id = _uuid(request.get("project_id"), "project_id")
+        payload = request.get("payload")
+        if not isinstance(payload, dict):
+            raise EntitySkillError("invalid preview payload")
+        agent_id = _uuid(payload.get("agent_id"), "agent_id")
+        relative_path = str(payload.get("path") or "")
+        match = re.fullmatch(
+            r"skills/channels/([A-Za-z0-9._%-]{1,128})/SKILL\.md",
+            relative_path,
+        )
+        if match is None:
+            raise EntitySkillError("preview path is not a canonical channel skill")
+        channel_id = _component(match.group(1), "channel_id")
+        path = self._path("channels", channel_id)
+        if path.is_symlink():
+            raise EntitySkillError("entity skill symlink is not allowed")
+
+        with self._lock:
+            manifest = self._load()
+            if (
+                str(manifest.get("project_id") or "") != project_id
+                or str(manifest.get("agent_id") or "") != agent_id
+            ):
+                raise EntitySkillError("entity skill preview identity mismatch")
+            self._migrate_one(
+                project_id=project_id,
+                kind="channels",
+                entity_id=channel_id,
+            )
+            content = self._document(project_id, "channels", channel_id)
+        if content is None:
+            raise EntitySkillError("entity skill preview file is missing")
+
+        from gateway.volume_inspector import truncate_utf8
+
+        preview, truncated = truncate_utf8(content)
+        return {
+            "path": relative_path,
+            "content": preview,
+            "encoding": "utf-8",
+            "truncated": truncated,
+        }
+
     def _binding_context(
         self,
         binding: dict[str, Any],

@@ -7,6 +7,7 @@ actions:
   - ringo.entity_skills.prepare
   - ringo.entity_skills.finish
   - ringo.entity_skills.context
+  - ringo.entity_skills.preview
 hooks:
   - pre_llm_call
   - pre_tool_call
