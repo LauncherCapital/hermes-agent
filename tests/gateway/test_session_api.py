@@ -441,6 +441,7 @@ async def test_chat_completions_session_syncs_explicit_context(
                         "user_id": "U1",
                         "principal_id": "",
                         "team_slug": "",
+                        "slack_caller_token": "signed-channel-context",
                     },
                 },
                 headers={
@@ -454,6 +455,10 @@ async def test_chat_completions_session_syncs_explicit_context(
     assert kwargs["conversation_history"] == context_messages
     assert kwargs["persist_user_message_id"] == "slack:102.000"
     assert kwargs["trusted_runtime_metadata"]["channel_id"] == "C1"
+    assert (
+        kwargs["trusted_runtime_metadata"]["slack_caller_token"]
+        == "signed-channel-context"
+    )
 
 
 @pytest.mark.asyncio

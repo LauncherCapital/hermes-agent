@@ -563,6 +563,7 @@ _TRUSTED_RUNTIME_FIELDS = {
     "user_id",
     "principal_id",
     "team_slug",
+    "slack_caller_token",
 }
 
 
@@ -577,9 +578,10 @@ def _trusted_runtime_metadata(
         or set(value) - _TRUSTED_RUNTIME_FIELDS
         or any(
             not isinstance(item, str)
-            or len(item) > 256
+            or len(item)
+            > (8192 if key == "slack_caller_token" else 256)
             or re.search(r"[\r\n\x00]", item)
-            for item in value.values()
+            for key, item in value.items()
         )
     ):
         return None, web.json_response(
