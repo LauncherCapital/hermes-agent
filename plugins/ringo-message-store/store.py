@@ -9,7 +9,9 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -32,7 +34,7 @@ from .file_processing import (
 
 logger = logging.getLogger(__name__)
 SCHEMA_VERSION = 7
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 PROTOCOL_CAPABILITIES = (
     "acl_metadata",
     "allowed_source_ids",
@@ -41,6 +43,7 @@ PROTOCOL_CAPABILITIES = (
     "file_index_parent_context_v1",
     "file_index_v1",
     "ingest_window",
+    "message_search_v1",
     "reconciliation_events",
     "stable_cursor",
 )
@@ -54,6 +57,238 @@ FILE_SEARCH_IMAGE_INSPECT_LIMIT = 3
 FILE_SEARCH_MIN_SEMANTIC_SCORE = 0.80
 FILE_SEARCH_MIN_LEXICAL_COVERAGE = 0.25
 MAX_FILE_PROCESSING_ATTEMPTS = 3
+MESSAGE_SEARCH_ADJACENCY_SECONDS = 10 * 60
+MESSAGE_SEARCH_MIN_TERM_COVERAGE = 0.6
+
+
+def _search_words(text: str) -> list[str]:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
+
+
+def _search_features(text: str) -> Counter[str]:
+    features: Counter[str] = Counter()
+    for word in _search_words(text):
+        features[f"w:{word}"] += 1
+        if len(word) >= 3:
+            for index in range(len(word) - 2):
+                features[f"c:{word[index : index + 3]}"] += 1
+    return features
+
+
+def _row_search_text(row: Any) -> str:
+    return " ".join(
+        value
+        for value in (
+            str(row["text"] or ""),
+            str(row["conversation_title"] or ""),
+            str(row["sender_display_name"] or ""),
+        )
+        if value
+    )
+
+
+def _row_timestamp(row: Any) -> float:
+    try:
+        return datetime.fromisoformat(str(row["occurred_at"])).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _search_message(row: Any) -> dict[str, Any]:
+    try:
+        provider_payload = json.loads(row["provider_payload_json"] or "{}")
+    except json.JSONDecodeError:
+        provider_payload = {}
+    return {
+        "provider": row["provider"],
+        "workspace_id": row["workspace_id"],
+        "conversation_id": row["conversation_id"],
+        "conversation_title": row["conversation_title"],
+        "provider_message_id": row["provider_message_id"],
+        "parent_message_id": row["parent_message_id"],
+        "sender_id": row["sender_id"],
+        "sender_display_name": row["sender_display_name"],
+        "text": row["text"],
+        "occurred_at": row["occurred_at"],
+        "changed_at": row["updated_at"],
+        "edited_at": row["edited_at"],
+        "provider_payload": provider_payload,
+        "reactions": [],
+    }
+
+
+def _rank_message_rows(
+    rows: list[Any],
+    *,
+    query: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    query_words = set(_search_words(query))
+    query_features = _search_features(query)
+    if not query_words or not query_features:
+        return []
+
+    units: list[dict[str, Any]] = []
+    by_conversation: dict[tuple[str, str, str], list[Any]] = {}
+    for row in rows:
+        by_conversation.setdefault(
+            (
+                str(row["provider"]),
+                str(row["workspace_id"]),
+                str(row["conversation_id"]),
+            ),
+            [],
+        ).append(row)
+    for conversation_rows in by_conversation.values():
+        grouped: dict[str, list[Any]] = {}
+        for row in conversation_rows:
+            root_id = str(row["parent_message_id"] or row["provider_message_id"])
+            grouped.setdefault(root_id, []).append(row)
+        conversation_units = [
+            {
+                "core": sorted(group, key=_row_timestamp),
+                "context": sorted(group, key=_row_timestamp),
+            }
+            for group in grouped.values()
+        ]
+        conversation_units.sort(key=lambda item: _row_timestamp(item["core"][0]))
+        for index, unit in enumerate(conversation_units):
+            adjacent: list[Any] = []
+            for neighbor_index in (index - 1, index + 1):
+                if not 0 <= neighbor_index < len(conversation_units):
+                    continue
+                neighbor = conversation_units[neighbor_index]
+                gap = min(
+                    abs(_row_timestamp(left) - _row_timestamp(right))
+                    for left in unit["core"]
+                    for right in neighbor["core"]
+                )
+                if gap <= MESSAGE_SEARCH_ADJACENCY_SECONDS:
+                    adjacent.extend(neighbor["core"])
+            unit["adjacent"] = adjacent
+            unit["context"] = sorted(
+                [*unit["core"], *adjacent],
+                key=_row_timestamp,
+            )
+            units.append(unit)
+
+    document_features: list[Counter[str]] = []
+    document_words: list[set[str]] = []
+    for unit in units:
+        core_text = " ".join(_row_search_text(row) for row in unit["core"])
+        adjacent_text = " ".join(_row_search_text(row) for row in unit["adjacent"])
+        features = _search_features(core_text)
+        for feature, count in _search_features(adjacent_text).items():
+            features[feature] += count * 0.35
+        document_features.append(features)
+        document_words.append(set(_search_words(f"{core_text} {adjacent_text}")))
+
+    document_count = len(units)
+    if not document_count:
+        return []
+    document_frequency = {
+        feature: sum(1 for features in document_features if features[feature] > 0)
+        for feature in query_features
+    }
+    lengths = [sum(features.values()) for features in document_features]
+    average_length = sum(lengths) / document_count or 1.0
+    required_terms = math.ceil(len(query_words) * MESSAGE_SEARCH_MIN_TERM_COVERAGE)
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    normalized_query = unicodedata.normalize("NFKC", query).casefold()
+    for index, unit in enumerate(units):
+        matched_terms = {
+            word
+            for word in query_words
+            if word in document_words[index]
+            or word
+            in unicodedata.normalize(
+                "NFKC",
+                " ".join(_row_search_text(row) for row in unit["context"]),
+            ).casefold()
+        }
+        if len(matched_terms) < required_terms:
+            continue
+        score = 0.0
+        for feature, query_count in query_features.items():
+            term_frequency = document_features[index][feature]
+            if term_frequency <= 0:
+                continue
+            frequency = document_frequency[feature]
+            inverse_frequency = math.log(
+                1.0 + (document_count - frequency + 0.5) / (frequency + 0.5)
+            )
+            denominator = term_frequency + 1.2 * (
+                0.25 + 0.75 * lengths[index] / average_length
+            )
+            score += (
+                inverse_frequency * (term_frequency * 2.2 / denominator) * query_count
+            )
+        core_text = unicodedata.normalize(
+            "NFKC",
+            " ".join(_row_search_text(row) for row in unit["core"]),
+        ).casefold()
+        context_text = unicodedata.normalize(
+            "NFKC",
+            " ".join(_row_search_text(row) for row in unit["context"]),
+        ).casefold()
+        if normalized_query in core_text:
+            score += 2.0
+        elif normalized_query in context_text:
+            score += 0.7
+        primary = max(
+            unit["context"],
+            key=lambda row: (
+                sum(
+                    min(count, _search_features(_row_search_text(row))[feature])
+                    for feature, count in query_features.items()
+                ),
+                _row_timestamp(row),
+            ),
+        )
+        ranked.append((
+            score,
+            {
+                "score": round(score, 6),
+                "message": _search_message(primary),
+                "context": [_search_message(row) for row in unit["context"]],
+            },
+        ))
+
+    ranked.sort(
+        key=lambda item: (
+            item[0],
+            _row_timestamp(
+                next(
+                    row
+                    for unit in units
+                    for row in unit["context"]
+                    if str(row["provider_message_id"])
+                    == str(item[1]["message"]["provider_message_id"])
+                    and str(row["conversation_id"])
+                    == str(item[1]["message"]["conversation_id"])
+                )
+            ),
+        ),
+        reverse=True,
+    )
+    selected: list[dict[str, Any]] = []
+    selected_contexts: list[set[tuple[str, str]]] = []
+    for _score, hit in ranked:
+        context_keys = {
+            (
+                str(message["conversation_id"]),
+                str(message["provider_message_id"]),
+            )
+            for message in hit["context"]
+        }
+        if any(context_keys & existing for existing in selected_contexts):
+            continue
+        selected.append(hit)
+        selected_contexts.append(context_keys)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 _SCHEMA = """
@@ -2726,8 +2961,12 @@ class MessageStore:
             "fetch_history",
             "fetch_snapshot",
             "ingest_window",
+            "search",
         }:
             raise ValueError("unsupported message store query operation")
+        search_query = str(request.get("query") or "").strip()
+        if operation == "search" and not search_query:
+            raise ValueError("search query is required")
         start = str(request.get("start") or "")
         end = str(request.get("end") or "")
         if not start or not end or start > end:
@@ -2933,8 +3172,28 @@ class MessageStore:
             sql += (
                 f" ORDER BY {time_column} DESC, m.provider DESC, "
                 "m.workspace_id DESC, m.conversation_id DESC, "
-                "m.provider_message_id DESC LIMIT ?"
+                "m.provider_message_id DESC"
             )
+            if operation == "search":
+                rows = conn.execute(sql, params).fetchall()
+                floor = max(str(row["contiguous_since"]) for row in coverage_rows)
+                return {
+                    "hits": _rank_message_rows(
+                        rows,
+                        query=search_query,
+                        limit=limit,
+                    ),
+                    "coverage_complete": True,
+                    "covered_since": floor,
+                    "last_sequence": max(
+                        int(row["last_sequence"] or 0)
+                        for row in conn.execute(
+                            "SELECT last_sequence FROM coverage WHERE project_id=?",
+                            (self.project_id,),
+                        ).fetchall()
+                    ),
+                }
+            sql += " LIMIT ?"
             params.append(
                 limit * 10
                 if operation == "recent_activity"

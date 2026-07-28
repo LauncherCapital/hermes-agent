@@ -189,6 +189,7 @@ async def test_claim_initializes_schema_key_and_idempotent_delivery(tmp_path, mo
         "event_batch",
         "file_index_v1",
         "ingest_window",
+        "message_search_v1",
         "reconciliation_events",
         "stable_cursor",
     } <= set(health["capabilities"])
@@ -2525,6 +2526,119 @@ def test_bounded_query_enforces_exact_acl_tuples_and_complete_coverage(
     assert {row["provider_message_id"] for row in result["messages"]} == {
         "allowed-one",
         "allowed-two",
+    }
+
+
+def test_message_search_recovers_price_change_thread_without_cross_thread_noise(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    messages = (
+        (
+            "C099U109ZM4",
+            "1784869080.000001",
+            None,
+            "월문당/CallMe 가격 변경 논의",
+            "2026-07-24T09:38:00+00:00",
+        ),
+        (
+            "C099U109ZM4",
+            "1784869142.677289",
+            None,
+            "단건 26,700원 -> 31,900원, 구독 26,000원 -> 33,900원",
+            "2026-07-24T09:39:02+00:00",
+        ),
+        (
+            "C099U109ZM4",
+            "1784869200.000001",
+            "1784869142.677289",
+            "Stripe 신규 Price 생성 방식입니다.",
+            "2026-07-24T09:40:00+00:00",
+        ),
+        (
+            "COTHER",
+            "1784869260.000001",
+            None,
+            "다른 서비스 가격 변경은 다음 분기에 검토합니다.",
+            "2026-07-24T09:41:00+00:00",
+        ),
+        (
+            "CSECRET",
+            "1784869320.000001",
+            None,
+            "월문당 가격 변경 Stripe 전체 키워드가 있지만 ACL 밖입니다.",
+            "2026-07-24T09:42:00+00:00",
+        ),
+    )
+    with store._connect() as conn:
+        for conversation_id in {"C099U109ZM4", "COTHER", "CSECRET"}:
+            conn.execute(
+                "INSERT INTO conversations(project_id, provider, workspace_id, "
+                "conversation_id, title, updated_at) VALUES (?, 'slack', 'T1', ?, ?, ?)",
+                (
+                    project_id,
+                    conversation_id,
+                    "billing" if conversation_id == "C099U109ZM4" else "random",
+                    "2026-07-24T10:00:00+00:00",
+                ),
+            )
+            conn.execute(
+                "INSERT INTO coverage(project_id, provider, workspace_id, "
+                "conversation_id, contiguous_since, last_sequence, last_event_at, state) "
+                "VALUES (?, 'slack', 'T1', ?, '2026-07-20T00:00:00+00:00', 6673, "
+                "'2026-07-26T00:00:00+00:00', 'COLLECTING')",
+                (project_id, conversation_id),
+            )
+        for conversation_id, message_id, parent_id, text, occurred_at in messages:
+            conn.execute(
+                "INSERT INTO messages(project_id, provider, workspace_id, "
+                "conversation_id, provider_message_id, parent_message_id, sender_id, "
+                "text, provider_payload_json, occurred_at, inserted_at, updated_at) "
+                "VALUES (?, 'slack', 'T1', ?, ?, ?, 'U1', ?, '{}', ?, ?, ?)",
+                (
+                    project_id,
+                    conversation_id,
+                    message_id,
+                    parent_id,
+                    text,
+                    occurred_at,
+                    occurred_at,
+                    occurred_at,
+                ),
+            )
+
+    scoped = {
+        "operation": "search",
+        "start": "2026-07-20T00:00:00+00:00",
+        "end": "2026-07-28T00:00:00+00:00",
+        "providers": ["slack"],
+        "workspace_ids": ["T1"],
+        "allowed_source_ids": ["slack:T1:C099U109ZM4", "slack:T1:COTHER"],
+        "limit": 10,
+    }
+    regression = store.query({**scoped, "query": "월문당 가격 변경 Stripe"})
+    direct = store.query({**scoped, "query": "31,900원"})
+    reply = store.query({**scoped, "query": "Stripe 신규 Price"})
+
+    assert regression["coverage_complete"] is True
+    assert len(regression["hits"]) == 1
+    assert regression["hits"][0]["message"]["conversation_id"] == "C099U109ZM4"
+    assert {
+        item["provider_message_id"] for item in regression["hits"][0]["context"]
+    } >= {"1784869142.677289", "1784869200.000001"}
+    assert all(
+        hit["message"]["conversation_id"] not in {"COTHER", "CSECRET"}
+        for hit in regression["hits"]
+    )
+    assert direct["hits"][0]["message"]["provider_message_id"] == "1784869142.677289"
+    assert reply["hits"][0]["message"]["provider_message_id"] == "1784869200.000001"
+    assert {item["provider_message_id"] for item in reply["hits"][0]["context"]} >= {
+        "1784869142.677289",
+        "1784869200.000001",
     }
 
 
