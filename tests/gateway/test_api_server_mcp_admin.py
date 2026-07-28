@@ -256,6 +256,164 @@ class TestAdminConfig:
             assert resp.status == 400
 
     @pytest.mark.asyncio
+    async def test_file_search_reranker_model_applies_and_rolls_back_live(
+        self, adapter
+    ):
+        from hermes_cli.config import load_config
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/admin/config",
+                json={
+                    "ringo": {
+                        "file_search": {
+                            "reranker_model": "cohere/rerank-4-pro"
+                        }
+                    }
+                },
+            )
+            assert resp.status == 200
+            assert (await resp.json())["applied"][
+                "file_search_reranker_model"
+            ] == "cohere/rerank-4-pro"
+            assert load_config()["ringo"]["file_search"][
+                "reranker_model"
+            ] == "cohere/rerank-4-pro"
+
+            resp = await cli.post(
+                "/admin/config",
+                json={"ringo": {"file_search": {"reranker_model": None}}},
+            )
+            assert resp.status == 200
+            assert (await resp.json())["applied"][
+                "file_search_reranker_model"
+            ] is None
+            assert load_config()["ringo"]["file_search"]["reranker_model"] == ""
+
+    @pytest.mark.asyncio
+    async def test_file_search_reranker_model_rejects_unapproved_config(
+        self, adapter
+    ):
+        app = _create_app(adapter)
+        invalid_payloads = (
+            {"ringo": "cohere/rerank-v3.5"},
+            {"ringo": {"other": {}}},
+            {"ringo": {"file_search": {}}},
+            {
+                "ringo": {
+                    "file_search": {
+                        "reranker_model": "nvidia/private-reranker"
+                    }
+                }
+            },
+            {
+                "ringo": {
+                    "file_search": {
+                        "reranker_model": "cohere/rerank-v3.5",
+                        "top_n": 100,
+                    }
+                }
+            },
+        )
+        async with TestClient(TestServer(app)) as cli:
+            for payload in invalid_payloads:
+                resp = await cli.post("/admin/config", json=payload)
+                assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_file_embedding_profile_applies_and_rolls_back(
+        self, adapter
+    ):
+        from hermes_cli.config import load_config
+
+        profile = {
+            "model": "openai/text-embedding-3-small",
+            "dimensions": 1024,
+            "normalization": "cosine",
+            "content_version": "file-content-v2",
+        }
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/admin/config",
+                json={
+                    "ringo": {
+                        "file_search": {"embedding_profile": profile}
+                    }
+                },
+            )
+            assert resp.status == 200
+            assert (await resp.json())["applied"][
+                "file_search_embedding_profile"
+            ] == profile
+            assert load_config()["ringo"]["file_search"][
+                "embedding_profile"
+            ] == profile
+
+            resp = await cli.post(
+                "/admin/config",
+                json={
+                    "ringo": {
+                        "file_search": {"embedding_profile": None}
+                    }
+                },
+            )
+            assert resp.status == 200
+            assert (await resp.json())["applied"][
+                "file_search_embedding_profile"
+            ] is None
+            assert load_config()["ringo"]["file_search"][
+                "embedding_profile"
+            ] is None
+
+    @pytest.mark.asyncio
+    async def test_file_embedding_profile_rejects_unsafe_values(
+        self, adapter
+    ):
+        invalid_profiles = (
+            {},
+            {
+                "model": "cohere/embed-v4.0",
+                "dimensions": 1024,
+                "normalization": "cosine",
+                "content_version": "file-content-v2",
+            },
+            {
+                "model": "openai/text-embedding-3-small",
+                "dimensions": 2048,
+                "normalization": "cosine",
+                "content_version": "file-content-v2",
+            },
+            {
+                "model": "openai/text-embedding-3-small",
+                "dimensions": 1024,
+                "normalization": "dot",
+                "content_version": "file-content-v2",
+            },
+            {
+                "model": "openai/text-embedding-3-small",
+                "dimensions": 1024,
+                "normalization": "cosine",
+                "content_version": "latest",
+            },
+        )
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            for profile in invalid_profiles:
+                resp = await cli.post(
+                    "/admin/config",
+                    json={
+                        "ringo": {
+                            "file_search": {
+                                "embedding_profile": profile
+                            }
+                        }
+                    },
+                )
+                assert resp.status == 400
+
+    @pytest.mark.asyncio
     async def test_mcp_addition_uses_incremental_discovery(self, adapter):
         """Adding a server must not drop live connections (no full shutdown)."""
         from hermes_cli.config import load_config

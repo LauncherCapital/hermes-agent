@@ -25,6 +25,12 @@ MAX_TEXT_CHARS = 100_000
 STALE_TEMP_SECONDS = 6 * 60 * 60
 CAPTION_PROMPT_VERSION = "file-index-v1"
 DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small"
+LEGACY_EMBEDDING_PROFILE = {
+    "model": DEFAULT_EMBEDDING_MODEL,
+    "dimensions": None,
+    "normalization": "cosine",
+    "content_version": "file-content-v1",
+}
 _TEXT_SUFFIXES = {
     ".csv",
     ".json",
@@ -207,14 +213,44 @@ def _caption_image(path: Path) -> tuple[str, str]:
     return str(result["analysis"]).strip()[:MAX_TEXT_CHARS], model or "auxiliary-default"
 
 
+def get_file_embedding_profile() -> dict[str, Any]:
+    """Return the managed profile or the legacy full-dimension behavior."""
+    legacy = {
+        **LEGACY_EMBEDDING_PROFILE,
+        "model": (
+            os.getenv("FILE_INDEX_EMBEDDING_MODEL", "").strip()
+            or DEFAULT_EMBEDDING_MODEL
+        ),
+    }
+    try:
+        from hermes_cli.config import (
+            load_config,
+            normalize_ringo_file_search_embedding_profile,
+        )
+
+        config = load_config()
+        ringo = config.get("ringo") if isinstance(config, dict) else None
+        file_search = (
+            ringo.get("file_search") if isinstance(ringo, dict) else None
+        )
+        configured = (
+            file_search.get("embedding_profile")
+            if isinstance(file_search, dict)
+            else None
+        )
+        profile = normalize_ringo_file_search_embedding_profile(configured)
+    except ImportError:
+        profile = None
+    return dict(profile or legacy)
+
+
 def embed_texts(texts: list[str]) -> tuple[list[list[float]], str]:
     normalized = [text.strip()[:MAX_TEXT_CHARS] for text in texts]
     if not normalized or any(not text for text in normalized):
         raise FileProcessingError("empty_embedding_input")
-    model = (
-        os.getenv("FILE_INDEX_EMBEDDING_MODEL", "").strip()
-        or DEFAULT_EMBEDDING_MODEL
-    )
+    profile = get_file_embedding_profile()
+    model = str(profile["model"])
+    dimensions = profile["dimensions"]
     try:
         from agent.auxiliary_client import resolve_provider_client
 
@@ -226,6 +262,10 @@ def embed_texts(texts: list[str]) -> tuple[list[list[float]], str]:
             [float(value) for value in item.embedding]
             for item in response.data
         ]
+        if dimensions is not None:
+            if any(len(vector) < dimensions for vector in vectors):
+                raise RuntimeError("embedding response dimension is too small")
+            vectors = [vector[:dimensions] for vector in vectors]
     except Exception as exc:
         logger.warning("File embedding failed: %s", type(exc).__name__)
         raise FileProcessingError("embedding_failed") from None

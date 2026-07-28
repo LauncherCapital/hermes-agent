@@ -1002,6 +1002,166 @@ def test_file_processing_deletes_transient_bytes_on_success_and_failure(
     }
 
 
+def test_file_embedding_profile_truncates_to_managed_dimension(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "ringo:\n"
+        "  file_search:\n"
+        "    embedding_profile:\n"
+        "      model: openai/text-embedding-3-small\n"
+        "      dimensions: 1024\n"
+        "      normalization: cosine\n"
+        "      content_version: file-content-v2\n"
+    )
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    processing = sys.modules[module.MessageStore.apply_file_command.__globals__[
+        "process_slack_file"
+    ].__module__]
+    from agent import auxiliary_client
+
+    captured = {}
+
+    class Embeddings:
+        @staticmethod
+        def create(*, model, input):
+            captured.update(model=model, input=input)
+
+            class Item:
+                embedding = [float(index) for index in range(1536)]
+
+            class Response:
+                data = [Item() for _ in input]
+
+            return Response()
+
+    class Client:
+        embeddings = Embeddings()
+
+    monkeypatch.setattr(
+        auxiliary_client,
+        "resolve_provider_client",
+        lambda _provider, async_mode: (Client(), None),
+    )
+
+    vectors, model = processing.embed_texts(["first", "second"])
+
+    assert model == "openai/text-embedding-3-small"
+    assert captured == {
+        "model": "openai/text-embedding-3-small",
+        "input": ["first", "second"],
+    }
+    assert [len(vector) for vector in vectors] == [1024, 1024]
+    assert vectors[0][-1] == 1023.0
+
+
+def test_file_embedding_profile_rotates_generation_and_reembeds_captions(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+    store.apply_file_command(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "operation": "upsert_share",
+            "file_id": "F1",
+            "conversation_id": "C1",
+            "provider_message_id": "M1",
+            "source_version": 1,
+            "processing_status": "indexed",
+            "file_name": "profile.png",
+            "mime_type": "image/png",
+            "caption_ocr": "white ghost profile candidate",
+            "text_content_embedding": [0.1, 0.2, 0.3],
+            "image_embedding": [0.1, 0.2, 0.3],
+            "thread_context": "Ringo profile rebranding discussion",
+            "parent_embedding": [0.3, 0.2, 0.1],
+            "parent_embedding_model": "openai/text-embedding-3-small",
+            "parent_embedding_dimension": 3,
+        }
+    )
+    old_generation = store.store_generation
+    (tmp_path / "config.yaml").write_text(
+        "ringo:\n"
+        "  file_search:\n"
+        "    embedding_profile:\n"
+        "      model: openai/text-embedding-3-small\n"
+        "      dimensions: 1024\n"
+        "      normalization: cosine\n"
+        "      content_version: file-content-v2\n"
+    )
+
+    health = store.health()
+
+    assert store.store_generation != old_generation
+    assert health["file_index_store_generation"] == store.store_generation
+    assert health["file_embedding_profile"] == {
+        "model": "openai/text-embedding-3-small",
+        "dimensions": 1024,
+        "normalization": "cosine",
+        "content_version": "file-content-v2",
+    }
+    with store._connect() as conn:
+        content = conn.execute(
+            "SELECT text_content_embedding_json, image_embedding_json "
+            "FROM file_contents WHERE file_id='F1'"
+        ).fetchone()
+        share = conn.execute(
+            "SELECT parent_embedding_json FROM file_shares WHERE file_id='F1'"
+        ).fetchone()
+    assert content["text_content_embedding_json"] is None
+    assert content["image_embedding_json"] is None
+    assert share["parent_embedding_json"] is None
+
+    monkeypatch.setattr(
+        store_module,
+        "embed_texts",
+        lambda texts: (
+            [[0.5] * 1024 for _text in texts],
+            "openai/text-embedding-3-small",
+        ),
+    )
+    monkeypatch.setattr(
+        store_module,
+        "embed_text",
+        lambda _text: (
+            [0.5] * 1024,
+            "openai/text-embedding-3-small",
+        ),
+    )
+    assert store._process_pending_content_embeddings(
+        provider="slack",
+        workspace_id="T1",
+        limit=20,
+    ) == 1
+    assert store._process_pending_parent_embeddings(
+        provider="slack",
+        workspace_id="T1",
+        limit=20,
+    ) == 1
+    with store._connect() as conn:
+        content = conn.execute(
+            "SELECT text_embedding_dimension, image_embedding_dimension "
+            "FROM file_contents WHERE file_id='F1'"
+        ).fetchone()
+        share = conn.execute(
+            "SELECT parent_embedding_dimension FROM file_shares WHERE file_id='F1'"
+        ).fetchone()
+    assert content["text_embedding_dimension"] == 1024
+    assert content["image_embedding_dimension"] == 1024
+    assert share["parent_embedding_dimension"] == 1024
+
+
 def test_image_caption_neuters_async_client_destructor_before_analysis(
     tmp_path, monkeypatch
 ):
@@ -1708,6 +1868,154 @@ def test_file_search_without_query_lists_recent_scoped_files(
     )
 
 
+def test_file_search_hosted_reranker_is_scoped_private_and_fails_open(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "ringo:\n"
+        "  file_search:\n"
+        "    reranker_model: cohere/rerank-v3.5\n"
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-private")
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+    groups = [("C1", f"ROOT-{index}") for index in range(12)]
+    items = [
+        {
+            "channel_id": channel_id,
+            "channel_name": "design",
+            "thread_root_id": thread_root_id,
+            "thread_context": f"candidate discussion {index}",
+            "upload_text": f"option {index}",
+            "name": f"candidate-{index}.png",
+            "caption_ocr": f"profile icon {index}",
+        }
+        for index, (channel_id, thread_root_id) in enumerate(groups)
+    ]
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def read():
+            return json.dumps(
+                {
+                    "results": [
+                        {"index": 7, "relevance_score": 0.95},
+                        {"index": 2, "relevance_score": 0.80},
+                    ],
+                    "usage": {"search_units": 2},
+                }
+            ).encode()
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data)
+        captured["headers"] = dict(request.header_items())
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr(store_module.urllib.request, "urlopen", fake_urlopen)
+
+    selected, scores, metadata = store._file_search_hosted_rerank(
+        query="latest high resolution profile candidates",
+        context_query="Ringo rebranding discussion",
+        groups=groups,
+        items=items,
+    )
+
+    assert selected == [groups[7], groups[2]]
+    assert scores == {groups[7]: 0.95, groups[2]: 0.80}
+    assert metadata["status"] == "applied"
+    assert metadata["candidate_count"] == 12
+    assert metadata["search_units"] == 2
+    assert captured["timeout"] == 3.0
+    assert captured["payload"]["model"] == "cohere/rerank-v3.5"
+    assert captured["payload"]["top_n"] == 5
+    assert captured["payload"]["provider"] == {
+        "data_collection": "deny",
+        "only": ["cohere"],
+        "allow_fallbacks": False,
+    }
+    assert len(captured["payload"]["documents"]) == 12
+    assert "or-private" not in json.dumps(captured["payload"])
+    assert captured["headers"]["Authorization"] == "Bearer or-private"
+
+    def timeout(*_args, **_kwargs):
+        raise TimeoutError
+
+    monkeypatch.setattr(store_module.urllib.request, "urlopen", timeout)
+    selected, scores, metadata = store._file_search_hosted_rerank(
+        query="profile candidates",
+        context_query="",
+        groups=groups,
+        items=items,
+    )
+
+    assert selected == groups[:10]
+    assert scores == {}
+    assert metadata["status"] == "fallback"
+    assert metadata["reason"] == "TimeoutError"
+
+
+def test_file_search_hosted_reranker_requires_explicit_supported_model(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+    monkeypatch.setattr(
+        store_module.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: pytest.fail(
+            "disabled reranker must not make a network request"
+        ),
+    )
+    groups = [("C1", "ROOT")]
+    items = [
+        {
+            "channel_id": "C1",
+            "thread_root_id": "ROOT",
+        }
+    ]
+
+    selected, _scores, metadata = store._file_search_hosted_rerank(
+        query="profile",
+        context_query="",
+        groups=groups,
+        items=items,
+    )
+    assert selected == groups
+    assert metadata == {"status": "disabled"}
+
+    (tmp_path / "config.yaml").write_text(
+        "ringo:\n"
+        "  file_search:\n"
+        "    reranker_model: cohere/rerank-4-pro\n"
+    )
+    health = store.health()["file_search_reranker"]
+    assert health == {
+        "configured": True,
+        "ready": False,
+        "model": "cohere/rerank-4-pro",
+        "candidate_limit": 100,
+        "top_n": 5,
+        "data_collection": "deny",
+        "provider": "cohere",
+    }
+
+
 def test_file_search_keeps_high_semantic_candidate_without_token_overlap(
     tmp_path, monkeypatch
 ):
@@ -2059,6 +2367,12 @@ def test_file_search_finds_recent_profile_candidates_from_thread_context(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "ringo:\n"
+        "  file_search:\n"
+        "    reranker_model: cohere/rerank-v3.5\n"
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-private")
     project_id = str(uuid.uuid4())
     write_project_marker(project_id)
     _manager, module = _load_service()
@@ -2078,6 +2392,46 @@ def test_file_search_finds_recent_profile_candidates_from_thread_context(
         "링고방\n"
         "앱 아이콘 후보입니다\n"
         "귀엽던지, 문학적이던지, 기술적인 느낌이 아니면 좋겠다"
+    )
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            documents = self.payload["documents"]
+            canonical = next(
+                index
+                for index, document in enumerate(documents)
+                if "귀엽던지" in document
+            )
+            order = [canonical] + [
+                index
+                for index in range(len(documents))
+                if index != canonical
+            ][:4]
+            return json.dumps(
+                {
+                    "results": [
+                        {
+                            "index": index,
+                            "relevance_score": 1.0 - rank / 10,
+                        }
+                        for rank, index in enumerate(order)
+                    ]
+                }
+            ).encode()
+
+    monkeypatch.setattr(
+        store_module.urllib.request,
+        "urlopen",
+        lambda request, timeout: Response(json.loads(request.data)),
     )
     target_ids = {
         "F0BKBRY7HV2",
@@ -2323,6 +2677,8 @@ def test_file_search_finds_recent_profile_candidates_from_thread_context(
 
     returned = [item["file_id"] for item in result["files"]]
     assert target_ids <= set(returned)
+    assert result["reranker"]["status"] == "applied"
+    assert result["reranker"]["selected_count"] <= 5
     first_old = next(
         index
         for index, file_id in enumerate(returned)

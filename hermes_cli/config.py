@@ -805,6 +805,15 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    "ringo": {
+        "file_search": {
+            # Empty is fail-closed. Managed tenants opt in individually.
+            "reranker_model": "",
+            # Versioned separately because changing the embedding space requires
+            # a file-index generation rotation and re-embedding.
+            "embedding_profile": None,
+        },
+    },
     "agent": {
         "max_turns": 90,
         # Inactivity timeout for gateway agent execution (seconds).
@@ -2428,6 +2437,85 @@ DEFAULT_CONFIG = {
     # Config schema version - bump this when adding new required fields
     "_config_version": 27,
 }
+
+
+_RINGO_FILE_SEARCH_RERANKER_MODEL_RE = re.compile(
+    r"^cohere/[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
+)
+_RINGO_FILE_SEARCH_EMBEDDING_MODEL_MAX_DIMENSIONS = {
+    "openai/text-embedding-3-small": 1536,
+    "openai/text-embedding-3-large": 3072,
+}
+_RINGO_FILE_SEARCH_CONTENT_VERSION_RE = re.compile(
+    r"^file-content-v[1-9][0-9]*$"
+)
+
+
+def normalize_ringo_file_search_reranker_model(value: Any) -> str:
+    """Return a disabled or approved Cohere reranker model slug."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("ringo.file_search.reranker_model must be a string or null")
+    model = value.strip()
+    if model and not _RINGO_FILE_SEARCH_RERANKER_MODEL_RE.fullmatch(model):
+        raise ValueError(
+            "ringo.file_search.reranker_model must be empty or a cohere/* model"
+        )
+    return model
+
+
+def normalize_ringo_file_search_embedding_profile(
+    value: Any,
+) -> Dict[str, Any] | None:
+    """Return a canonical managed file-embedding profile."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "model",
+        "dimensions",
+        "normalization",
+        "content_version",
+    }:
+        raise ValueError(
+            "ringo.file_search.embedding_profile must contain model, dimensions, "
+            "normalization, and content_version"
+        )
+    model = str(value.get("model") or "").strip()
+    max_dimensions = _RINGO_FILE_SEARCH_EMBEDDING_MODEL_MAX_DIMENSIONS.get(model)
+    if max_dimensions is None:
+        raise ValueError(
+            "ringo.file_search.embedding_profile.model must be an approved "
+            "OpenAI text-embedding-3 model"
+        )
+    dimensions = value.get("dimensions")
+    if (
+        isinstance(dimensions, bool)
+        or not isinstance(dimensions, int)
+        or not 256 <= dimensions <= max_dimensions
+    ):
+        raise ValueError(
+            "ringo.file_search.embedding_profile.dimensions must be "
+            f"an integer from 256 to {max_dimensions} for {model}"
+        )
+    normalization = str(value.get("normalization") or "").strip().lower()
+    if normalization != "cosine":
+        raise ValueError(
+            "ringo.file_search.embedding_profile.normalization must be cosine"
+        )
+    content_version = str(value.get("content_version") or "").strip()
+    if not _RINGO_FILE_SEARCH_CONTENT_VERSION_RE.fullmatch(content_version):
+        raise ValueError(
+            "ringo.file_search.embedding_profile.content_version must match "
+            "file-content-vN"
+        )
+    return {
+        "model": model,
+        "dimensions": dimensions,
+        "normalization": normalization,
+        "content_version": content_version,
+    }
+
 
 # =============================================================================
 # Config Migration System

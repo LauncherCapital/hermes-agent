@@ -9,6 +9,7 @@ import os
 import re
 import threading
 import time
+import urllib.request
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,6 +27,7 @@ from .file_processing import (
     cleanup_stale_temp_files,
     embed_text,
     embed_texts,
+    get_file_embedding_profile,
     inspect_slack_image,
     process_slack_file,
 )
@@ -59,6 +61,10 @@ RETENTION_INTERVAL_SECONDS = 3600
 MAX_BATCH_EVENTS = 500
 FILE_SEARCH_RETRIEVE_LIMIT = 50
 FILE_SEARCH_RERANK_LIMIT = 10
+FILE_SEARCH_HOSTED_RERANK_CANDIDATE_LIMIT = 100
+FILE_SEARCH_HOSTED_RERANK_TOP_N = 5
+FILE_SEARCH_HOSTED_RERANK_TIMEOUT_SECONDS = 3.0
+FILE_SEARCH_HOSTED_RERANK_MAX_DOCUMENT_CHARS = 4_000
 FILE_SEARCH_IMAGE_INSPECT_LIMIT = 3
 FILE_SEARCH_MIN_SEMANTIC_SCORE = 0.80
 FILE_SEARCH_MIN_PARENT_SEMANTIC_SCORE = 0.25
@@ -718,10 +724,105 @@ class MessageStore:
         self.message_search_index_available = False
         self.file_search_index_available = False
         self._migrate()
+        self._sync_file_embedding_profile()
         cleanup_stale_temp_files()
 
     def _connect(self):
         return self.database.connect()
+
+    @staticmethod
+    def _file_embedding_profile_json() -> tuple[dict[str, Any], str]:
+        profile = get_file_embedding_profile()
+        return profile, json.dumps(
+            profile,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def _sync_file_embedding_profile(self) -> bool:
+        """Rotate the file generation when its embedding space changes."""
+        profile, encoded = self._file_embedding_profile_json()
+        legacy_encoded = json.dumps(
+            {
+                "model": (
+                    os.getenv("FILE_INDEX_EMBEDDING_MODEL", "").strip()
+                    or "openai/text-embedding-3-small"
+                ),
+                "dimensions": None,
+                "normalization": "cosine",
+                "content_version": "file-content-v1",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self._writer_lock, self._connect() as conn:
+            current_row = conn.execute(
+                "SELECT value FROM schema_meta "
+                "WHERE key='file_embedding_profile'"
+            ).fetchone()
+            current = str(current_row[0]) if current_row is not None else None
+            if current is None:
+                has_existing_vectors = (
+                    conn.execute(
+                        "SELECT 1 FROM file_contents "
+                        "WHERE text_content_embedding_json IS NOT NULL LIMIT 1"
+                    ).fetchone()
+                    is not None
+                    or conn.execute(
+                        "SELECT 1 FROM file_shares "
+                        "WHERE parent_embedding_json IS NOT NULL LIMIT 1"
+                    ).fetchone()
+                    is not None
+                )
+                current = legacy_encoded if has_existing_vectors else encoded
+            if current == encoded:
+                conn.execute(
+                    "INSERT INTO schema_meta(key, value) VALUES "
+                    "('file_embedding_profile', ?) ON CONFLICT(key) "
+                    "DO UPDATE SET value=excluded.value",
+                    (encoded,),
+                )
+                return False
+
+            generation = str(uuid.uuid4())
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO schema_meta(key, value) VALUES "
+                "('file_embedding_profile', ?) ON CONFLICT(key) "
+                "DO UPDATE SET value=excluded.value",
+                (encoded,),
+            )
+            conn.execute(
+                "INSERT INTO schema_meta(key, value) VALUES "
+                "('file_index_store_generation', ?) ON CONFLICT(key) "
+                "DO UPDATE SET value=excluded.value",
+                (generation,),
+            )
+            conn.execute(
+                "UPDATE file_contents SET text_content_embedding_json=NULL, "
+                "image_embedding_json=NULL, text_embedding_model=NULL, "
+                "text_embedding_dimension=NULL, image_embedding_model=NULL, "
+                "image_embedding_dimension=NULL, processing_attempts=0, "
+                "last_error_code=NULL WHERE processing_status='indexed' "
+                "AND caption_ocr IS NOT NULL AND caption_ocr!=''"
+            )
+            conn.execute(
+                "UPDATE file_shares SET parent_embedding_json=NULL, "
+                "parent_embedding_model=NULL, parent_embedding_dimension=NULL, "
+                "parent_embedding_attempts=0, parent_embedding_error=NULL "
+                "WHERE tombstoned_at IS NULL"
+            )
+            conn.commit()
+            self.store_generation = generation
+        logger.info(
+            "file embedding profile changed; rotated generation=%s "
+            "model=%s dimensions=%s content_version=%s",
+            self.store_generation,
+            profile["model"],
+            profile["dimensions"],
+            profile["content_version"],
+        )
+        return True
 
     def _migrate(self) -> None:
         with self._writer_lock, self._connect() as conn:
@@ -1107,6 +1208,7 @@ class MessageStore:
 
     def apply_file_command(self, request: dict[str, Any]) -> dict[str, Any]:
         """Apply one independently authenticated file-index command."""
+        self._sync_file_embedding_profile()
         request = dict(request)
         access_token = str(request.pop("provider_access_token", "") or "")
         if str(request.get("project_id") or "") != self.project_id:
@@ -1316,6 +1418,7 @@ class MessageStore:
 
     def reconcile_file_window(self, request: dict[str, Any]) -> dict[str, Any]:
         """Scan one bounded batch of already-encrypted local messages."""
+        self._sync_file_embedding_profile()
         request = dict(request)
         access_token = str(request.pop("provider_access_token", "") or "")
         if str(request.get("project_id") or "") != self.project_id:
@@ -2180,8 +2283,203 @@ class MessageStore:
             for row in rows
         }
 
+    @staticmethod
+    def _file_search_reranker_model() -> str:
+        try:
+            from hermes_cli.config import (
+                load_config,
+                normalize_ringo_file_search_reranker_model,
+            )
+
+            config = load_config()
+        except Exception:
+            return ""
+        ringo = config.get("ringo") if isinstance(config, dict) else None
+        file_search = (
+            ringo.get("file_search") if isinstance(ringo, dict) else None
+        )
+        configured = (
+            str(file_search.get("reranker_model") or "").strip()
+            if isinstance(file_search, dict)
+            else ""
+        )
+        try:
+            return normalize_ringo_file_search_reranker_model(configured)
+        except ValueError:
+            return ""
+
+    @staticmethod
+    def _file_search_group_passage(items: list[dict[str, Any]]) -> str:
+        if not items:
+            return ""
+        parts = [
+            "Slack channel: "
+            + str(items[0].get("channel_name") or items[0].get("channel_id") or ""),
+            "Thread context:\n"
+            + str(items[0].get("thread_context") or "")[:2_600],
+        ]
+        seen: set[str] = set()
+        uploads: list[str] = []
+        files: list[str] = []
+        for item in items:
+            upload = " ".join(str(item.get("upload_text") or "").split())
+            if upload and upload not in seen:
+                seen.add(upload)
+                uploads.append(upload[:600])
+            file_text = ": ".join(
+                value
+                for value in (
+                    str(item.get("name") or "").strip(),
+                    " ".join(str(item.get("caption_ocr") or "").split()),
+                )
+                if value
+            )
+            if file_text and file_text not in seen:
+                seen.add(file_text)
+                files.append(file_text[:800])
+        if uploads:
+            parts.append("Upload messages:\n" + "\n".join(uploads))
+        if files:
+            parts.append("Files:\n" + "\n".join(files))
+        return "\n\n".join(parts)[:FILE_SEARCH_HOSTED_RERANK_MAX_DOCUMENT_CHARS]
+
+    def _file_search_hosted_rerank(
+        self,
+        *,
+        query: str,
+        context_query: str,
+        groups: list[tuple[str, str]],
+        items: list[dict[str, Any]],
+    ) -> tuple[
+        list[tuple[str, str]],
+        dict[tuple[str, str], float],
+        dict[str, Any],
+    ]:
+        fallback = groups[:FILE_SEARCH_RERANK_LIMIT]
+        model = self._file_search_reranker_model()
+        if not model:
+            return fallback, {}, {"status": "disabled"}
+        if not groups:
+            return fallback, {}, {
+                "status": "not_applicable",
+                "model": model,
+            }
+        api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        if not api_key:
+            return fallback, {}, {
+                "status": "fallback",
+                "reason": "missing_api_key",
+                "model": model,
+            }
+
+        items_by_group: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for item in items:
+            group = (
+                str(item["channel_id"]),
+                str(item["thread_root_id"]),
+            )
+            items_by_group.setdefault(group, []).append(item)
+        documents = [
+            self._file_search_group_passage(items_by_group.get(group, []))
+            for group in groups
+        ]
+        rerank_query = query
+        if context_query:
+            rerank_query += "\nDiscussion context: " + context_query
+        body = json.dumps(
+            {
+                "model": model,
+                "query": rerank_query[:2_000],
+                "documents": documents,
+                "top_n": min(FILE_SEARCH_HOSTED_RERANK_TOP_N, len(groups)),
+                "provider": {
+                    "data_collection": "deny",
+                    "only": ["cohere"],
+                    "allow_fallbacks": False,
+                },
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            "https://openrouter.ai/api/v1/rerank",
+            data=body,
+            headers={
+                "Authorization": "Bearer " + api_key,
+                "Content-Type": "application/json",
+                "HTTP-Referer": os.getenv(
+                    "OPENROUTER_HTTP_REFERER", "https://ringoai.app"
+                ),
+                "X-Title": os.getenv("OPENROUTER_X_TITLE", "RingoWork"),
+            },
+            method="POST",
+        )
+        started_at = time.monotonic()
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=FILE_SEARCH_HOSTED_RERANK_TIMEOUT_SECONDS,
+            ) as response:
+                payload = json.loads(response.read())
+            results = payload.get("results")
+            if not isinstance(results, list) or not results:
+                raise ValueError("reranker returned no results")
+            selected: list[tuple[str, str]] = []
+            scores: dict[tuple[str, str], float] = {}
+            seen_indices: set[int] = set()
+            for result in results:
+                index = int(result["index"])
+                if index < 0 or index >= len(groups) or index in seen_indices:
+                    raise ValueError("reranker returned an invalid index")
+                seen_indices.add(index)
+                group = groups[index]
+                selected.append(group)
+                scores[group] = float(result.get("relevance_score") or 0.0)
+            latency_ms = round((time.monotonic() - started_at) * 1_000)
+            usage = payload.get("usage")
+            search_units = (
+                usage.get("search_units")
+                if isinstance(usage, dict)
+                else None
+            )
+            logger.info(
+                "file search hosted reranker applied model=%s candidates=%d "
+                "selected=%d latency_ms=%d search_units=%s",
+                model,
+                len(groups),
+                len(selected),
+                latency_ms,
+                search_units,
+            )
+            return selected, scores, {
+                "status": "applied",
+                "model": model,
+                "candidate_count": len(groups),
+                "selected_count": len(selected),
+                "latency_ms": latency_ms,
+                "search_units": search_units,
+            }
+        except Exception as exc:
+            latency_ms = round((time.monotonic() - started_at) * 1_000)
+            logger.warning(
+                "file search hosted reranker fallback model=%s candidates=%d "
+                "latency_ms=%d error=%s",
+                model,
+                len(groups),
+                latency_ms,
+                type(exc).__name__,
+            )
+            return fallback, {}, {
+                "status": "fallback",
+                "reason": type(exc).__name__,
+                "model": model,
+                "candidate_count": len(groups),
+                "latency_ms": latency_ms,
+            }
+
     def search_file_index(self, request: dict[str, Any]) -> dict[str, Any]:
         """Fuse lexical and dense retrieval by thread, then expand its files."""
+        self._sync_file_embedding_profile()
         request = dict(request)
         access_token = str(request.pop("provider_access_token", "") or "")
         if str(request.get("project_id") or "") != self.project_id:
@@ -2576,6 +2874,7 @@ class MessageStore:
             )[:FILE_SEARCH_RETRIEVE_LIMIT]
             reranked = retrieved[:FILE_SEARCH_RERANK_LIMIT]
             rerank_count = len(reranked)
+            reranker_metadata = {"status": "not_applicable"}
         else:
             by_content: dict[int, list[dict[str, Any]]] = {}
             by_share: dict[int, list[dict[str, Any]]] = {}
@@ -2596,7 +2895,7 @@ class MessageStore:
                         key=lambda value: str(value.get("shared_at") or ""),
                         reverse=True,
                     )
-                ][:FILE_SEARCH_RETRIEVE_LIMIT]
+                ][:FILE_SEARCH_HOSTED_RERANK_CANDIDATE_LIMIT]
                 if lane:
                     lanes.append(
                         (
@@ -2622,7 +2921,7 @@ class MessageStore:
                     str(item.get("shared_at") or ""),
                 ),
                 reverse=True,
-            )[:FILE_SEARCH_RETRIEVE_LIMIT]
+            )[:FILE_SEARCH_HOSTED_RERANK_CANDIDATE_LIMIT]
             parent_lane = sorted(
                 (
                     item
@@ -2636,7 +2935,7 @@ class MessageStore:
                     str(item.get("shared_at") or ""),
                 ),
                 reverse=True,
-            )[:FILE_SEARCH_RETRIEVE_LIMIT]
+            )[:FILE_SEARCH_HOSTED_RERANK_CANDIDATE_LIMIT]
             if semantic_lane:
                 lanes.append(
                     (
@@ -2700,14 +2999,24 @@ class MessageStore:
                     latest_by_group.get(group, ""),
                     str(item.get("shared_at") or ""),
                 )
-            selected_groups = sorted(
+            candidate_groups = sorted(
                 admitted_groups,
                 key=lambda group: (
                     group_scores.get(group, 0.0),
                     latest_by_group.get(group, ""),
                 ),
                 reverse=True,
-            )[:FILE_SEARCH_RERANK_LIMIT]
+            )[:FILE_SEARCH_HOSTED_RERANK_CANDIDATE_LIMIT]
+            (
+                selected_groups,
+                hosted_group_scores,
+                reranker_metadata,
+            ) = self._file_search_hosted_rerank(
+                query=query,
+                context_query=context_query,
+                groups=candidate_groups,
+                items=candidates,
+            )
             if selected_groups:
                 group_clauses = []
                 group_params: list[Any] = []
@@ -2772,7 +3081,11 @@ class MessageStore:
                     str(item["thread_root_id"]),
                 )
                 item["rerank_score"] = (
-                    group_scores.get(group, 0.0) * 100.0
+                    hosted_group_scores.get(
+                        group,
+                        group_scores.get(group, 0.0),
+                    )
+                    * 100.0
                     + item_scores.get(id(item), 0.0)
                 )
             reranked.sort(
@@ -2872,6 +3185,7 @@ class MessageStore:
             "retrieve_count": len(retrieved),
             "rerank_count": rerank_count,
             "inspected_image_count": inspected,
+            "reranker": reranker_metadata,
             "files": output,
             "store_generation": self.store_generation,
         }
@@ -4531,6 +4845,7 @@ class MessageStore:
         return {"deliveries": deliveries, "reactions": reactions, "messages": messages}
 
     def health(self) -> dict[str, Any]:
+        self._sync_file_embedding_profile()
         self.maybe_run_retention()
         with self._connect() as conn:
             cursor = conn.execute(
@@ -4620,6 +4935,19 @@ class MessageStore:
                 "search": True,
                 "graph": True,
             },
+            "file_search_reranker": {
+                "configured": bool(self._file_search_reranker_model()),
+                "ready": bool(
+                    self._file_search_reranker_model()
+                    and os.getenv("OPENROUTER_API_KEY", "").strip()
+                ),
+                "model": self._file_search_reranker_model() or None,
+                "candidate_limit": FILE_SEARCH_HOSTED_RERANK_CANDIDATE_LIMIT,
+                "top_n": FILE_SEARCH_HOSTED_RERANK_TOP_N,
+                "data_collection": "deny",
+                "provider": "cohere",
+            },
+            "file_embedding_profile": self._file_embedding_profile_json()[0],
             "message_count": int(message_count),
             "file_embedding_index": {
                 "contents_total": int(content_embeddings["total"] or 0),
