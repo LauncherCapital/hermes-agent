@@ -22,8 +22,9 @@ LEASE_MINUTES = 15
 MAX_SKILL_BYTES = 30_000
 MAX_CONTEXT_BYTES = 60_000
 MAX_COMPLETED_TURNS = 500
-MAX_DM_CHANNEL_SKILLS = 8
 MAX_CHANNEL_INDEX_BYTES = 6_000
+MAX_CHANNEL_SEARCH_RESULTS = 5
+MAX_CHANNEL_SUMMARY_CHARS = 400
 ENTITY_KINDS = ("users", "channels", "teams", "organizations")
 _COMPONENT = re.compile(r"^[A-Za-z0-9._%-]{1,128}$")
 _TEAM_SLUG = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
@@ -37,6 +38,7 @@ _DETAIL_QUERY = re.compile(
     r"|근거|출처|참고"
 )
 _REFERENCES_HEADING = re.compile(r"(?mi)^##+\s+references?\s*$")
+_SEARCH_TERM = re.compile(r"[\w.%+-]+", re.UNICODE)
 
 
 class EntitySkillError(RuntimeError):
@@ -79,6 +81,52 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _frontmatter_value(content: str, key: str) -> str:
+    if not content.startswith("---\n"):
+        return ""
+    end = content.find("\n---", 4)
+    if end < 0:
+        return ""
+    prefix = f"{key}:"
+    for line in content[4:end].splitlines():
+        if line.lower().startswith(prefix):
+            return line.split(":", 1)[1].strip().strip("\"'")
+    return ""
+
+
+def _channel_skill_summary(content: str) -> str:
+    summary = _frontmatter_value(content, "summary") or _frontmatter_value(
+        content,
+        "description",
+    )
+    if not summary:
+        body = content
+        if body.startswith("---\n"):
+            end = body.find("\n---", 4)
+            if end >= 0:
+                body = body[end + 4 :]
+        reference = _REFERENCES_HEADING.search(body)
+        if reference is not None:
+            body = body[: reference.start()]
+        lines = [
+            re.sub(r"^\s*(?:#+|[-*])\s*", "", line).strip()
+            for line in body.splitlines()
+        ]
+        summary = " ".join(line for line in lines if line)[:MAX_CHANNEL_SUMMARY_CHARS]
+    return " ".join(summary.split())[:MAX_CHANNEL_SUMMARY_CHARS]
+
+
+def _search_terms(query: object) -> tuple[str, ...]:
+    text = str(query or "").strip()[:500]
+    return tuple(
+        dict.fromkeys(
+            match.group(0).casefold()
+            for match in _SEARCH_TERM.finditer(text)
+            if match.group(0).strip()
+        )
+    )
+
+
 def _pending_initial_write_paths(binding: dict[str, Any]) -> set[str]:
     required = {
         path
@@ -113,6 +161,7 @@ class EntitySkillService:
         self.documents = EncryptedSkillStore(self.skills_root)
         self._access_checker = access_checker
         self._lock = threading.RLock()
+        self._dm_runtime_sessions: dict[str, dict[str, str | datetime]] = {}
         self._health: dict[str, Any] = {
             "name": "ringo_entity_skills",
             "status": "idle",
@@ -404,6 +453,76 @@ class EntitySkillService:
             if expires_at <= now:
                 manifest["bindings"].pop(session_id, None)
 
+    def _bind_dm_runtime(
+        self,
+        *,
+        runtime: dict[str, Any],
+        session_id: str,
+        project_id: str,
+        agent_id: str,
+        workspace_id: str,
+    ) -> None:
+        channel_type = str(runtime.get("channel_type") or "").strip().lower()
+        if channel_type not in {"im", "dm"}:
+            with self._lock:
+                self._dm_runtime_sessions.pop(session_id, None)
+            return
+        caller_token = str(runtime.get("slack_caller_token") or "").strip()
+        user_id = _optional_component(runtime.get("user_id"), "user_id")
+        principal_id = _optional_uuid(
+            runtime.get("principal_id"),
+            "principal_id",
+        )
+        destination_channel_id = _optional_component(
+            runtime.get("channel_id"),
+            "channel_id",
+        )
+        if (
+            not caller_token
+            or len(caller_token) > 8192
+            or re.search(r"[\r\n\x00]", caller_token)
+            or not user_id
+            or not principal_id
+            or not destination_channel_id
+        ):
+            with self._lock:
+                self._dm_runtime_sessions.pop(session_id, None)
+            return
+        with self._lock:
+            now = _now()
+            self._dm_runtime_sessions = {
+                key: value
+                for key, value in self._dm_runtime_sessions.items()
+                if isinstance(value.get("expires_at"), datetime)
+                and value["expires_at"] > now
+            }
+            self._dm_runtime_sessions[session_id] = {
+                "project_id": project_id,
+                "agent_id": agent_id,
+                "workspace_id": workspace_id,
+                "user_id": user_id,
+                "principal_id": principal_id,
+                "destination_channel_id": destination_channel_id,
+                "destination_channel_type": channel_type,
+                "slack_caller_token": caller_token,
+                "expires_at": now + timedelta(minutes=LEASE_MINUTES),
+            }
+
+    def _dm_runtime(self, session_id: str) -> dict[str, str] | None:
+        with self._lock:
+            runtime = self._dm_runtime_sessions.get(session_id)
+            if not isinstance(runtime, dict):
+                return None
+            expires_at = runtime.get("expires_at")
+            if not isinstance(expires_at, datetime) or expires_at <= _now():
+                self._dm_runtime_sessions.pop(session_id, None)
+                return None
+            return {
+                key: str(value)
+                for key, value in runtime.items()
+                if key != "expires_at"
+            }
+
     def _check_channel_access(
         self,
         *,
@@ -416,6 +535,9 @@ class EntitySkillService:
         slack_user_id: str,
         session_id: str,
         operation: str,
+        slack_caller_token: str = "",
+        destination_channel_id: str = "",
+        destination_channel_type: str = "",
     ) -> dict[str, Any]:
         payload = {
             "agent_id": agent_id,
@@ -427,6 +549,14 @@ class EntitySkillService:
             "session_id": session_id,
             "operation": operation,
         }
+        if slack_caller_token:
+            payload.update(
+                {
+                    "slack_caller_token": slack_caller_token,
+                    "destination_channel_id": destination_channel_id,
+                    "destination_channel_type": destination_channel_type,
+                }
+            )
         try:
             if self._access_checker is not None:
                 result = self._access_checker(payload)
@@ -465,6 +595,13 @@ class EntitySkillService:
             or str(result.get("channel_type") or "") != channel_type
             or str(result.get("principal_id") or "") != principal_id
             or str(result.get("slack_user_id") or "") != slack_user_id
+        ):
+            raise EntitySkillError("entity skill channel access denied")
+        if slack_caller_token and (
+            str(result.get("destination_channel_id") or "")
+            != destination_channel_id
+            or str(result.get("destination_channel_type") or "")
+            != destination_channel_type
         ):
             raise EntitySkillError("entity skill channel access denied")
         return result
@@ -665,7 +802,6 @@ class EntitySkillService:
         channel_type: str = "",
         team_slug: str = "",
         session_id: str = "",
-        accessible_restricted_channel_ids: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         self._encrypt_plaintext_context(
             project_id=project_id,
@@ -690,40 +826,11 @@ class EntitySkillService:
             if access["visibility"] in {"private", "restricted"}:
                 requested = []
             requested.append(("channels", channel_id))
-        if (
-            channel_type in {"im", "dm"}
-            and user_id
-            and principal_id
-        ):
-            for candidate in accessible_restricted_channel_ids[
-                :MAX_DM_CHANNEL_SKILLS
-            ]:
-                try:
-                    access = self._check_channel_access(
-                        project_id=project_id,
-                        agent_id=agent_id,
-                        workspace_id=workspace_id,
-                        channel_id=candidate,
-                        channel_type="channel",
-                        principal_id=principal_id,
-                        slack_user_id=user_id,
-                        session_id=session_id,
-                        operation="read",
-                    )
-                except EntitySkillError:
-                    continue
-                if access.get("visibility") in {"private", "restricted"}:
-                    requested.append(("channels", candidate))
         if team_slug:
             requested.append(("teams", self._team_slug(team_slug)))
 
         documents: list[dict[str, str]] = []
         total = 0
-        cross_channel_ids = (
-            set(accessible_restricted_channel_ids)
-            if channel_type in {"im", "dm"}
-            else set()
-        )
         for kind, entity_id in requested:
             self._migrate_one(
                 project_id=project_id,
@@ -737,8 +844,6 @@ class EntitySkillService:
             if size > MAX_SKILL_BYTES:
                 raise EntitySkillError("entity skill context exceeds size limit")
             if total + size > MAX_CONTEXT_BYTES:
-                if kind == "channels" and entity_id in cross_channel_ids:
-                    continue
                 raise EntitySkillError("entity skill context exceeds size limit")
             total += size
             documents.append(
@@ -793,6 +898,53 @@ class EntitySkillService:
             team_slug=str(payload.get("team_slug") or ""),
             session_id=_component(payload.get("session_id"), "session_id"),
         )
+
+    def preview(self, *, request: dict[str, Any]) -> dict[str, Any]:
+        """Decrypt one canonical channel skill for the control-plane inspector."""
+        if not isinstance(request, dict):
+            raise EntitySkillError("invalid preview request")
+        project_id = _uuid(request.get("project_id"), "project_id")
+        payload = request.get("payload")
+        if not isinstance(payload, dict):
+            raise EntitySkillError("invalid preview payload")
+        agent_id = _uuid(payload.get("agent_id"), "agent_id")
+        relative_path = str(payload.get("path") or "")
+        match = re.fullmatch(
+            r"skills/channels/([A-Za-z0-9._%-]{1,128})/SKILL\.md",
+            relative_path,
+        )
+        if match is None:
+            raise EntitySkillError("preview path is not a canonical channel skill")
+        channel_id = _component(match.group(1), "channel_id")
+        path = self._path("channels", channel_id)
+        if path.is_symlink():
+            raise EntitySkillError("entity skill symlink is not allowed")
+
+        with self._lock:
+            manifest = self._load()
+            if (
+                str(manifest.get("project_id") or "") != project_id
+                or str(manifest.get("agent_id") or "") != agent_id
+            ):
+                raise EntitySkillError("entity skill preview identity mismatch")
+            self._migrate_one(
+                project_id=project_id,
+                kind="channels",
+                entity_id=channel_id,
+            )
+            content = self._document(project_id, "channels", channel_id)
+        if content is None:
+            raise EntitySkillError("entity skill preview file is missing")
+
+        from gateway.volume_inspector import truncate_utf8
+
+        preview, truncated = truncate_utf8(content)
+        return {
+            "path": relative_path,
+            "content": preview,
+            "encoding": "utf-8",
+            "truncated": truncated,
+        }
 
     def _binding_context(
         self,
@@ -858,6 +1010,10 @@ class EntitySkillService:
                     str(session_id or ""),
                 )
             elif runtime is not None:
+                runtime_session_id = _component(
+                    session_id,
+                    "session_id",
+                )
                 project_id = _uuid(runtime.get("project_id"), "project_id")
                 agent_id = _uuid(runtime.get("agent_id"), "agent_id")
                 workspace_id = _component(
@@ -873,9 +1029,13 @@ class EntitySkillService:
                         workspace_id=workspace_id,
                     )
                     self._save(manifest)
-                    restricted_channel_ids = tuple(
-                        sorted(manifest["channel_visibilities"])
-                    )
+                self._bind_dm_runtime(
+                    runtime=runtime,
+                    session_id=runtime_session_id,
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    workspace_id=workspace_id,
+                )
                 payload = self._context_payload(
                     project_id=project_id,
                     agent_id=agent_id,
@@ -891,10 +1051,7 @@ class EntitySkillService:
                     ),
                     channel_type=str(runtime.get("channel_type") or ""),
                     team_slug=str(runtime.get("team_slug") or ""),
-                    session_id=_component(session_id, "session_id"),
-                    accessible_restricted_channel_ids=(
-                        restricted_channel_ids
-                    ),
+                    session_id=runtime_session_id,
                 )
             else:
                 return None
@@ -947,6 +1104,159 @@ class EntitySkillService:
             return False
         return bool(relative.parts and relative.parts[0] in ENTITY_KINDS)
 
+    @staticmethod
+    def _handled_tool_result(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "action": "handled",
+            "result": json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            "redact_args": True,
+        }
+
+    def _dm_channel_candidates(
+        self,
+        runtime: dict[str, str],
+    ) -> tuple[str, ...]:
+        with self._lock:
+            manifest = self._load()
+        for key in ("project_id", "agent_id", "workspace_id"):
+            if str(manifest.get(key) or "") != runtime[key]:
+                raise EntitySkillError("entity skill runtime mismatch")
+        return tuple(sorted(manifest["channel_visibilities"]))
+
+    def _dm_channel_access(
+        self,
+        *,
+        runtime: dict[str, str],
+        session_id: str,
+        channel_id: str,
+        operation: str,
+    ) -> dict[str, Any]:
+        return self._check_channel_access(
+            project_id=runtime["project_id"],
+            agent_id=runtime["agent_id"],
+            workspace_id=runtime["workspace_id"],
+            channel_id=channel_id,
+            channel_type="channel",
+            principal_id=runtime["principal_id"],
+            slack_user_id=runtime["user_id"],
+            session_id=session_id,
+            operation=operation,
+            slack_caller_token=runtime["slack_caller_token"],
+            destination_channel_id=runtime["destination_channel_id"],
+            destination_channel_type=runtime[
+                "destination_channel_type"
+            ],
+        )
+
+    def _channel_skill_search(
+        self,
+        *,
+        session_id: str,
+        query: object,
+    ) -> dict[str, Any]:
+        runtime = self._dm_runtime(session_id)
+        if runtime is None:
+            raise EntitySkillError("channel skill runtime missing")
+        terms = _search_terms(query)
+        if not terms:
+            return {"error": "empty_query"}
+
+        matches: list[tuple[int, str, dict[str, str]]] = []
+        for channel_id in self._dm_channel_candidates(runtime):
+            try:
+                access = self._dm_channel_access(
+                    runtime=runtime,
+                    session_id=session_id,
+                    channel_id=channel_id,
+                    operation="search",
+                )
+                self._migrate_one(
+                    project_id=runtime["project_id"],
+                    kind="channels",
+                    entity_id=channel_id,
+                )
+                content = self._document(
+                    runtime["project_id"],
+                    "channels",
+                    channel_id,
+                )
+            except EntitySkillError:
+                continue
+            if not content:
+                continue
+            channel_name = str(
+                access.get("source_name")
+                or _frontmatter_value(content, "name")
+                or channel_id
+            ).strip()[:200]
+            haystack = "\n".join(
+                (channel_id, channel_name, content)
+            ).casefold()
+            score = sum(haystack.count(term) for term in terms)
+            if score <= 0:
+                continue
+            matches.append(
+                (
+                    score,
+                    channel_id,
+                    {
+                        "channel_id": channel_id,
+                        "channel_name": channel_name,
+                        "summary": _channel_skill_summary(content),
+                    },
+                )
+            )
+        matches.sort(key=lambda item: (-item[0], item[1]))
+        return {
+            "matches": [
+                item[2] for item in matches[:MAX_CHANNEL_SEARCH_RESULTS]
+            ]
+        }
+
+    def _channel_skill_read(
+        self,
+        *,
+        session_id: str,
+        channel_id: object,
+    ) -> dict[str, Any]:
+        runtime = self._dm_runtime(session_id)
+        if runtime is None:
+            raise EntitySkillError("channel skill runtime missing")
+        selected = _component(channel_id, "channel_id")
+        if selected not in self._dm_channel_candidates(runtime):
+            raise EntitySkillError("channel skill access denied")
+        access = self._dm_channel_access(
+            runtime=runtime,
+            session_id=session_id,
+            channel_id=selected,
+            operation="read",
+        )
+        self._migrate_one(
+            project_id=runtime["project_id"],
+            kind="channels",
+            entity_id=selected,
+        )
+        content = self._document(
+            runtime["project_id"],
+            "channels",
+            selected,
+        )
+        if not content:
+            raise EntitySkillError("channel skill missing")
+        return {
+            "channel_id": selected,
+            "channel_name": str(
+                access.get("source_name")
+                or _frontmatter_value(content, "name")
+                or selected
+            ).strip()[:200],
+            "content": content,
+        }
+
     def authorize_tool(
         self,
         *,
@@ -957,6 +1267,25 @@ class EntitySkillService:
     ) -> dict[str, Any] | None:
         name = str(tool_name or "")
         arguments = args if isinstance(args, dict) else {}
+        if name in {"channel_skill_search", "channel_skill_read"}:
+            try:
+                runtime_session_id = _component(
+                    session_id,
+                    "session_id",
+                )
+                if name == "channel_skill_search":
+                    result = self._channel_skill_search(
+                        session_id=runtime_session_id,
+                        query=arguments.get("query"),
+                    )
+                else:
+                    result = self._channel_skill_read(
+                        session_id=runtime_session_id,
+                        channel_id=arguments.get("channel_id"),
+                    )
+            except EntitySkillError:
+                result = {"error": "channel_skill_access_denied"}
+            return self._handled_tool_result(result)
         raw_path = arguments.get("path") or arguments.get("file_path")
         path: Path | None = None
         if isinstance(raw_path, (str, os.PathLike)):

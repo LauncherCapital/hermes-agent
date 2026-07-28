@@ -78,6 +78,32 @@ def _skill(path: Path, body: str, *, language: str = "") -> None:
     )
 
 
+def test_registered_channel_skill_tools_expose_no_identity_arguments():
+    service_mod = _load_service_module()
+    plugin = sys.modules[service_mod.__package__]
+    tools = {}
+
+    class Context:
+        def register_action(self, *_args):
+            return None
+
+        def register_hook(self, *_args):
+            return None
+
+        def register_tool(self, **kwargs):
+            tools[kwargs["name"]] = kwargs
+
+    plugin.register(Context())
+
+    assert set(tools) == {"channel_skill_search", "channel_skill_read"}
+    assert set(tools["channel_skill_search"]["schema"]["parameters"]["properties"]) == {
+        "query"
+    }
+    assert set(tools["channel_skill_read"]["schema"]["parameters"]["properties"]) == {
+        "channel_id"
+    }
+
+
 def test_prepare_binds_only_exact_runtime_entities(tmp_path):
     service_mod = _load_service_module()
     service = _service(service_mod, tmp_path)
@@ -607,7 +633,7 @@ def test_restricted_channel_cannot_be_read_from_another_session(tmp_path):
     assert blocked["action"] == "block"
 
 
-def test_dm_loads_live_authorized_restricted_channel_skill(tmp_path):
+def test_dm_searches_then_reads_one_live_authorized_channel_skill(tmp_path):
     service_mod = _load_service_module()
     revoked = False
     calls = []
@@ -628,6 +654,13 @@ def test_dm_loads_live_authorized_restricted_channel_skill(tmp_path):
             "session_id": payload["session_id"],
             "operation": payload["operation"],
             "visibility": "private",
+            "source_name": "private-planning",
+            "destination_channel_id": payload.get(
+                "destination_channel_id"
+            ),
+            "destination_channel_type": payload.get(
+                "destination_channel_type"
+            ),
         }
 
     service = service_mod.EntitySkillService(
@@ -655,8 +688,11 @@ def test_dm_loads_live_authorized_restricted_channel_skill(tmp_path):
         args={
             "path": channel_path,
             "content": (
-                "---\nname: channel-G1\n---\n\n"
-                "PRIVATE_CHANNEL_CONTEXT\n"
+                "---\n"
+                "name: channel-G1\n"
+                "summary: Durable planning conventions.\n"
+                "---\n\n"
+                "The launch checklist uses PRIVATE_CHANNEL_CONTEXT.\n"
             ),
         },
     )["action"] == "handled"
@@ -671,6 +707,7 @@ def test_dm_loads_live_authorized_restricted_channel_skill(tmp_path):
         }
     )
 
+    calls.clear()
     injected = service.inject_context(
         session_id="dm-session",
         trusted_runtime_metadata={
@@ -681,26 +718,175 @@ def test_dm_loads_live_authorized_restricted_channel_skill(tmp_path):
             "principal_id": principal_id,
             "channel_id": "D1",
             "channel_type": "im",
+            "slack_caller_token": "signed-dm-caller",
         },
     )
 
-    assert "PRIVATE_CHANNEL_CONTEXT" in injected["context"]
+    assert injected is None or "PRIVATE_CHANNEL_CONTEXT" not in injected["context"]
+    assert calls == []
+
+    searched = service.authorize_tool(
+        session_id="dm-session",
+        tool_name="channel_skill_search",
+        args={
+            "query": "planning",
+            "slack_user_id": "MODEL_AUTHORED_USER",
+        },
+    )
+    search_result = json.loads(searched["result"])
+    assert search_result == {
+        "matches": [
+            {
+                "channel_id": "G1",
+                "channel_name": "private-planning",
+                "summary": "Durable planning conventions.",
+            }
+        ]
+    }
+    assert "PRIVATE_CHANNEL_CONTEXT" not in searched["result"]
+    assert calls[-1] == {
+        "agent_id": AGENT_ID,
+        "principal_id": principal_id,
+        "workspace_id": "T1",
+        "channel_id": "G1",
+        "channel_type": "channel",
+        "slack_user_id": "U1",
+        "session_id": "dm-session",
+        "operation": "search",
+        "slack_caller_token": "signed-dm-caller",
+        "destination_channel_id": "D1",
+        "destination_channel_type": "im",
+    }
+
+    read = service.authorize_tool(
+        session_id="dm-session",
+        tool_name="channel_skill_read",
+        args={"channel_id": "G1", "slack_user_id": "MODEL_AUTHORED_USER"},
+    )
+    read_result = json.loads(read["result"])
+    assert read_result["channel_id"] == "G1"
+    assert read_result["channel_name"] == "private-planning"
+    assert "PRIVATE_CHANNEL_CONTEXT" in read_result["content"]
     assert calls[-1]["operation"] == "read"
-    assert calls[-1]["session_id"] == "dm-session"
+    assert calls[-1]["slack_user_id"] == "U1"
 
     revoked = True
+    denied = service.authorize_tool(
+        session_id="dm-session",
+        tool_name="channel_skill_read",
+        args={"channel_id": "G1"},
+    )
+    assert json.loads(denied["result"]) == {
+        "error": "channel_skill_access_denied"
+    }
+    assert "PRIVATE_CHANNEL_CONTEXT" not in denied["result"]
+
+
+def test_dm_channel_skill_tools_fail_closed_without_hidden_caller(tmp_path):
+    service_mod = _load_service_module()
+    checked = []
+    service = service_mod.EntitySkillService(
+        tmp_path,
+        access_checker=lambda payload: checked.append(payload),
+    )
+
     assert service.inject_context(
-        session_id="revoked-dm-session",
+        session_id="unsigned-dm-session",
         trusted_runtime_metadata={
             "project_id": PROJECT_ID,
             "agent_id": AGENT_ID,
             "workspace_id": "T1",
             "user_id": "U1",
-            "principal_id": principal_id,
+            "principal_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             "channel_id": "D1",
             "channel_type": "im",
         },
     ) is None
+
+    result = service.authorize_tool(
+        session_id="unsigned-dm-session",
+        tool_name="channel_skill_search",
+        args={
+            "query": "context",
+            "slack_caller_token": "MODEL_AUTHORED_TOKEN",
+        },
+    )
+
+    assert json.loads(result["result"]) == {
+        "error": "channel_skill_access_denied"
+    }
+    assert checked == []
+
+
+def test_dm_search_is_not_limited_by_channel_id_order(tmp_path):
+    service_mod = _load_service_module()
+
+    def check(payload):
+        return {
+            "authorized": True,
+            "project_id": PROJECT_ID,
+            "agent_id": AGENT_ID,
+            "workspace_id": "T1",
+            "channel_id": payload["channel_id"],
+            "channel_type": payload["channel_type"],
+            "principal_id": payload["principal_id"],
+            "slack_user_id": payload["slack_user_id"],
+            "session_id": payload["session_id"],
+            "operation": payload["operation"],
+            "visibility": "private",
+            "source_name": f"channel-{payload['channel_id']}",
+            "destination_channel_id": payload["destination_channel_id"],
+            "destination_channel_type": payload["destination_channel_type"],
+        }
+
+    service = service_mod.EntitySkillService(tmp_path, access_checker=check)
+    channel_ids = [f"G{index}" for index in range(9)]
+    with service._lock:
+        manifest = service._load()
+        service._bind_identity(
+            manifest,
+            project_id=PROJECT_ID,
+            agent_id=AGENT_ID,
+            workspace_id="T1",
+        )
+        manifest["channel_visibilities"] = {
+            channel_id: "private" for channel_id in channel_ids
+        }
+        service._save(manifest)
+    for channel_id in channel_ids:
+        body = (
+            "Selected durable context."
+            if channel_id == channel_ids[-1]
+            else "Unrelated durable context."
+        )
+        service.documents.put(
+            PROJECT_ID,
+            "channels",
+            channel_id,
+            f"---\nname: channel-{channel_id}\n---\n\n{body}\n",
+        )
+
+    assert service.inject_context(
+        session_id="dm-session",
+        trusted_runtime_metadata={
+            "project_id": PROJECT_ID,
+            "agent_id": AGENT_ID,
+            "workspace_id": "T1",
+            "user_id": "U1",
+            "principal_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "channel_id": "D1",
+            "channel_type": "im",
+            "slack_caller_token": "signed-dm-caller",
+        },
+    ) is None
+
+    searched = service.authorize_tool(
+        session_id="dm-session",
+        tool_name="channel_skill_search",
+        args={"query": "Selected"},
+    )
+
+    assert json.loads(searched["result"])["matches"][0]["channel_id"] == "G8"
 
 
 def test_multi_user_channel_never_loads_another_private_channel(tmp_path):
@@ -895,6 +1081,39 @@ def test_channel_context_defaults_to_index_and_expands_references_on_demand(
     assert "release train runs on Fridays" in index["context"]
     assert "PRIVATE_DETAILED_REFERENCE" not in index["context"]
     assert "PRIVATE_DETAILED_REFERENCE" in detailed["context"]
+
+
+def test_control_plane_preview_reuses_encrypted_store_and_exact_identity(tmp_path):
+    service_mod = _load_service_module()
+    service = _service(service_mod, tmp_path)
+    service.prepare(request=_request())
+    content = "---\nname: channel-C1\n---\n\nSAFE_CHANNEL_CONTEXT\n"
+    service.documents.put(PROJECT_ID, "channels", "C1", content)
+
+    result = service.preview(
+        request={
+            "project_id": PROJECT_ID,
+            "payload": {
+                "agent_id": AGENT_ID,
+                "path": "skills/channels/C1/SKILL.md",
+            },
+        }
+    )
+
+    assert result["content"] == content
+    assert "SAFE_CHANNEL_CONTEXT" not in (
+        tmp_path / "skills/channels/C1/SKILL.md"
+    ).read_text()
+    with pytest.raises(service_mod.EntitySkillError, match="identity"):
+        service.preview(
+            request={
+                "project_id": PROJECT_ID,
+                "payload": {
+                    "agent_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    "path": "skills/channels/C1/SKILL.md",
+                },
+            }
+        )
 
 
 def test_private_acl_response_with_wrong_principal_fails_closed(tmp_path):

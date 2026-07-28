@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent
+from tools.budget_config import BudgetConfig
 
 
 def _make_tool_defs(*names: str) -> list[dict]:
@@ -254,6 +255,10 @@ def test_default_run_conversation_warns_without_guardrail_halt():
 
     with (
         patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc,
+        patch(
+            "tools.budget_config.load_runtime_budget_config",
+            return_value=BudgetConfig(),
+        ) as load_budget,
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
@@ -261,6 +266,8 @@ def test_default_run_conversation_warns_without_guardrail_halt():
         result = agent.run_conversation("search repeatedly")
 
     assert mock_hfc.call_count == 3
+    assert agent.client.chat.completions.create.call_count == 4
+    assert load_budget.call_count == 1
     assert result["turn_exit_reason"].startswith("text_response")
     assert "guardrail" not in result
     assert result["final_response"] == "done"

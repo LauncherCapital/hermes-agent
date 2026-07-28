@@ -461,6 +461,11 @@ def run_conversation(
     agent._unicode_sanitization_passes = 0
     agent._tool_guardrails.reset_for_turn()
     agent._tool_guardrail_halt_decision = None
+    from tools.budget_config import load_runtime_budget_config
+    from tools.tool_result_storage import ToolResultContextBudget
+    agent._tool_result_context_budget = ToolResultContextBudget(
+        config=load_runtime_budget_config(),
+    )
     # True until the server rejects an image_url content part with an error
     # like "Only 'text' content type is supported."  Set to False on first
     # rejection and kept False for the rest of the session so we never re-send
@@ -1105,6 +1110,28 @@ def run_conversation(
         approx_tokens = estimate_messages_tokens_rough(api_messages)
         approx_request_tokens = estimate_request_tokens_rough(
             api_messages, tools=agent.tools or None
+        )
+        from tools.tool_result_storage import tool_result_context_metrics
+        _tool_result_metrics = tool_result_context_metrics(api_messages)
+        _turn_result_budget = getattr(agent, "_tool_result_context_budget", None)
+        if _turn_result_budget is not None:
+            _turn_result_budget.note_api_request()
+        logger.info(
+            "API request tool context: api_call=%d tool_call_count=%d "
+            "tool_argument_chars=%d approx_argument_tokens=%d result_count=%d "
+            "result_chars=%d approx_result_tokens=%d turn_result_count=%d "
+            "turn_raw_chars=%d turn_inline_chars=%d turn_replayed_approx_tokens=%d",
+            api_call_count,
+            _tool_result_metrics["tool_call_count"],
+            _tool_result_metrics["tool_argument_chars"],
+            _tool_result_metrics["approx_argument_tokens"],
+            _tool_result_metrics["result_count"],
+            _tool_result_metrics["result_chars"],
+            _tool_result_metrics["approx_tokens"],
+            getattr(_turn_result_budget, "result_count", 0),
+            getattr(_turn_result_budget, "raw_chars", 0),
+            getattr(_turn_result_budget, "inline_chars", 0),
+            getattr(_turn_result_budget, "replayed_approx_tokens", 0),
         )
 
         _runtime_context_error = _ollama_context_limit_error(
@@ -4943,6 +4970,9 @@ def run_conversation(
         "cost_source": agent.session_cost_source,
         "session_id": agent.session_id,
     }
+    _turn_result_budget = getattr(agent, "_tool_result_context_budget", None)
+    if _turn_result_budget is not None:
+        result["tool_result_context"] = _turn_result_budget.to_metrics()
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # If a /steer landed after the final assistant turn (no more tool

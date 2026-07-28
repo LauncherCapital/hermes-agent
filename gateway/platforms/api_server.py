@@ -22,6 +22,8 @@ Exposes an HTTP server with endpoints:
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
+- POST /v1/volume/inspect          — authenticated bounded HERMES_HOME metadata
+- POST /v1/volume/preview          — authenticated allowlisted diagnostic preview
 
 Any OpenAI-compatible frontend (Open WebUI, LobeChat, LibreChat,
 AnythingLLM, NextChat, ChatBox, etc.) can connect to hermes-agent
@@ -563,6 +565,7 @@ _TRUSTED_RUNTIME_FIELDS = {
     "user_id",
     "principal_id",
     "team_slug",
+    "slack_caller_token",
 }
 
 
@@ -577,9 +580,10 @@ def _trusted_runtime_metadata(
         or set(value) - _TRUSTED_RUNTIME_FIELDS
         or any(
             not isinstance(item, str)
-            or len(item) > 256
+            or len(item)
+            > (8192 if key == "slack_caller_token" else 256)
             or re.search(r"[\r\n\x00]", item)
-            for item in value.values()
+            for key, item in value.items()
         )
     ):
         return None, web.json_response(
@@ -1333,9 +1337,16 @@ class APIServerAdapter(BasePlatformAdapter):
             ]
         except Exception:
             logger.debug("plugin health collection failed", exc_info=True)
+        from tools.budget_config import load_runtime_budget_config
+
+        context_budget = load_runtime_budget_config().context_budget
+        effective_context_budget = (
+            0 if context_budget == float("inf") else int(context_budget)
+        )
         return web.json_response({
             "status": "ok",
             "platform": "hermes-agent",
+            "tool_result_context_budget_chars": effective_context_budget,
             "gateway_state": runtime.get("gateway_state"),
             "platforms": runtime.get("platforms", {}),
             "active_agents": runtime.get("active_agents", 0),
@@ -1344,6 +1355,165 @@ class APIServerAdapter(BasePlatformAdapter):
             "pid": os.getpid(),
             "components": plugin_health,
         })
+
+    async def _volume_request(
+        self,
+        request: "web.Request",
+        *,
+        allow_path: bool = False,
+    ) -> tuple[Optional[dict[str, Any]], Optional["web.Response"]]:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return None, auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return None, web.json_response(
+                {"error": {"code": "invalid_json", "message": "request body must be a JSON object"}},
+                status=400,
+            )
+        if not isinstance(body, dict):
+            return None, web.json_response(
+                {"error": {"code": "invalid_request", "message": "request body must be a JSON object"}},
+                status=400,
+            )
+        allowed_fields = {"project_id", "agent_id"}
+        if allow_path:
+            allowed_fields.add("path")
+        if set(body) - allowed_fields:
+            return None, web.json_response(
+                {"error": {"code": "invalid_request", "message": "request contains unsupported fields"}},
+                status=400,
+            )
+        try:
+            project_id = str(uuid.UUID(str(body.get("project_id") or "")))
+            agent_id = str(uuid.UUID(str(body.get("agent_id") or "")))
+        except (TypeError, ValueError):
+            return None, web.json_response(
+                {"error": {"code": "invalid_identity", "message": "project_id and agent_id must be UUIDs"}},
+                status=400,
+            )
+
+        from gateway.event_ingress import read_project_marker
+
+        marker = read_project_marker()
+        if marker is None:
+            return None, web.json_response(
+                {"error": {"code": "project_unclaimed", "message": "runtime is not claimed"}},
+                status=503,
+            )
+        if project_id != marker["project_id"]:
+            return None, web.json_response(
+                {"error": {"code": "project_mismatch", "message": "request targets another project"}},
+                status=403,
+            )
+        return {**body, "project_id": project_id, "agent_id": agent_id}, None
+
+    async def _handle_volume_inspect(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        """Return a bounded metadata tree and selected plugin health."""
+        body, error = await self._volume_request(request)
+        if error is not None:
+            return error
+        assert body is not None
+
+        from gateway.volume_inspector import VolumeInspectorError, inspect_volume
+
+        try:
+            result = inspect_volume()
+        except VolumeInspectorError as exc:
+            return web.json_response(
+                {"error": {"code": exc.code, "message": str(exc)}},
+                status=exc.status,
+            )
+
+        wanted = ("ringo_entity_skills", "ringo_channel_memory")
+        components: dict[str, dict[str, Any]] = {
+            name: {"name": name, "status": "unavailable", "last_error": None}
+            for name in wanted
+        }
+        try:
+            from hermes_cli.plugins import discover_plugins, invoke_hook
+
+            discover_plugins()
+            for report in invoke_hook("health_report"):
+                if (
+                    isinstance(report, dict)
+                    and report.get("name") in components
+                ):
+                    components[str(report["name"])] = report
+        except Exception:
+            logger.debug("volume inspector health collection failed", exc_info=True)
+        return web.json_response(
+            {
+                **result,
+                "project_id": body["project_id"],
+                "agent_id": body["agent_id"],
+                "components": [components[name] for name in wanted],
+            }
+        )
+
+    async def _handle_volume_preview(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        """Decrypt one explicitly allowlisted canonical channel SKILL.md."""
+        body, error = await self._volume_request(request, allow_path=True)
+        if error is not None:
+            return error
+        assert body is not None
+
+        from gateway.volume_inspector import (
+            VolumeInspectorError,
+            validate_preview_target,
+        )
+
+        try:
+            validate_preview_target(body.get("path"))
+        except VolumeInspectorError as exc:
+            return web.json_response(
+                {"error": {"code": exc.code, "message": str(exc)}},
+                status=exc.status,
+            )
+
+        action_request = {
+            "action": "ringo.entity_skills.preview",
+            "project_id": body["project_id"],
+            "request_id": f"volume-preview:{uuid.uuid4()}",
+            "payload": {
+                "agent_id": body["agent_id"],
+                "path": body["path"],
+            },
+        }
+        try:
+            from hermes_cli.plugins import (
+                PluginActionUnavailable,
+                invoke_plugin_action,
+            )
+
+            result = await invoke_plugin_action(
+                action_request["action"],
+                request=action_request,
+            )
+        except PluginActionUnavailable:
+            return web.json_response(
+                {"error": {"code": "preview_unavailable", "message": "canonical preview is unavailable"}},
+                status=503,
+            )
+        except Exception:
+            logger.warning("canonical volume preview denied", exc_info=True)
+            return web.json_response(
+                {"error": {"code": "preview_denied", "message": "canonical preview was denied"}},
+                status=403,
+            )
+        if not isinstance(result, dict):
+            return web.json_response(
+                {"error": {"code": "preview_unavailable", "message": "canonical preview is unavailable"}},
+                status=503,
+            )
+        return web.json_response(result)
 
     async def _handle_events(self, request: "web.Request") -> "web.Response":
         """POST /v1/events — signed, project-bound plugin event dispatch."""
@@ -1761,6 +1931,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events_sse": True,
                 "run_stop": True,
                 "run_approval_response": True,
+                "volume_inspection": True,
                 "tool_progress_events": True,
                 "approval_events": True,
                 "session_resources": True,
@@ -3306,6 +3477,11 @@ class APIServerAdapter(BasePlatformAdapter):
         _dropped_tools = result.get("dropped_tools")
         if _dropped_tools:
             response_data["dropped_tools"] = _dropped_tools
+        tool_result_context = result.get("tool_result_context")
+        if isinstance(tool_result_context, dict):
+            response_data["hermes_metrics"] = {
+                "tool_result_context": tool_result_context,
+            }
         turn_messages = self._turn_transcript_messages(
             history,
             user_message,
@@ -5527,6 +5703,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
+            self._app.router.add_post("/v1/volume/inspect", self._handle_volume_inspect)
+            self._app.router.add_post("/v1/volume/preview", self._handle_volume_preview)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_post("/v1/events", self._handle_events)

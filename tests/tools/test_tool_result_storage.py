@@ -4,6 +4,8 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from tools.budget_config import (
+    CANARY_CONTEXT_BUDGET_CHARS,
+    DEFAULT_CONTEXT_BUDGET_CHARS,
     DEFAULT_RESULT_SIZE_CHARS,
     DEFAULT_PREVIEW_SIZE_CHARS,
     BudgetConfig,
@@ -13,13 +15,16 @@ from tools.tool_result_storage import (
     PERSISTED_OUTPUT_TAG,
     PERSISTED_OUTPUT_CLOSING_TAG,
     STORAGE_DIR,
+    ToolResultContextBudget,
     _build_persisted_message,
     _heredoc_marker,
     _resolve_storage_dir,
     _write_to_sandbox,
     enforce_turn_budget,
     generate_preview,
+    generate_head_tail_preview,
     maybe_persist_tool_result,
+    tool_result_context_metrics,
 )
 
 
@@ -62,6 +67,31 @@ class TestGeneratePreview:
         preview, has_more = generate_preview(text)
         assert preview == text
         assert has_more is False
+
+
+class TestGenerateHeadTailPreview:
+    def test_tail_evidence_outside_head_is_preserved_deterministically(self):
+        evidence = "TAIL_EVIDENCE_FINAL_PRICE"
+        text = "HEAD\n" + ("x" * 5_000) + evidence
+
+        preview, has_more = generate_head_tail_preview(text, max_chars=1_500)
+
+        assert preview.startswith("HEAD")
+        assert evidence in preview
+        assert "[middle omitted]" in preview
+        assert len(preview) <= 1_500
+        assert has_more is True
+
+    def test_tiny_budget_never_exceeds_requested_size(self):
+        marker_size = len("\n...[middle omitted]...\n")
+
+        preview, has_more = generate_head_tail_preview(
+            "x" * 100,
+            max_chars=marker_size + 1,
+        )
+
+        assert len(preview) <= marker_size + 1
+        assert has_more is True
 
 
 # ── _heredoc_marker ───────────────────────────────────────────────────
@@ -491,6 +521,215 @@ class TestEnforceTurnBudget:
     def test_empty_messages(self):
         result = enforce_turn_budget([], env=None, config=BudgetConfig(turn_budget=200_000))
         assert result == []
+
+
+# ── Cross-API result context budget ──────────────────────────────────
+
+class TestToolResultContextBudget:
+    # Content-free production fixture from execution
+    # f215d59d-4e24-477c-aeb1-7f7452f02ce0. Each nested list is one tool
+    # batch; values are result character counts in call order.
+    PRODUCTION_BATCHES = [
+        [1_159],
+        [1_159, 1_159, 1_159],
+        [1_405, 15_680, 1_404],
+        [1_408, 1_825, 537],
+        [26_158, 1_026, 6_376],
+        [533, 533, 539],
+        [386],
+    ]
+
+    def test_production_fixture_reproduces_replayed_result_context(self):
+        cumulative_chars = 0
+        replayed_tokens = 0
+        for batch in self.PRODUCTION_BATCHES:
+            cumulative_chars += sum(batch)
+            replayed_tokens += (cumulative_chars + 3) // 4
+
+        assert cumulative_chars == 62_446
+        assert replayed_tokens == 60_196
+
+    def test_production_fixture_spills_before_first_model_exposure(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        budget = ToolResultContextBudget(
+            config=BudgetConfig(context_budget=CANARY_CONTEXT_BUDGET_CHARS),
+        )
+        inline_batches = []
+        call_index = 0
+        replayed_inline_tokens = 0
+
+        for batch in self.PRODUCTION_BATCHES:
+            inline_batch = []
+            for size in batch:
+                call_index += 1
+                inline_batch.append(
+                    budget.prepare(
+                        content="x" * size,
+                        tool_name=f"read_tool_{call_index}",
+                        tool_use_id=f"call_{call_index}",
+                        env=env,
+                    )
+                )
+            inline_batches.append(inline_batch)
+            replayed_inline_tokens += (budget.inline_chars + 3) // 4
+
+        assert budget.raw_chars == 62_446
+        assert budget.budget_chars == CANARY_CONTEXT_BUDGET_CHARS == 40_000
+        assert budget.budget_spill_count >= 1
+        assert budget.inline_chars < budget.raw_chars
+        assert replayed_inline_tokens <= 43_000
+        assert 60_196 - replayed_inline_tokens >= 17_000
+        assert any(
+            PERSISTED_OUTPUT_TAG in result
+            for batch in inline_batches
+            for result in batch
+        )
+        assert sum(
+            "Result-context budget reached" in result
+            for batch in inline_batches
+            for result in batch
+        ) == 1
+
+    def test_budget_is_fail_open_without_recoverable_storage(self):
+        budget = ToolResultContextBudget(
+            config=BudgetConfig(context_budget=10),
+        )
+        content = "evidence that must remain available"
+
+        result = budget.prepare(
+            content=content,
+            tool_name="read_tool",
+            tool_use_id="call_1",
+            env=None,
+        )
+
+        assert result == content
+        assert budget.budget_spill_count == 0
+
+    def test_default_budget_does_not_change_existing_inline_recall(
+        self,
+        caplog,
+    ):
+        env = MagicMock()
+        content = "HEAD\n" + ("x" * 50_000) + "TAIL_EVIDENCE"
+        budget = ToolResultContextBudget()
+
+        with caplog.at_level("INFO", logger="tools.tool_result_storage"):
+            result = budget.prepare(
+                content=content,
+                tool_name="read_tool",
+                tool_use_id="call_1",
+                env=env,
+            )
+
+        assert DEFAULT_CONTEXT_BUDGET_CHARS == float("inf")
+        assert result == content
+        assert "TAIL_EVIDENCE" in result
+        assert "budget_chars=disabled" in caplog.text
+        env.execute.assert_not_called()
+
+    def test_opt_in_budget_keeps_tail_evidence_in_inline_preview_and_full_storage(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        evidence = "TAIL_EVIDENCE_FINAL_PRICE"
+        content = "HEAD\n" + ("x" * 50_000) + evidence
+        budget = ToolResultContextBudget(
+            config=BudgetConfig(context_budget=10),
+        )
+
+        result = budget.prepare(
+            content=content,
+            tool_name="read_tool",
+            tool_use_id="call_1",
+            env=env,
+        )
+
+        assert PERSISTED_OUTPUT_TAG in result
+        assert "Preview (head+tail " in result
+        assert result.index("HEAD") < result.index("[middle omitted]")
+        assert result.index("[middle omitted]") < result.index(evidence)
+        assert env.execute.call_args.kwargs["stdin_data"] == content
+
+    def test_budget_is_fail_open_when_storage_write_fails(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "disk full", "returncode": 1}
+        budget = ToolResultContextBudget(
+            config=BudgetConfig(context_budget=10),
+        )
+        content = "evidence that must remain available"
+
+        result = budget.prepare(
+            content=content,
+            tool_name="read_tool",
+            tool_use_id="call_1",
+            env=env,
+        )
+
+        assert result == content
+        assert budget.budget_spill_count == 0
+
+    def test_read_file_recovery_remains_inline_past_budget(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        budget = ToolResultContextBudget(
+            config=BudgetConfig(context_budget=10),
+        )
+        content = "recovered evidence"
+
+        result = budget.prepare(
+            content=content,
+            tool_name="read_file",
+            tool_use_id="call_1",
+            env=env,
+        )
+
+        assert result == content
+        env.execute.assert_not_called()
+
+    def test_request_metrics_include_only_tool_result_metadata(self):
+        messages = [
+            {"role": "user", "content": "private user text"},
+            {
+                "role": "assistant",
+                "content": "private reply",
+                "tool_calls": [
+                    {"function": {"name": "private_tool", "arguments": "z" * 7}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "a", "content": "x" * 9},
+            {"role": "tool", "tool_call_id": "b", "content": "y" * 8},
+        ]
+
+        assert tool_result_context_metrics(messages) == {
+            "result_count": 2,
+            "result_chars": 17,
+            "approx_tokens": 5,
+            "tool_call_count": 1,
+            "tool_argument_chars": 7,
+            "approx_argument_tokens": 2,
+        }
+
+    def test_turn_metrics_are_content_free_and_report_recovery(self):
+        budget = ToolResultContextBudget(
+            config=BudgetConfig(context_budget=10),
+        )
+        budget.prepare(
+            content="recovered evidence",
+            tool_name="read_file",
+            tool_use_id="call_1",
+            env=MagicMock(),
+        )
+
+        assert budget.to_metrics() == {
+            "budget_chars": 10,
+            "result_count": 1,
+            "raw_chars": 18,
+            "inline_chars": 18,
+            "budget_spill_count": 0,
+            "recovery_result_count": 1,
+            "replayed_approx_tokens": 0,
+        }
 
 
 # ── Per-tool threshold integration ────────────────────────────────────

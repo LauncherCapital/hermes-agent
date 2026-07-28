@@ -2602,24 +2602,24 @@ def test_message_search_recovers_price_change_thread_without_cross_thread_noise(
     messages = (
         (
             "C099U109ZM4",
-            "1784869080.000001",
+            "1784869077.894429",
             None,
-            "월문당/CallMe 가격 변경 논의",
-            "2026-07-24T09:38:00+00:00",
+            "오~",
+            "2026-07-24T04:57:57+00:00",
         ),
         (
             "C099U109ZM4",
             "1784869142.677289",
-            None,
+            "1784869142.677289",
             "단건 26,700원 -> 31,900원, 구독 26,000원 -> 33,900원",
-            "2026-07-24T09:39:02+00:00",
+            "2026-07-24T04:59:02+00:00",
         ),
         (
             "C099U109ZM4",
-            "1784869200.000001",
+            "1784869920.846569",
             "1784869142.677289",
-            "Stripe 신규 Price 생성 방식입니다.",
-            "2026-07-24T09:40:00+00:00",
+            "Stripe 가격을 수정하는 대신 신규 Price를 추가하는 방식입니다.",
+            "2026-07-24T05:12:00+00:00",
         ),
         (
             "COTHER",
@@ -2682,26 +2682,105 @@ def test_message_search_recovers_price_change_thread_without_cross_thread_noise(
         "allowed_source_ids": ["slack:T1:C099U109ZM4", "slack:T1:COTHER"],
         "limit": 10,
     }
-    regression = store.query({**scoped, "query": "월문당 가격 변경 Stripe"})
+    regression = store.query({**scoped, "query": "가격"})
     direct = store.query({**scoped, "query": "31,900원"})
     reply = store.query({**scoped, "query": "Stripe 신규 Price"})
+    unrelated = store.query({**scoped, "query": "다른 서비스 가격 변경"})
 
     assert regression["coverage_complete"] is True
-    assert len(regression["hits"]) == 1
-    assert regression["hits"][0]["message"]["conversation_id"] == "C099U109ZM4"
+    canonical = next(
+        hit
+        for hit in regression["hits"]
+        if hit["message"]["conversation_id"] == "C099U109ZM4"
+    )
     assert {
-        item["provider_message_id"] for item in regression["hits"][0]["context"]
-    } >= {"1784869142.677289", "1784869200.000001"}
+        item["provider_message_id"] for item in canonical["context"]
+    } >= {"1784869142.677289", "1784869920.846569"}
     assert all(
-        hit["message"]["conversation_id"] not in {"COTHER", "CSECRET"}
+        hit["message"]["conversation_id"] != "CSECRET"
         for hit in regression["hits"]
     )
     assert direct["hits"][0]["message"]["provider_message_id"] == "1784869142.677289"
-    assert reply["hits"][0]["message"]["provider_message_id"] == "1784869200.000001"
+    assert reply["hits"][0]["message"]["provider_message_id"] == "1784869920.846569"
     assert {item["provider_message_id"] for item in reply["hits"][0]["context"]} >= {
         "1784869142.677289",
-        "1784869200.000001",
+        "1784869920.846569",
     }
+    assert len(unrelated["hits"]) == 1
+    assert unrelated["hits"][0]["message"]["conversation_id"] == "COTHER"
+
+
+def test_message_search_returns_partial_hits_when_coverage_is_incomplete(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO conversations(project_id, provider, workspace_id, "
+            "conversation_id, title, updated_at) VALUES (?, 'slack', 'T1', 'C1', "
+            "'billing', '2026-07-28T00:00:00+00:00')",
+            (project_id,),
+        )
+        conn.execute(
+            "INSERT INTO coverage(project_id, provider, workspace_id, "
+            "conversation_id, contiguous_since, last_sequence, last_event_at, state) "
+            "VALUES (?, 'slack', 'T1', 'C1', NULL, 6673, "
+            "'2026-07-28T00:00:00+00:00', 'COLLECTING')",
+            (project_id,),
+        )
+        for message_id, parent_id, text, occurred_at in (
+            (
+                "1784869142.677289",
+                "1784869142.677289",
+                "단건 26,700원 -> 31,900원, 구독 26,000원 -> 33,900원",
+                "2026-07-24T04:59:02+00:00",
+            ),
+            (
+                "1784869920.846569",
+                "1784869142.677289",
+                "Stripe 가격을 수정하는 대신 신규 Price를 추가하는 방식입니다.",
+                "2026-07-24T05:12:00+00:00",
+            ),
+        ):
+            conn.execute(
+                "INSERT INTO messages(project_id, provider, workspace_id, "
+                "conversation_id, provider_message_id, parent_message_id, sender_id, "
+                "text, provider_payload_json, occurred_at, inserted_at, updated_at) "
+                "VALUES (?, 'slack', 'T1', 'C1', ?, ?, 'U1', ?, '{}', ?, ?, ?)",
+                (
+                    project_id,
+                    message_id,
+                    parent_id,
+                    text,
+                    occurred_at,
+                    occurred_at,
+                    occurred_at,
+                ),
+            )
+
+    result = store.query(
+        {
+            "operation": "search",
+            "query": "가격",
+            "start": "2026-07-21T00:00:00+00:00",
+            "end": "2026-07-28T00:00:00+00:00",
+            "providers": ["slack"],
+            "workspace_ids": ["T1"],
+            "allowed_source_ids": ["slack:T1:C1"],
+            "limit": 10,
+        }
+    )
+
+    assert result["coverage_complete"] is False
+    assert result["reason"] == "coverage_incomplete"
+    assert result["hits"][0]["message"]["provider_message_id"] == "1784869920.846569"
+    assert {
+        item["provider_message_id"] for item in result["hits"][0]["context"]
+    } == {"1784869142.677289", "1784869920.846569"}
 
 
 def test_message_search_supports_unicode_scripts_without_language_dictionaries(

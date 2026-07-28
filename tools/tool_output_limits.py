@@ -23,6 +23,7 @@ Example ``config.yaml``::
       max_bytes: 100000        # terminal output cap (chars)
       max_lines: 5000          # read_file pagination + truncation cap
       max_line_length: 2000    # per-line length cap before '... [truncated]'
+      context_budget_chars: 40000  # opt-in cross-API tool-result budget
 
 The limits reader is defensive: any error (missing config file, invalid
 value type, etc.) falls back to the built-in defaults so tools never
