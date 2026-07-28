@@ -55,9 +55,10 @@ see the underlying tool, not the bridge.
 
 ## When does it activate?
 
-By default Tool Search runs in `auto` mode: it activates only when the
+By default Tool Search runs in `auto` mode: it activates when the
 deferrable tool schemas would consume at least 10% of the active model's
-context window. Below that, the tools-array assembly is a pure
+context window or reach the absolute 20K-schema-token budget, whichever
+comes first. Below both thresholds, the tools-array assembly is a pure
 pass-through and you pay no overhead.
 
 This decision is re-evaluated every time the tools array is built, so:
@@ -75,7 +76,8 @@ This decision is re-evaluated every time the tools array is built, so:
 tools:
   tool_search:
     enabled: auto       # auto (default), on, or off
-    threshold_pct: 10   # percentage of context — only used in auto mode
+    threshold_pct: 10   # percentage of context — auto uses the lower threshold
+    threshold_tokens: 20000  # absolute schema-token budget in auto mode
     search_default_limit: 5
     max_search_limit: 20
 ```
@@ -84,6 +86,7 @@ tools:
 | --- | --- | --- |
 | `enabled` | `auto` | `auto` activates above threshold; `on` always activates if there's at least one deferrable tool; `off` disables entirely. |
 | `threshold_pct` | `10` | Percentage of context length at which `auto` mode kicks in. Range 0–100. |
+| `threshold_tokens` | `20000` | Absolute deferrable-schema token budget. `auto` uses the lower of this budget and `threshold_pct`. |
 | `search_default_limit` | `5` | Hits returned when the model calls `tool_search` without a `limit`. |
 | `max_search_limit` | `20` | Hard upper bound the model can request via `limit`. Range 1–50. |
 

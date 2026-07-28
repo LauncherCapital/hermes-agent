@@ -2080,8 +2080,9 @@ DEFAULT_CONFIG = {
     "tools": {
         "tool_search": {
             # "auto" (default) — activate only when deferrable tool schemas
-            #   exceed ``threshold_pct`` of the active model's context length,
-            #   so small toolsets pay no overhead.
+            #   reach either ``threshold_pct`` of the active model's context
+            #   length or the absolute ``threshold_tokens`` budget, so small
+            #   toolsets pay no overhead on large-context models.
             # "on"  — always activate when there is at least one deferrable
             #   tool. Use when you have many MCP servers and want maximum
             #   token reduction unconditionally.
@@ -2090,6 +2091,10 @@ DEFAULT_CONFIG = {
             # Percentage of context length at which "auto" mode kicks in.
             # 10 matches the Claude Code default. Range 0..100.
             "threshold_pct": 10,
+            # Absolute deferrable-schema budget for "auto" mode. The lower of
+            # this and threshold_pct is used. 20K preserves the existing
+            # unknown-context fallback while protecting 1M-context models.
+            "threshold_tokens": 20_000,
             # When the model calls tool_search without a ``limit`` argument,
             # how many hits to return. Range 1..max_search_limit.
             "search_default_limit": 5,

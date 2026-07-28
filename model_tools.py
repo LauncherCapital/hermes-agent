@@ -494,9 +494,10 @@ def _compute_tool_definitions(
     # ── Tool Search (progressive disclosure) ────────────────────────────
     # Conditionally replace MCP + plugin (non-core) tools with three bridge
     # tools (tool_search / tool_describe / tool_call) when the deferrable
-    # surface exceeds the configured threshold (default 10% of context
-    # window). Core Hermes tools (toolsets._HERMES_CORE_TOOLS) are NEVER
-    # deferred. See tools/tool_search.py for full design notes.
+    # surface exceeds either configured threshold (default 10% of context
+    # window or 20K schema tokens). Core Hermes tools
+    # (toolsets._HERMES_CORE_TOOLS) are NEVER deferred. See
+    # tools/tool_search.py for full design notes.
     #
     # This is deliberately the last step before returning — sanitization
     # has already normalized schemas, and the assembly is idempotent in
