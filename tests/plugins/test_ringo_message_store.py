@@ -1448,7 +1448,7 @@ def test_file_reconcile_resumes_local_encrypted_message_scan(tmp_path, monkeypat
     assert run["discovered_shares"] == 2
 
 
-def test_file_search_uses_fixed_acl_retrieve_rerank_inspect_limits(
+def test_file_search_applies_acl_and_inspects_ranked_thread_files(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -1606,8 +1606,8 @@ def test_file_search_uses_fixed_acl_retrieve_rerank_inspect_limits(
 
     assert result["coverage_complete"] is True
     assert result["retrieve_count"] == 14
-    assert result["rerank_count"] == 10
-    assert result["inspected_image_count"] == 3
+    assert result["rerank_count"] == 1
+    assert result["inspected_image_count"] == 1
     assert len(result["files"]) == 1
     assert {item["channel_id"] for item in result["files"]} == {"C1"}
     assert sum(item["image_inspected"] for item in result["files"]) == 1
@@ -1868,7 +1868,6 @@ def test_direct_file_search_does_not_promote_unrequested_thread_context(
                 "shared_at": "2026-07-28T00:00:00+00:00",
             }
         )
-
     result = store.search_file_index(
         {
             "project_id": project_id,
@@ -1882,6 +1881,64 @@ def test_direct_file_search_does_not_promote_unrequested_thread_context(
     )
 
     assert [item["file_id"] for item in result["files"]] == ["F-direct"]
+
+
+def test_file_search_uses_bm25_index_without_embeddings(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+    monkeypatch.setattr(
+        store_module,
+        "embed_text",
+        lambda _text: ([], "embedding-unavailable"),
+    )
+    for file_id, caption in (
+        ("F-target", "월문당 시장 가격 조정 검토"),
+        ("F-distractor", "캐릭터 프로필 이미지 시안"),
+    ):
+        store.apply_file_command(
+            {
+                "project_id": project_id,
+                "store_generation": store.store_generation,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "operation": "upsert_share",
+                "file_id": file_id,
+                "conversation_id": "C1",
+                "provider_message_id": file_id,
+                "source_version": 1,
+                "processing_status": "indexed",
+                "caption_ocr": caption,
+                "shared_at": "2026-07-28T00:00:00+00:00",
+            }
+        )
+    with store._connect() as conn:
+        conn.execute("DELETE FROM file_content_search_fts")
+        conn.execute("DELETE FROM file_content_search_trigram")
+        conn.execute("DELETE FROM file_share_search_fts")
+        conn.execute("DELETE FROM file_share_search_trigram")
+        conn.execute(
+            "DELETE FROM schema_meta WHERE key='file_search_index_version'"
+        )
+    store = module.MessageStore(project_id)
+
+    result = store.search_file_index(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "query": "월문당 가격 조정",
+            "allowed_source_ids": ["slack:T1:C1"],
+            "allowed_scope_revision": "scope-1",
+        }
+    )
+
+    assert store.file_search_index_available is True
+    assert [item["file_id"] for item in result["files"]] == ["F-target"]
 
 
 def test_file_search_finds_recent_profile_candidates_from_thread_context(
@@ -2012,6 +2069,27 @@ def test_file_search_finds_recent_profile_candidates_from_thread_context(
             file_id, "Unrelated workplace document."
         ),
     )
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO messages(project_id, provider, workspace_id, "
+            "conversation_id, provider_message_id, sender_id, text, "
+            "provider_payload_json, occurred_at, inserted_at, updated_at) "
+            "VALUES (?, 'slack', 'T1', 'C1', 'PROFILE-ROOT', 'U1', "
+            "'링고 리브랜딩 프로필 후보 논의', '{}', "
+            "'2026-07-23T05:00:00+00:00', '2026-07-23T05:00:00+00:00', "
+            "'2026-07-23T05:00:00+00:00')",
+            (project_id,),
+        )
+        for index in range(7):
+            occurred_at = f"2026-07-23T05:{index + 1:02d}:00+00:00"
+            conn.execute(
+                "INSERT INTO messages(project_id, provider, workspace_id, "
+                "conversation_id, provider_message_id, parent_message_id, "
+                "sender_id, text, provider_payload_json, occurred_at, "
+                "inserted_at, updated_at) VALUES (?, 'slack', 'T1', 'C1', ?, "
+                "'PROFILE-ROOT', 'U1', '프로필 후보 이미지', '{}', ?, ?, ?)",
+                (project_id, f"M-{index}", occurred_at, occurred_at, occurred_at),
+            )
     for index, (
         file_id,
         name,
@@ -2109,6 +2187,101 @@ def test_file_search_finds_recent_profile_candidates_from_thread_context(
         for item in result["files"]
         if item["file_id"] in target_ids
     )
+
+
+def test_file_search_expands_all_matching_files_from_a_ranked_thread(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+    monkeypatch.setattr(
+        store_module,
+        "embed_texts",
+        lambda texts: ([[1.0, 0.0] for _text in texts], "embedding-test"),
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO messages(project_id, provider, workspace_id, "
+            "conversation_id, provider_message_id, sender_id, text, "
+            "provider_payload_json, occurred_at, inserted_at, updated_at) "
+            "VALUES (?, 'slack', 'T1', 'C1', 'ROOT', 'U1', "
+            "'링고 리브랜딩 프로필 후보 논의', '{}', "
+            "'2026-07-23T05:00:00+00:00', '2026-07-23T05:00:00+00:00', "
+            "'2026-07-23T05:00:00+00:00')",
+            (project_id,),
+        )
+        for index in range(12):
+            occurred_at = f"2026-07-23T05:{index + 1:02d}:00+00:00"
+            conn.execute(
+                "INSERT INTO messages(project_id, provider, workspace_id, "
+                "conversation_id, provider_message_id, parent_message_id, "
+                "sender_id, text, provider_payload_json, occurred_at, "
+                "inserted_at, updated_at) VALUES (?, 'slack', 'T1', 'C1', ?, "
+                "'ROOT', 'U1', '프로필 후보 이미지', '{}', ?, ?, ?)",
+                (project_id, f"M{index}", occurred_at, occurred_at, occurred_at),
+            )
+
+    for index in range(12):
+        store.apply_file_command(
+            {
+                "project_id": project_id,
+                "store_generation": store.store_generation,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "operation": "upsert_share",
+                "file_id": f"F{index}",
+                "conversation_id": "C1",
+                "provider_message_id": f"M{index}",
+                "source_version": index + 1,
+                "content_version": index + 1,
+                "context_version": index + 1,
+                "file_name": "image.png",
+                "mime_type": "image/png",
+                "processing_status": "indexed",
+                "caption_ocr": (
+                    f"링고 프로필 후보 {index}"
+                    if index < 11
+                    else "unrelated exported asset"
+                ),
+                "text_content_embedding": (
+                    [1.0, 0.0] if index < 11 else [0.0, 1.0]
+                ),
+                "parent_embedding": (
+                    [1.0, 0.0] if index < 11 else [0.0, 1.0]
+                ),
+                "parent_embedding_model": "embedding-test",
+                "parent_embedding_dimension": 2,
+                "thread_context": (
+                    "링고 리브랜딩 프로필 사진 후보 논의"
+                    if index < 11
+                    else None
+                ),
+                "shared_at": f"2026-07-23T05:{index + 1:02d}:00+00:00",
+            }
+        )
+
+    result = store.search_file_index(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "query": "링고 프로필 후보",
+            "context_query": "링고 리브랜딩 프로필 사진 후보 논의",
+            "allowed_source_ids": ["slack:T1:C1"],
+            "allowed_scope_revision": "scope-1",
+            "limit": 20,
+        }
+    )
+
+    assert [item["file_id"] for item in result["files"]] == [
+        f"F{index}" for index in reversed(range(12))
+    ]
+    assert result["rerank_count"] == 1
 
 
 def test_file_graph_batch_has_independent_ack_cursor_and_no_vectors(

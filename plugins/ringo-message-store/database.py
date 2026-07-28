@@ -130,6 +130,7 @@ class EncryptedDatabase:
                 search_index_text,
                 deterministic=True,
             )
+            self._load_vector_extension(conn)
             conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=5000")
@@ -138,6 +139,21 @@ class EncryptedDatabase:
         except Exception:
             conn.close()
             raise
+
+    @staticmethod
+    def _load_vector_extension(conn: Any) -> None:
+        """Load the pinned sqlite-vec extension when the optional extra is present."""
+        try:
+            import sqlite_vec
+        except ImportError:
+            return
+        conn.enable_load_extension(True)
+        try:
+            sqlite_vec.load(conn)
+        except (OSError, sqlcipher.Error):
+            return
+        finally:
+            conn.enable_load_extension(False)
 
     @staticmethod
     def _apply_key(conn: Any, key: str) -> None:
