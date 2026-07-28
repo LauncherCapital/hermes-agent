@@ -39,7 +39,7 @@ from .search_text import (
 
 
 logger = logging.getLogger(__name__)
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 PROTOCOL_VERSION = 2
 PROTOCOL_CAPABILITIES = (
     "acl_metadata",
@@ -67,6 +67,7 @@ FILE_SEARCH_MAX_INDEX_MATCHES = 5_000
 FILE_SEARCH_DIRECT_LEXICAL_LANE_WEIGHT = 0.25
 FILE_SEARCH_CONTEXT_LANE_WEIGHT = 1.0
 FILE_SEARCH_CONTEXT_DENSE_LANE_WEIGHT = 2.0
+FILE_EMBEDDING_BACKFILL_LIMIT = 20
 MAX_FILE_PROCESSING_ATTEMPTS = 3
 MESSAGE_SEARCH_ADJACENCY_SECONDS = 10 * 60
 MESSAGE_SEARCH_CANDIDATE_LIMIT = 200
@@ -555,6 +556,18 @@ ALTER TABLE file_shares
     ADD COLUMN parent_embedding_error TEXT;
 """
 _MIGRATION_V8 = ""
+_MIGRATION_V9 = """
+UPDATE file_contents
+SET processing_attempts=0, last_error_code=NULL
+WHERE processing_status='indexed'
+  AND caption_ocr IS NOT NULL AND caption_ocr!=''
+  AND text_content_embedding_json IS NULL;
+UPDATE file_shares
+SET parent_embedding_attempts=0, parent_embedding_error=NULL
+WHERE tombstoned_at IS NULL
+  AND parent_embedding_json IS NULL
+  AND (thread_context IS NOT NULL OR upload_text IS NOT NULL);
+"""
 _MIGRATIONS = {
     1: _SCHEMA,
     2: _MIGRATION_V2,
@@ -564,6 +577,7 @@ _MIGRATIONS = {
     6: _MIGRATION_V6,
     7: _MIGRATION_V7,
     8: _MIGRATION_V8,
+    9: _MIGRATION_V9,
 }
 
 _MESSAGE_SEARCH_INDEX_SQL = """
@@ -1548,9 +1562,15 @@ class MessageStore:
         contextualized = self._process_pending_parent_embeddings(
             provider=provider,
             workspace_id=workspace_id,
-            limit=3,
+            limit=FILE_EMBEDDING_BACKFILL_LIMIT,
+        )
+        embedded_contents = self._process_pending_content_embeddings(
+            provider=provider,
+            workspace_id=workspace_id,
+            limit=FILE_EMBEDDING_BACKFILL_LIMIT,
         )
         pending = 0
+        pending_content_embeddings = 0
         pending_parent_embeddings = 0
         if access_token:
             processed = self._process_pending_file_contents(
@@ -1578,6 +1598,22 @@ class MessageStore:
                     ).fetchone()
                     is not None
                 )
+                pending_content_embeddings = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM file_contents WHERE project_id=? "
+                        "AND provider=? AND workspace_id=? "
+                        "AND processing_status='indexed' "
+                        "AND caption_ocr IS NOT NULL AND caption_ocr!='' "
+                        "AND text_content_embedding_json IS NULL "
+                        "AND processing_attempts<?",
+                        (
+                            self.project_id,
+                            provider,
+                            workspace_id,
+                            MAX_FILE_PROCESSING_ATTEMPTS,
+                        ),
+                    ).fetchone()[0]
+                )
                 pending_parent_embeddings = int(
                     conn.execute(
                         "SELECT COUNT(*) FROM file_shares WHERE project_id=? "
@@ -1597,6 +1633,7 @@ class MessageStore:
                 complete = (
                     scan_complete
                     and pending == 0
+                    and pending_content_embeddings == 0
                     and pending_parent_embeddings == 0
                 )
                 conn.execute(
@@ -1628,6 +1665,8 @@ class MessageStore:
                 "discovered_shares": discovered,
                 "indexed_contents": processed,
                 "pending_contents": pending,
+                "embedded_contents": embedded_contents,
+                "pending_content_embeddings": pending_content_embeddings,
                 "contextualized_shares": contextualized,
                 "pending_parent_embeddings": pending_parent_embeddings,
             }
@@ -1644,6 +1683,8 @@ class MessageStore:
             "discovered_shares": discovered,
             "indexed_contents": processed,
             "pending_contents": pending,
+            "embedded_contents": embedded_contents,
+            "pending_content_embeddings": pending_content_embeddings,
             "contextualized_shares": contextualized,
             "pending_parent_embeddings": pending_parent_embeddings,
         }
@@ -1816,6 +1857,97 @@ class MessageStore:
             ).rowcount
             conn.commit()
         return bool(updated and processing_status != "metadata_only")
+
+    def _process_pending_content_embeddings(
+        self,
+        *,
+        provider: str,
+        workspace_id: str,
+        limit: int,
+    ) -> int:
+        """Backfill embeddings from stored captions without re-downloading files."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT rowid AS content_rowid, file_name, mime_type, caption_ocr "
+                "FROM file_contents WHERE project_id=? AND provider=? "
+                "AND workspace_id=? AND processing_status='indexed' "
+                "AND caption_ocr IS NOT NULL AND caption_ocr!='' "
+                "AND text_content_embedding_json IS NULL "
+                "AND processing_attempts<? ORDER BY uploaded_at, file_id LIMIT ?",
+                (
+                    self.project_id,
+                    provider,
+                    workspace_id,
+                    MAX_FILE_PROCESSING_ATTEMPTS,
+                    max(1, min(limit, FILE_EMBEDDING_BACKFILL_LIMIT)),
+                ),
+            ).fetchall()
+        if not rows:
+            return 0
+        texts = [
+            " ".join(
+                value
+                for value in (
+                    str(row["file_name"] or "").strip(),
+                    str(row["caption_ocr"] or "").strip(),
+                )
+                if value
+            )
+            for row in rows
+        ]
+        try:
+            vectors, model = embed_texts(texts)
+        except FileProcessingError as exc:
+            now = datetime.now(timezone.utc).isoformat()
+            with self._writer_lock, self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                for row in rows:
+                    conn.execute(
+                        "UPDATE file_contents SET "
+                        "processing_attempts=processing_attempts+1, "
+                        "last_error_code=?, updated_at=? "
+                        "WHERE rowid=? AND text_content_embedding_json IS NULL",
+                        (exc.code, now, int(row["content_rowid"])),
+                    )
+                conn.commit()
+            return 0
+
+        now = datetime.now(timezone.utc).isoformat()
+        processed = 0
+        with self._writer_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for row, vector in zip(rows, vectors, strict=True):
+                encoded = json.dumps(vector, separators=(",", ":"))
+                is_image = str(row["mime_type"] or "").lower().startswith(
+                    "image/"
+                )
+                processed += conn.execute(
+                    "UPDATE file_contents SET text_content_embedding_json=?, "
+                    "text_embedding_model=?, text_embedding_dimension=?, "
+                    "image_embedding_json=CASE WHEN ? THEN ? "
+                    "ELSE image_embedding_json END, "
+                    "image_embedding_model=CASE WHEN ? THEN ? "
+                    "ELSE image_embedding_model END, "
+                    "image_embedding_dimension=CASE WHEN ? THEN ? "
+                    "ELSE image_embedding_dimension END, "
+                    "processing_attempts=0, last_error_code=NULL, updated_at=? "
+                    "WHERE rowid=? AND text_content_embedding_json IS NULL",
+                    (
+                        encoded,
+                        model,
+                        len(vector),
+                        is_image,
+                        encoded,
+                        is_image,
+                        f"caption-text:{model}",
+                        is_image,
+                        len(vector),
+                        now,
+                        int(row["content_rowid"]),
+                    ),
+                ).rowcount
+            conn.commit()
+        return processed
 
     def _process_pending_parent_embeddings(
         self,
@@ -4412,6 +4544,42 @@ class MessageStore:
             message_count = conn.execute(
                 "SELECT COUNT(*) FROM messages"
             ).fetchone()[0]
+            content_embeddings = conn.execute(
+                "SELECT COUNT(*) AS total, "
+                "SUM(CASE WHEN text_content_embedding_json IS NOT NULL "
+                "THEN 1 ELSE 0 END) AS embedded, "
+                "SUM(CASE WHEN processing_status='indexed' "
+                "AND caption_ocr IS NOT NULL AND caption_ocr!='' "
+                "AND text_content_embedding_json IS NULL "
+                "AND processing_attempts<? THEN 1 ELSE 0 END) AS pending, "
+                "SUM(CASE WHEN processing_status='indexed' "
+                "AND caption_ocr IS NOT NULL AND caption_ocr!='' "
+                "AND text_content_embedding_json IS NULL "
+                "AND processing_attempts>=? THEN 1 ELSE 0 END) AS failed "
+                "FROM file_contents WHERE processing_status!='deleted'",
+                (
+                    MAX_FILE_PROCESSING_ATTEMPTS,
+                    MAX_FILE_PROCESSING_ATTEMPTS,
+                ),
+            ).fetchone()
+            parent_embeddings = conn.execute(
+                "SELECT COUNT(*) AS total, "
+                "SUM(CASE WHEN parent_embedding_json IS NOT NULL "
+                "THEN 1 ELSE 0 END) AS embedded, "
+                "SUM(CASE WHEN parent_embedding_json IS NULL "
+                "AND parent_embedding_attempts<? "
+                "AND (thread_context IS NOT NULL OR upload_text IS NOT NULL) "
+                "THEN 1 ELSE 0 END) AS pending, "
+                "SUM(CASE WHEN parent_embedding_json IS NULL "
+                "AND parent_embedding_attempts>=? "
+                "AND (thread_context IS NOT NULL OR upload_text IS NOT NULL) "
+                "THEN 1 ELSE 0 END) AS failed "
+                "FROM file_shares WHERE tombstoned_at IS NULL",
+                (
+                    MAX_FILE_PROCESSING_ATTEMPTS,
+                    MAX_FILE_PROCESSING_ATTEMPTS,
+                ),
+            ).fetchone()
         lag_seconds = None
         if latest:
             try:
@@ -4440,6 +4608,16 @@ class MessageStore:
                 "graph": True,
             },
             "message_count": int(message_count),
+            "file_embedding_index": {
+                "contents_total": int(content_embeddings["total"] or 0),
+                "contents_embedded": int(content_embeddings["embedded"] or 0),
+                "contents_pending": int(content_embeddings["pending"] or 0),
+                "contents_failed": int(content_embeddings["failed"] or 0),
+                "parents_total": int(parent_embeddings["total"] or 0),
+                "parents_embedded": int(parent_embeddings["embedded"] or 0),
+                "parents_pending": int(parent_embeddings["pending"] or 0),
+                "parents_failed": int(parent_embeddings["failed"] or 0),
+            },
             "key_version": self.key_version,
             "storage_encryption": "sqlcipher",
             "database_key_version": self.database.active_key_version,

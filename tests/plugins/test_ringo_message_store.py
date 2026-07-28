@@ -271,7 +271,7 @@ def test_schema_v6_upgrades_existing_v5_file_rows(tmp_path, monkeypatch):
     assert reopened.store_generation != old_generation
 
 
-def test_schema_v8_backfills_existing_messages_into_search_index(
+def test_schema_upgrade_backfills_existing_messages_into_search_index(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -311,7 +311,10 @@ def test_schema_v8_backfills_existing_messages_into_search_index(
             ).fetchone()[0]
             == 1
         )
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert (
+            conn.execute("PRAGMA user_version").fetchone()[0]
+            == _message_store_schema_version(module)
+        )
 
 
 def test_retention_removes_expired_messages_reactions_and_deliveries(
@@ -1830,6 +1833,117 @@ def test_parent_context_embedding_is_reused_across_thread_attachments(
     assert {row["parent_embedding_model"] for row in rows} == {
         "embedding-test"
     }
+
+
+def test_existing_captions_are_backfilled_without_redownloading(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+    embedded = []
+
+    def fake_embed_texts(texts):
+        embedded.extend(texts)
+        return [[0.6, 0.8] for _text in texts], "embedding-test"
+
+    monkeypatch.setattr(store_module, "embed_texts", fake_embed_texts)
+    store.apply_file_command(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "operation": "upsert_share",
+            "file_id": "F1",
+            "conversation_id": "C1",
+            "provider_message_id": "M1",
+            "source_version": 1,
+            "processing_status": "indexed",
+            "file_name": "profile.png",
+            "mime_type": "image/png",
+            "caption_ocr": "white ghost profile candidate",
+        }
+    )
+
+    processed = store._process_pending_content_embeddings(
+        provider="slack",
+        workspace_id="T1",
+        limit=20,
+    )
+
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT text_content_embedding_json, image_embedding_json, "
+            "text_embedding_model, image_embedding_model, "
+            "text_embedding_dimension, image_embedding_dimension "
+            "FROM file_contents WHERE file_id='F1'"
+        ).fetchone()
+    assert processed == 1
+    assert embedded == ["profile.png white ghost profile candidate"]
+    assert json.loads(row["text_content_embedding_json"]) == [0.6, 0.8]
+    assert json.loads(row["image_embedding_json"]) == [0.6, 0.8]
+    assert row["text_embedding_model"] == "embedding-test"
+    assert row["image_embedding_model"] == "caption-text:embedding-test"
+    assert row["text_embedding_dimension"] == 2
+    assert row["image_embedding_dimension"] == 2
+
+
+def test_schema_nine_retries_exhausted_embedding_backfill(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store.apply_file_command(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "operation": "upsert_share",
+            "file_id": "F1",
+            "conversation_id": "C1",
+            "provider_message_id": "M1",
+            "source_version": 1,
+            "processing_status": "indexed",
+            "caption_ocr": "profile candidate",
+            "thread_context": "rebranding discussion",
+        }
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE file_contents SET processing_attempts=3, "
+            "last_error_code='embedding_failed' WHERE file_id='F1'"
+        )
+        conn.execute(
+            "UPDATE file_shares SET parent_embedding_attempts=3, "
+            "parent_embedding_error='embedding_failed' WHERE file_id='F1'"
+        )
+        conn.execute("PRAGMA user_version=8")
+        conn.commit()
+
+    migrated = module.MessageStore(project_id)
+
+    with migrated._connect() as conn:
+        content = conn.execute(
+            "SELECT processing_attempts, last_error_code "
+            "FROM file_contents WHERE file_id='F1'"
+        ).fetchone()
+        parent = conn.execute(
+            "SELECT parent_embedding_attempts, parent_embedding_error "
+            "FROM file_shares WHERE file_id='F1'"
+        ).fetchone()
+    assert content["processing_attempts"] == 0
+    assert content["last_error_code"] is None
+    assert parent["parent_embedding_attempts"] == 0
+    assert parent["parent_embedding_error"] is None
+    assert migrated.health()["schema_version"] == 9
 
 
 def test_direct_file_search_does_not_promote_unrequested_thread_context(
