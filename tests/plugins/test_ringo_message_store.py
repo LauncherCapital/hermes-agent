@@ -1615,6 +1615,96 @@ def test_file_search_uses_fixed_acl_retrieve_rerank_inspect_limits(
     assert "upload:" in result["files"][0]["why_matched"]
 
 
+def test_file_search_without_query_lists_recent_scoped_files(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+    monkeypatch.setattr(
+        store_module,
+        "embed_text",
+        lambda _text: pytest.fail("recent listing must not call embeddings"),
+    )
+    monkeypatch.setattr(
+        store_module,
+        "embed_texts",
+        lambda _texts: pytest.fail("recent listing must not call embeddings"),
+    )
+
+    for file_id, channel_id, shared_at in (
+        ("F-older", "C1", "2026-07-21T00:00:00+00:00"),
+        ("F-newer", "C1", "2026-07-23T00:00:00+00:00"),
+        ("F-hidden", "C2", "2026-07-24T00:00:00+00:00"),
+    ):
+        store.apply_file_command(
+            {
+                "project_id": project_id,
+                "store_generation": store.store_generation,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "operation": "upsert_share",
+                "file_id": file_id,
+                "conversation_id": channel_id,
+                "provider_message_id": f"M-{file_id}",
+                "source_version": 1,
+                "content_version": 1,
+                "context_version": 1,
+                "file_name": "image.png",
+                "mime_type": "image/png",
+                "processing_status": "indexed",
+                "caption_ocr": f"caption for {file_id}",
+                "shared_at": shared_at,
+            }
+        )
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO file_index_runs(provider, workspace_id, "
+            "store_generation, window_started_at, window_ended_at, "
+            "allowed_scope_revision, status, processing_signature, updated_at, "
+            "completed_at) VALUES (?, ?, ?, ?, ?, ?, 'complete', ?, ?, ?)",
+            (
+                "slack",
+                "T1",
+                store.store_generation,
+                "2026-06-25T00:00:00+00:00",
+                "2026-07-25T00:00:00+00:00",
+                "scope-1",
+                "content-v1",
+                "2026-07-25T00:00:00+00:00",
+                "2026-07-25T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+
+    result = store.search_file_index(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "query": "",
+            "context_query": "profile candidates",
+            "allowed_source_ids": ["slack:T1:C1"],
+            "allowed_scope_revision": "scope-1",
+            "limit": 20,
+        }
+    )
+
+    assert result["coverage_complete"] is True
+    assert [item["file_id"] for item in result["files"]] == [
+        "F-newer",
+        "F-older",
+    ]
+    assert all(
+        item["why_matched"] == "recent file in selected scope"
+        for item in result["files"]
+    )
+
+
 def test_file_search_keeps_high_semantic_candidate_without_token_overlap(
     tmp_path, monkeypatch
 ):
