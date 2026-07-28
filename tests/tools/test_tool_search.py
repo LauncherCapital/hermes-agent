@@ -460,6 +460,46 @@ class TestBridgeDispatch:
         assert err is not None
         assert "bridge tool" in err.lower()
 
+    def test_recover_deferred_direct_call_wraps_existing_arguments(
+        self, monkeypatch
+    ):
+        from tools import tool_search
+
+        monkeypatch.setattr(
+            tool_search, "is_deferrable_tool_name", lambda name: True
+        )
+        recovered = tool_search.recover_deferred_direct_call(
+            "mcp_ringo_ie_slack_search",
+            '{"query":"가격 인상"}',
+            bridge_available=True,
+        )
+
+        assert recovered is not None
+        name, raw_args = recovered
+        assert name == "tool_call"
+        assert json.loads(raw_args) == {
+            "name": "mcp_ringo_ie_slack_search",
+            "arguments": {"query": "가격 인상"},
+        }
+
+    def test_recover_deferred_direct_call_fails_closed(
+        self, monkeypatch
+    ):
+        from tools import tool_search
+
+        monkeypatch.setattr(
+            tool_search, "is_deferrable_tool_name", lambda name: True
+        )
+        assert tool_search.recover_deferred_direct_call(
+            "mcp_test_search", "{}", bridge_available=False
+        ) is None
+        assert tool_search.recover_deferred_direct_call(
+            "mcp_test_search", "[1,2]", bridge_available=True
+        ) is None
+        assert tool_search.recover_deferred_direct_call(
+            "mcp_test_search", "{broken", bridge_available=True
+        ) is None
+
 
 # ---------------------------------------------------------------------------
 # End-to-end via the real handle_function_call (smoke test).

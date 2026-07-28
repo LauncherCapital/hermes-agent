@@ -619,6 +619,47 @@ def is_bridge_tool(name: str) -> bool:
     return name in BRIDGE_TOOL_NAMES
 
 
+def recover_deferred_direct_call(
+    name: str,
+    raw_args: Any,
+    *,
+    bridge_available: bool,
+) -> Optional[Tuple[str, str]]:
+    """Wrap a historical direct call to a deferred tool in ``tool_call``.
+
+    A resumed session can contain direct MCP/plugin calls from a turn where
+    progressive disclosure was inactive. If a later turn activates tool
+    search, the model may reuse that exact tool name even though only the
+    bridge is visible. The bridge still enforces the current session's scoped
+    deferred catalog before dispatch.
+    """
+    if not bridge_available or not is_deferrable_tool_name(name):
+        return None
+    if raw_args is None or (
+        isinstance(raw_args, str) and not raw_args.strip()
+    ):
+        arguments: Any = {}
+    elif isinstance(raw_args, dict):
+        arguments = raw_args
+    elif isinstance(raw_args, str):
+        try:
+            arguments = json.loads(raw_args)
+        except json.JSONDecodeError:
+            return None
+    else:
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    return (
+        TOOL_CALL_NAME,
+        json.dumps(
+            {"name": name, "arguments": arguments},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+
+
 def _format_search_hit(entry: CatalogEntry) -> Dict[str, Any]:
     return {
         "name": entry.name,
@@ -755,6 +796,7 @@ __all__ = [
     "bridge_tool_schemas",
     "assemble_tool_defs",
     "is_bridge_tool",
+    "recover_deferred_direct_call",
     "dispatch_tool_search",
     "dispatch_tool_describe",
     "resolve_underlying_call",

@@ -3908,6 +3908,25 @@ def run_conversation(
                 # Repair mismatched tool names before validating
                 for tc in assistant_message.tool_calls:
                     if tc.function.name not in agent.valid_tool_names:
+                        from tools.tool_search import (
+                            TOOL_CALL_NAME,
+                            recover_deferred_direct_call,
+                        )
+
+                        recovered = recover_deferred_direct_call(
+                            tc.function.name,
+                            tc.function.arguments,
+                            bridge_available=TOOL_CALL_NAME
+                            in agent.valid_tool_names,
+                        )
+                        if recovered:
+                            original_name = tc.function.name
+                            tc.function.name, tc.function.arguments = recovered
+                            agent._buffer_vprint(
+                                "🔧 Routed deferred direct tool call "
+                                f"'{original_name}' through {TOOL_CALL_NAME}"
+                            )
+                            continue
                         repaired = agent._repair_tool_call(tc.function.name)
                         if repaired:
                             print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
