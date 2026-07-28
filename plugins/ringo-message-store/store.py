@@ -3277,15 +3277,25 @@ class MessageStore:
                 raise ValueError("provider message key is outside conversation scope")
 
         with self._writer_lock, self._connect() as conn:
+            coverage_complete = True
+            coverage_reason: str | None = None
+
+            def mark_incomplete(reason: str) -> None:
+                nonlocal coverage_complete, coverage_reason
+                coverage_complete = False
+                coverage_reason = coverage_reason or reason
+
             unresolved_gap = conn.execute(
                 "SELECT 1 FROM delivery_gaps WHERE repaired_at IS NULL LIMIT 1"
             ).fetchone()
             if unresolved_gap is not None:
-                return {
-                    "messages": [],
-                    "coverage_complete": False,
-                    "reason": "delivery_gap",
-                }
+                if operation != "search":
+                    return {
+                        "messages": [],
+                        "coverage_complete": False,
+                        "reason": "delivery_gap",
+                    }
+                mark_incomplete("delivery_gap")
             coverage_rows = []
             if operation != "fetch_snapshot":
                 coverage_sql = (
@@ -3311,36 +3321,44 @@ class MessageStore:
                     for row in coverage_rows
                 }
                 if allowed is not None and covered_sources != allowed:
-                    return {
-                        "messages": [],
-                        "coverage_complete": False,
-                        "reason": "coverage_missing",
-                    }
-                if allowed is None and conversations:
-                    covered_ids = {item[2] for item in covered_sources}
-                    if covered_ids != conversations:
+                    if operation != "search":
                         return {
                             "messages": [],
                             "coverage_complete": False,
                             "reason": "coverage_missing",
                         }
+                    mark_incomplete("coverage_missing")
+                if allowed is None and conversations:
+                    covered_ids = {item[2] for item in covered_sources}
+                    if covered_ids != conversations:
+                        if operation != "search":
+                            return {
+                                "messages": [],
+                                "coverage_complete": False,
+                                "reason": "coverage_missing",
+                            }
+                        mark_incomplete("coverage_missing")
                 if not coverage_rows:
-                    return {
-                        "messages": [],
-                        "coverage_complete": False,
-                        "reason": "coverage_missing",
-                    }
+                    if operation != "search":
+                        return {
+                            "messages": [],
+                            "coverage_complete": False,
+                            "reason": "coverage_missing",
+                        }
+                    mark_incomplete("coverage_missing")
                 if any(
                     row["state"] != "COLLECTING"
                     or not row["contiguous_since"]
                     or str(row["contiguous_since"]) > start
                     for row in coverage_rows
                 ):
-                    return {
-                        "messages": [],
-                        "coverage_complete": False,
-                        "reason": "coverage_incomplete",
-                    }
+                    if operation != "search":
+                        return {
+                            "messages": [],
+                            "coverage_complete": False,
+                            "reason": "coverage_incomplete",
+                        }
+                    mark_incomplete("coverage_incomplete")
 
             time_column = (
                 "m.updated_at" if operation == "ingest_window" else "m.occurred_at"
@@ -3429,23 +3447,34 @@ class MessageStore:
                     start=start,
                     end=end,
                 )
-                floor = max(str(row["contiguous_since"]) for row in coverage_rows)
-                return {
+                floors = [
+                    str(row["contiguous_since"])
+                    for row in coverage_rows
+                    if row["contiguous_since"]
+                ]
+                result = {
                     "hits": _rank_message_rows(
                         rows,
                         query=search_query,
                         limit=limit,
                     ),
-                    "coverage_complete": True,
-                    "covered_since": floor,
+                    "coverage_complete": coverage_complete,
                     "last_sequence": max(
-                        int(row["last_sequence"] or 0)
-                        for row in conn.execute(
-                            "SELECT last_sequence FROM coverage WHERE project_id=?",
-                            (self.project_id,),
-                        ).fetchall()
+                        (
+                            int(row["last_sequence"] or 0)
+                            for row in conn.execute(
+                                "SELECT last_sequence FROM coverage WHERE project_id=?",
+                                (self.project_id,),
+                            ).fetchall()
+                        ),
+                        default=0,
                     ),
                 }
+                if floors:
+                    result["covered_since"] = max(floors)
+                if coverage_reason:
+                    result["reason"] = coverage_reason
+                return result
             sql += " LIMIT ?"
             params.append(
                 limit * 10
