@@ -2951,13 +2951,17 @@ class MessageStore:
                 )
 
             group_scores: dict[tuple[str, str], float] = {}
-            item_scores: dict[int, float] = {}
+            item_scores: dict[tuple[int, int], float] = {}
             for lane, lane_weight in lanes:
                 seen_groups: set[tuple[str, str]] = set()
                 for rank, item in enumerate(lane, start=1):
                     score = lane_weight / (FILE_SEARCH_RRF_K + rank)
-                    item_scores[id(item)] = (
-                        item_scores.get(id(item), 0.0) + score
+                    item_key = (
+                        int(item["_content_rowid"]),
+                        int(item["_share_rowid"]),
+                    )
+                    item_scores[item_key] = (
+                        item_scores.get(item_key, 0.0) + score
                     )
                     group = (
                         str(item["channel_id"]),
@@ -2999,14 +3003,23 @@ class MessageStore:
                     latest_by_group.get(group, ""),
                     str(item.get("shared_at") or ""),
                 )
-            candidate_groups = sorted(
-                admitted_groups,
+            ranked_groups = sorted(
+                set(group_scores) | admitted_groups,
                 key=lambda group: (
                     group_scores.get(group, 0.0),
                     latest_by_group.get(group, ""),
                 ),
                 reverse=True,
-            )[:FILE_SEARCH_HOSTED_RERANK_CANDIDATE_LIMIT]
+            )
+            if self._file_search_reranker_model():
+                admitted_groups.update(
+                    ranked_groups[:FILE_SEARCH_HOSTED_RERANK_CANDIDATE_LIMIT]
+                )
+            elif not admitted_groups and ranked_groups:
+                admitted_groups.add(ranked_groups[0])
+            candidate_groups = [
+                group for group in ranked_groups if group in admitted_groups
+            ][:FILE_SEARCH_HOSTED_RERANK_CANDIDATE_LIMIT]
             (
                 selected_groups,
                 hosted_group_scores,
@@ -3086,7 +3099,13 @@ class MessageStore:
                         group_scores.get(group, 0.0),
                     )
                     * 100.0
-                    + item_scores.get(id(item), 0.0)
+                    + item_scores.get(
+                        (
+                            int(item["_content_rowid"]),
+                            int(item["_share_rowid"]),
+                        ),
+                        0.0,
+                    )
                 )
             reranked.sort(
                 key=lambda item: (
@@ -3096,8 +3115,8 @@ class MessageStore:
                             str(item["thread_root_id"]),
                         )
                     ],
-                    str(item.get("shared_at") or ""),
                     item["rerank_score"],
+                    str(item.get("shared_at") or ""),
                 ),
                 reverse=True,
             )

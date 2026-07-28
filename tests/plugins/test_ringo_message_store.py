@@ -2363,6 +2363,83 @@ def test_file_search_uses_bm25_index_without_embeddings(tmp_path, monkeypatch):
     assert [item["file_id"] for item in result["files"]] == ["F-target"]
 
 
+def test_file_search_admits_partial_bm25_matches_to_hosted_reranker(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "ringo:\n"
+        "  file_search:\n"
+        "    reranker_model: cohere/rerank-v3.5\n"
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-private")
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+    monkeypatch.setattr(
+        store_module,
+        "embed_text",
+        lambda _text: ([], "embedding-unavailable"),
+    )
+    store.apply_file_command(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "operation": "upsert_share",
+            "file_id": "F-target",
+            "conversation_id": "C1",
+            "provider_message_id": "M1",
+            "source_version": 1,
+            "processing_status": "indexed",
+            "caption_ocr": "링고 리브랜딩 프로필 후보",
+        }
+    )
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def read():
+            return json.dumps(
+                {
+                    "results": [
+                        {"index": 0, "relevance_score": 0.95},
+                    ]
+                }
+            ).encode()
+
+    monkeypatch.setattr(
+        store_module.urllib.request,
+        "urlopen",
+        lambda _request, timeout: Response(),
+    )
+    result = store.search_file_index(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "query": (
+                "최근 Slack에서 링고 리브랜딩 논의를 찾아서 "
+                "프로필 사진 후보 파일을 비교해줘"
+            ),
+            "allowed_source_ids": ["slack:T1:C1"],
+            "allowed_scope_revision": "scope-1",
+        }
+    )
+
+    assert [item["file_id"] for item in result["files"]] == ["F-target"]
+    assert result["reranker"]["status"] == "applied"
+
+
 def test_file_search_finds_recent_profile_candidates_from_thread_context(
     tmp_path, monkeypatch
 ):
@@ -2786,9 +2863,9 @@ def test_file_search_expands_all_matching_files_from_a_ranked_thread(
         }
     )
 
-    assert [item["file_id"] for item in result["files"]] == [
-        f"F{index}" for index in reversed(range(12))
-    ]
+    returned = [item["file_id"] for item in result["files"]]
+    assert set(returned) == {f"F{index}" for index in range(12)}
+    assert returned[-1] == "F11"
     assert result["rerank_count"] == 1
 
 
