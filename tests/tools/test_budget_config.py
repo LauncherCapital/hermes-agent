@@ -12,12 +12,16 @@ from unittest.mock import patch
 import pytest
 
 from tools.budget_config import (
+    CANARY_CONTEXT_BUDGET_CHARS,
     DEFAULT_BUDGET,
+    DEFAULT_CONTEXT_BUDGET_CHARS,
     DEFAULT_PREVIEW_SIZE_CHARS,
     DEFAULT_RESULT_SIZE_CHARS,
     DEFAULT_TURN_BUDGET_CHARS,
+    CONTEXT_BUDGET_ENV_VAR,
     PINNED_THRESHOLDS,
     BudgetConfig,
+    load_runtime_budget_config,
 )
 
 
@@ -34,6 +38,10 @@ class TestModuleConstants:
 
     def test_default_turn_budget(self):
         assert DEFAULT_TURN_BUDGET_CHARS == 200_000
+
+    def test_context_budget_is_disabled_by_default(self):
+        assert math.isinf(DEFAULT_CONTEXT_BUDGET_CHARS)
+        assert CANARY_CONTEXT_BUDGET_CHARS == 40_000
 
     def test_default_preview_size(self):
         assert DEFAULT_PREVIEW_SIZE_CHARS == 1_500
@@ -65,6 +73,9 @@ class TestBudgetConfigDefaults:
     def test_default_turn_budget(self):
         cfg = BudgetConfig()
         assert cfg.turn_budget == DEFAULT_TURN_BUDGET_CHARS
+
+    def test_default_context_budget_is_disabled(self):
+        assert math.isinf(BudgetConfig().context_budget)
 
     def test_default_preview_size(self):
         cfg = BudgetConfig()
@@ -127,6 +138,43 @@ class TestBudgetConfigCustom:
         assert cfg.turn_budget == 100_000
         assert cfg.preview_size == 500
         assert cfg.tool_overrides == {"my_tool": 42}
+
+
+class TestRuntimeContextBudget:
+    def test_absent_config_and_env_preserve_existing_behavior(self, monkeypatch):
+        monkeypatch.delenv(CONTEXT_BUDGET_ENV_VAR, raising=False)
+
+        cfg = load_runtime_budget_config({})
+
+        assert math.isinf(cfg.context_budget)
+
+    def test_tool_output_config_explicitly_opts_in(self, monkeypatch):
+        monkeypatch.delenv(CONTEXT_BUDGET_ENV_VAR, raising=False)
+
+        cfg = load_runtime_budget_config(
+            {"tool_output": {"context_budget_chars": 40_000}}
+        )
+
+        assert cfg.context_budget == CANARY_CONTEXT_BUDGET_CHARS
+
+    def test_tenant_env_explicitly_opts_in_and_overrides_config(self, monkeypatch):
+        monkeypatch.setenv(CONTEXT_BUDGET_ENV_VAR, "40000")
+
+        cfg = load_runtime_budget_config(
+            {"tool_output": {"context_budget_chars": 80_000}}
+        )
+
+        assert cfg.context_budget == CANARY_CONTEXT_BUDGET_CHARS
+
+    @pytest.mark.parametrize("value", ["", "0", "-1", "invalid"])
+    def test_invalid_explicit_value_fails_open_to_disabled(self, monkeypatch, value):
+        monkeypatch.setenv(CONTEXT_BUDGET_ENV_VAR, value)
+
+        cfg = load_runtime_budget_config(
+            {"tool_output": {"context_budget_chars": 40_000}}
+        )
+
+        assert math.isinf(cfg.context_budget)
 
 
 # ---------------------------------------------------------------------------

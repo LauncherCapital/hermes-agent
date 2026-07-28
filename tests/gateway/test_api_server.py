@@ -540,19 +540,26 @@ class TestHealthDetailedEndpoint:
     async def test_health_detailed_returns_ok(self, adapter):
         """GET /health/detailed returns status, platform, and runtime fields."""
         app = _create_app(adapter)
-        with patch("gateway.status.read_runtime_status", return_value={
-            "gateway_state": "running",
-            "platforms": {"telegram": {"state": "connected"}},
-            "active_agents": 2,
-            "exit_reason": None,
-            "updated_at": "2026-04-14T00:00:00Z",
-        }):
+        with (
+            patch("gateway.status.read_runtime_status", return_value={
+                "gateway_state": "running",
+                "platforms": {"telegram": {"state": "connected"}},
+                "active_agents": 2,
+                "exit_reason": None,
+                "updated_at": "2026-04-14T00:00:00Z",
+            }),
+            patch.dict(
+                os.environ,
+                {"HERMES_TOOL_RESULT_CONTEXT_BUDGET_CHARS": "40000"},
+            ),
+        ):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["status"] == "ok"
                 assert data["platform"] == "hermes-agent"
+                assert data["tool_result_context_budget_chars"] == 40000
                 assert data["gateway_state"] == "running"
                 assert data["platforms"] == {"telegram": {"state": "connected"}}
                 assert data["active_agents"] == 2
@@ -921,6 +928,11 @@ class TestChatCompletionsEndpoint:
             "final_response": "Hello! How can I help you today?",
             "messages": [],
             "api_calls": 1,
+            "tool_result_context": {
+                "budget_chars": 40000,
+                "raw_chars": 90000,
+                "inline_chars": 30000,
+            },
         }
 
         app = _create_app(adapter)
@@ -944,6 +956,11 @@ class TestChatCompletionsEndpoint:
             data = await resp.json()
             assert data["object"] == "chat.completion"
             assert data["choices"][0]["message"]["content"] == mock_result["final_response"]
+            assert data["hermes_metrics"]["tool_result_context"] == {
+                "budget_chars": 40000,
+                "raw_chars": 90000,
+                "inline_chars": 30000,
+            }
 
     @pytest.mark.asyncio
     async def test_stream_task_done_callback_enqueues_eos_for_chat_completions(self, adapter):

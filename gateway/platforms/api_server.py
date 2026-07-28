@@ -1333,9 +1333,16 @@ class APIServerAdapter(BasePlatformAdapter):
             ]
         except Exception:
             logger.debug("plugin health collection failed", exc_info=True)
+        from tools.budget_config import load_runtime_budget_config
+
+        context_budget = load_runtime_budget_config().context_budget
+        effective_context_budget = (
+            0 if context_budget == float("inf") else int(context_budget)
+        )
         return web.json_response({
             "status": "ok",
             "platform": "hermes-agent",
+            "tool_result_context_budget_chars": effective_context_budget,
             "gateway_state": runtime.get("gateway_state"),
             "platforms": runtime.get("platforms", {}),
             "active_agents": runtime.get("active_agents", 0),
@@ -3306,6 +3313,11 @@ class APIServerAdapter(BasePlatformAdapter):
         _dropped_tools = result.get("dropped_tools")
         if _dropped_tools:
             response_data["dropped_tools"] = _dropped_tools
+        tool_result_context = result.get("tool_result_context")
+        if isinstance(tool_result_context, dict):
+            response_data["hermes_metrics"] = {
+                "tool_result_context": tool_result_context,
+            }
         turn_messages = self._turn_transcript_messages(
             history,
             user_message,

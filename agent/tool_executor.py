@@ -42,7 +42,7 @@ from tools.terminal_tool import (
 )
 from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
-    maybe_persist_tool_result,
+    ToolResultContextBudget,
     enforce_turn_budget,
 )
 
@@ -51,6 +51,26 @@ logger = logging.getLogger(__name__)
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
+
+
+def _prepare_tool_result(
+    agent,
+    *,
+    content: str,
+    tool_name: str,
+    tool_use_id: str,
+    env,
+) -> str:
+    budget = getattr(agent, "_tool_result_context_budget", None)
+    if budget is None:
+        budget = ToolResultContextBudget()
+        agent._tool_result_context_budget = budget
+    return budget.prepare(
+        content=content,
+        tool_name=tool_name,
+        tool_use_id=tool_use_id,
+        env=env,
+    )
 
 
 def _redact_persisted_tool_arguments(
@@ -687,7 +707,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool complete callback error: {cb_err}")
 
-        function_result = maybe_persist_tool_result(
+        function_result = _prepare_tool_result(
+            agent,
             content=function_result,
             tool_name=name,
             tool_use_id=tc.id,
@@ -1245,7 +1266,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool complete callback error: {cb_err}")
 
-        function_result = maybe_persist_tool_result(
+        function_result = _prepare_tool_result(
+            agent,
             content=function_result,
             tool_name=function_name,
             tool_use_id=tool_call.id,
