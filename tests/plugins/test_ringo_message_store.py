@@ -1968,6 +1968,34 @@ def test_file_search_finds_recent_profile_candidates_from_thread_context(
                 "shared_at": shared_at,
             }
         )
+    for index in range(12):
+        store.apply_file_command(
+            {
+                "project_id": project_id,
+                "store_generation": store.store_generation,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "operation": "upsert_share",
+                "file_id": f"F-older-exact-{index}",
+                "conversation_id": "C1",
+                "provider_message_id": f"M-older-exact-{index}",
+                "source_version": 100 + index,
+                "content_version": 100 + index,
+                "context_version": 100 + index,
+                "file_name": f"ringo-profile-candidate-{index}.png",
+                "mime_type": "image/png",
+                "processing_status": "indexed",
+                "caption_ocr": "링고 프로필 아이콘 후보",
+                "text_content_embedding": [1.0, 0.0],
+                "image_embedding": [1.0, 0.0],
+                "upload_text": "링고 프로필 아이콘 후보",
+                "thread_context": "older exact-match onboarding discussion",
+                "parent_embedding": [0.2, 0.979796],
+                "parent_embedding_model": "embedding-test",
+                "parent_embedding_dimension": 2,
+                "shared_at": f"2026-07-10T00:00:{index:02d}+00:00",
+            }
+        )
 
     result = store.search_file_index(
         {
