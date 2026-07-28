@@ -1884,6 +1884,85 @@ def test_direct_file_search_does_not_promote_unrequested_thread_context(
     assert [item["file_id"] for item in result["files"]] == ["F-direct"]
 
 
+def test_context_file_search_uses_lexical_thread_fallback_without_embeddings(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+
+    def fail_embeddings(_texts):
+        raise store_module.FileProcessingError("embedding_failed")
+
+    monkeypatch.setattr(store_module, "embed_texts", fail_embeddings)
+    for index in range(3):
+        store.apply_file_command(
+            {
+                "project_id": project_id,
+                "store_generation": store.store_generation,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "operation": "upsert_share",
+                "file_id": f"F-target-{index}",
+                "conversation_id": "C1",
+                "provider_message_id": f"M-target-{index}",
+                "source_version": index + 1,
+                "processing_status": "indexed",
+                "file_name": "image.png",
+                "mime_type": "image/png",
+                "upload_text": "새 시안입니다",
+                "thread_context": (
+                    "링고방 앱 아이콘 후보입니다. "
+                    "귀엽고 기술적인 느낌이 아니면 좋겠습니다."
+                ),
+                "shared_at": f"2026-07-23T00:00:0{index}+00:00",
+            }
+        )
+    store.apply_file_command(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "operation": "upsert_share",
+            "file_id": "F-unrelated",
+            "conversation_id": "C1",
+            "provider_message_id": "M-unrelated",
+            "source_version": 10,
+            "processing_status": "indexed",
+            "file_name": "image.png",
+            "mime_type": "image/png",
+            "upload_text": "참고 자료",
+            "thread_context": "직원 온보딩 체크리스트",
+            "shared_at": "2026-07-24T00:00:00+00:00",
+        }
+    )
+
+    result = store.search_file_index(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "query": "링고 리브랜딩 프로필 사진 후보",
+            "context_query": "링고 리브랜딩 프로필 사진 후보",
+            "allowed_source_ids": ["slack:T1:C1"],
+            "allowed_scope_revision": "scope-1",
+            "limit": 20,
+        }
+    )
+
+    assert {item["file_id"] for item in result["files"]} == {
+        "F-target-0",
+        "F-target-1",
+        "F-target-2",
+    }
+    assert all("thread:" in item["why_matched"] for item in result["files"])
+
+
 def test_file_search_finds_recent_profile_candidates_from_thread_context(
     tmp_path, monkeypatch
 ):
