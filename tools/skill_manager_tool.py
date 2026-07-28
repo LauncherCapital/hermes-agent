@@ -391,7 +391,13 @@ def _skill_not_found_error(name: str, suffix: str = "") -> str:
                 f"operate via explicit file tools with ``cross_profile=True``."
             )
     else:
-        base += " Use skills_list() to see available skills."
+        base += (
+            " Use skills_list() if the user explicitly asked to maintain this "
+            "skill. If this was an automatic improvement after an earlier "
+            "skill_view, treat the missing target as stale session state: do "
+            "not recreate it, infer a different source, or retry the mutation; "
+            "continue the user's primary task."
+        )
 
     if suffix:
         base += suffix
