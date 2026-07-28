@@ -2208,6 +2208,10 @@ class APIServerAdapter(BasePlatformAdapter):
           toolsets:    [names] → platform_toolsets.api_server (next turn)
           tools:       {"tool_search": {"enabled": "off"|"auto"|"on"}} →
                        project-scoped progressive-disclosure rollout (next turn)
+          ringo:       {"file_search": {"reranker_model": str | null,
+                       "embedding_profile": object | null}} → tenant-local
+                       retrieval settings; embedding changes rotate the local
+                       file-index generation before re-embedding
           web:         shallow-merged into config.yaml web.* (read per call)
           env:         {KEY: value | null} → ~/.hermes/.env + in-process
                        reload_env(); null blanks the value (deletion only
@@ -2231,6 +2235,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "mcp_servers",
             "toolsets",
             "tools",
+            "ringo",
             "web",
             "env",
             "project",
@@ -2430,6 +2435,66 @@ class APIServerAdapter(BasePlatformAdapter):
                     config["tools"] = tools_cfg
                     config_dirty = True
                 applied["tool_search"] = enabled
+
+            ringo_spec = body.get("ringo")
+            if ringo_spec is not None:
+                if not isinstance(ringo_spec, dict) or set(ringo_spec) - {
+                    "file_search"
+                }:
+                    return web.json_response(
+                        _openai_error("ringo must only contain file_search"),
+                        status=400,
+                    )
+                file_search_spec = ringo_spec.get("file_search")
+                if (
+                    not isinstance(file_search_spec, dict)
+                    or set(file_search_spec)
+                    - {"reranker_model", "embedding_profile"}
+                    or not file_search_spec
+                ):
+                    return web.json_response(
+                        _openai_error(
+                            "ringo.file_search must only contain reranker_model "
+                            "and/or embedding_profile"
+                        ),
+                        status=400,
+                    )
+                from hermes_cli.config import (
+                    normalize_ringo_file_search_embedding_profile,
+                    normalize_ringo_file_search_reranker_model,
+                )
+
+                ringo_cfg = config.get("ringo")
+                if not isinstance(ringo_cfg, dict):
+                    ringo_cfg = {}
+                file_search_cfg = ringo_cfg.get("file_search")
+                if not isinstance(file_search_cfg, dict):
+                    file_search_cfg = {}
+                if "reranker_model" in file_search_spec:
+                    reranker_model = normalize_ringo_file_search_reranker_model(
+                        file_search_spec.get("reranker_model")
+                    )
+                    if file_search_cfg.get("reranker_model") != reranker_model:
+                        file_search_cfg["reranker_model"] = reranker_model
+                        config_dirty = True
+                    applied["file_search_reranker_model"] = (
+                        reranker_model or None
+                    )
+                if "embedding_profile" in file_search_spec:
+                    embedding_profile = (
+                        normalize_ringo_file_search_embedding_profile(
+                            file_search_spec.get("embedding_profile")
+                        )
+                    )
+                    if (
+                        file_search_cfg.get("embedding_profile")
+                        != embedding_profile
+                    ):
+                        file_search_cfg["embedding_profile"] = embedding_profile
+                        config_dirty = True
+                    applied["file_search_embedding_profile"] = embedding_profile
+                ringo_cfg["file_search"] = file_search_cfg
+                config["ringo"] = ringo_cfg
 
             web_spec = body.get("web")
             if isinstance(web_spec, dict) and web_spec:
