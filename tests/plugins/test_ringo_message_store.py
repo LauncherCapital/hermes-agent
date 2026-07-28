@@ -232,6 +232,7 @@ def test_schema_v6_upgrades_existing_v5_file_rows(tmp_path, monkeypatch):
     write_project_marker(project_id)
     _manager, module = _load_service()
     store = module.MessageStore(project_id)
+    old_generation = store.store_generation
     store.apply_file_command(
         {
             "project_id": project_id,
@@ -257,11 +258,16 @@ def test_schema_v6_upgrades_existing_v5_file_rows(tmp_path, monkeypatch):
         content = conn.execute(
             "SELECT file_id, processing_attempts FROM file_contents"
         ).fetchone()
+        share_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(file_shares)")
+        }
         assert (
             conn.execute("PRAGMA user_version").fetchone()[0]
             == _message_store_schema_version(module)
         )
     assert tuple(content) == ("F1", 0)
+    assert "parent_embedding_json" in share_columns
+    assert reopened.store_generation != old_generation
 
 
 def test_retention_removes_expired_messages_reactions_and_deliveries(
@@ -1615,6 +1621,313 @@ def test_file_search_keeps_high_semantic_candidate_without_token_overlap(
     )
 
     assert [item["file_id"] for item in result["files"]] == ["F1"]
+
+
+def test_parent_context_embedding_is_reused_across_thread_attachments(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+    embedded = []
+
+    def fake_embed(text):
+        embedded.append(text)
+        return [0.6, 0.8], "embedding-test"
+
+    monkeypatch.setattr(store_module, "embed_text", fake_embed)
+    for index in range(2):
+        store.apply_file_command(
+            {
+                "project_id": project_id,
+                "store_generation": store.store_generation,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "operation": "upsert_share",
+                "file_id": f"F{index}",
+                "conversation_id": "C1",
+                "provider_message_id": f"M{index}",
+                "source_version": index + 1,
+                "processing_status": "indexed",
+                "thread_context": "shared design discussion",
+                "upload_text": f"option {index}",
+            }
+        )
+
+    processed = store._process_pending_parent_embeddings(
+        provider="slack",
+        workspace_id="T1",
+        limit=3,
+    )
+
+    with store._connect() as conn:
+        rows = conn.execute(
+            "SELECT parent_embedding_json, parent_embedding_model "
+            "FROM file_shares ORDER BY file_id"
+        ).fetchall()
+    assert processed == 2
+    assert embedded == ["shared design discussion"]
+    assert [json.loads(row["parent_embedding_json"]) for row in rows] == [
+        [0.6, 0.8],
+        [0.6, 0.8],
+    ]
+    assert {row["parent_embedding_model"] for row in rows} == {
+        "embedding-test"
+    }
+
+
+def test_direct_file_search_does_not_promote_unrequested_thread_context(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+    monkeypatch.setattr(
+        store_module,
+        "embed_text",
+        lambda _text: ([1.0, 0.0], "embedding-test"),
+    )
+    for file_id, child_embedding, parent_embedding in (
+        ("F-direct", [0.9, 0.43589], [0.1, 0.994987]),
+        ("F-context", [0.1, 0.994987], [0.8, 0.6]),
+    ):
+        store.apply_file_command(
+            {
+                "project_id": project_id,
+                "store_generation": store.store_generation,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "operation": "upsert_share",
+                "file_id": file_id,
+                "conversation_id": "C1",
+                "provider_message_id": file_id,
+                "source_version": 1,
+                "processing_status": "indexed",
+                "caption_ocr": file_id,
+                "text_content_embedding": child_embedding,
+                "parent_embedding": parent_embedding,
+                "shared_at": "2026-07-28T00:00:00+00:00",
+            }
+        )
+
+    result = store.search_file_index(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "query": "exact attachment content",
+            "allowed_source_ids": ["slack:T1:C1"],
+            "allowed_scope_revision": "scope-1",
+        }
+    )
+
+    assert [item["file_id"] for item in result["files"]] == ["F-direct"]
+
+
+def test_file_search_finds_recent_profile_candidates_from_thread_context(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    store_module = sys.modules[module.MessageStore.__module__]
+    monkeypatch.setattr(
+        store_module,
+        "embed_text",
+        lambda _text: ([1.0, 0.0], "embedding-test"),
+    )
+    monkeypatch.setattr(
+        store_module,
+        "embed_texts",
+        lambda texts: ([[1.0, 0.0] for _text in texts], "embedding-test"),
+    )
+    thread_context = (
+        "링고방\n"
+        "앱 아이콘 후보입니다\n"
+        "귀엽던지, 문학적이던지, 기술적인 느낌이 아니면 좋겠다"
+    )
+    target_ids = {
+        "F0BKBRY7HV2",
+        "F0BKBS29JAY",
+        "F0BK89G6USE",
+        "F0BK69PV6EA",
+        "F0BJT4LMWFR",
+        "F0BK8FFEM42",
+    }
+    fixtures = [
+        (
+            "F0BKBRY7HV2",
+            "image.png",
+            "image/png",
+            "Logo and app icon exploration board with green apple variations.",
+            [0.18, 0.983666],
+            thread_context,
+            "2026-07-23T05:22:37+00:00",
+        ),
+        (
+            "F0BKBS29JAY",
+            "image.png",
+            "image/png",
+            "Monochrome mascot reference with radial light.",
+            [0.18, 0.983666],
+            thread_context,
+            "2026-07-23T05:23:27+00:00",
+        ),
+        (
+            "F0BK89G6USE",
+            "image.png",
+            "image/png",
+            "Simple green apple app icon.",
+            [0.18, 0.983666],
+            thread_context,
+            "2026-07-23T05:49:20+00:00",
+        ),
+        (
+            "F0BK69PV6EA",
+            "image.png",
+            "image/png",
+            "Green apple app icon on a blue rounded-square background.",
+            [0.18, 0.983666],
+            thread_context,
+            "2026-07-23T05:49:40+00:00",
+        ),
+        (
+            "F0BJT4LMWFR",
+            "image.png",
+            "image/png",
+            "White ghost mascot logo on a purple software page.",
+            [0.18, 0.983666],
+            thread_context,
+            "2026-07-23T06:25:01+00:00",
+        ),
+        (
+            "F0BK8FFEM42",
+            "image.png",
+            "image/png",
+            "Small white cartoon ghost app icon.",
+            [0.18, 0.983666],
+            thread_context,
+            "2026-07-23T06:25:14+00:00",
+        ),
+        (
+            "FNEWS",
+            "image.png",
+            "image/png",
+            "Newsletter screenshot with paragraphs and a chart.",
+            [0.10, 0.994987],
+            thread_context,
+            "2026-07-23T06:30:00+00:00",
+        ),
+        (
+            "F0BJMR92ENA",
+            "HANDOFF_AUTO_PIPELINE.md",
+            "text/plain",
+            "AI agent pipeline handoff and implementation instructions.",
+            [0.82, 0.572364],
+            "캐릭터 카드 자동화 작업",
+            "2026-07-21T08:01:35+00:00",
+        ),
+        (
+            "F0BDLGY9X39",
+            "image.png",
+            "image/png",
+            "Korean explanatory document with headings and bullet lists.",
+            [0.81, 0.58643],
+            "제품 개발 문서",
+            "2026-06-30T03:31:32+00:00",
+        ),
+    ]
+    inspections = {
+        file_id: caption
+        for file_id, _name, mimetype, caption, _embedding, _context, _shared_at
+        in fixtures
+        if mimetype == "image/png" and file_id != "F0BDLGY9X39"
+    }
+    monkeypatch.setattr(
+        store_module,
+        "inspect_slack_image",
+        lambda file_id, _token, _query: inspections.get(
+            file_id, "Unrelated workplace document."
+        ),
+    )
+    for index, (
+        file_id,
+        name,
+        mimetype,
+        caption,
+        embedding,
+        context,
+        shared_at,
+    ) in enumerate(fixtures):
+        store.apply_file_command(
+            {
+                "project_id": project_id,
+                "store_generation": store.store_generation,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "operation": "upsert_share",
+                "file_id": file_id,
+                "conversation_id": "C1",
+                "provider_message_id": f"M-{index}",
+                "source_version": index + 1,
+                "content_version": index + 1,
+                "context_version": index + 1,
+                "file_name": name,
+                "mime_type": mimetype,
+                "processing_status": "indexed",
+                "caption_ocr": caption,
+                "text_content_embedding": embedding,
+                "image_embedding": embedding,
+                "upload_text": (
+                    "새 시안입니다"
+                    if file_id in target_ids
+                    else "참고 자료"
+                ),
+                "thread_context": context,
+                "parent_embedding": (
+                    [0.363, 0.93179]
+                    if context == thread_context
+                    else [0.165, 0.98629]
+                    if file_id == "F0BJMR92ENA"
+                    else [0.131, 0.99138]
+                ),
+                "parent_embedding_model": "embedding-test",
+                "parent_embedding_dimension": 2,
+                "shared_at": shared_at,
+            }
+        )
+
+    result = store.search_file_index(
+        {
+            "project_id": project_id,
+            "store_generation": store.store_generation,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "query": "링고 프로필 아이콘 후보",
+            "context_query": "링고 리브랜딩 프로필 사진 논의",
+            "allowed_source_ids": ["slack:T1:C1"],
+            "allowed_scope_revision": "scope-1",
+            "limit": 20,
+            "provider_access_token": "xoxb-transient",
+        }
+    )
+
+    returned = {item["file_id"] for item in result["files"]}
+    assert target_ids <= returned
+    assert all(
+        item["description"]
+        for item in result["files"]
+        if item["file_id"] in target_ids
+    )
 
 
 def test_file_graph_batch_has_independent_ack_cursor_and_no_vectors(
