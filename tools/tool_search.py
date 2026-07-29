@@ -71,6 +71,7 @@ class ToolSearchConfig:
     threshold_tokens: int  # absolute schema-token budget used in "auto"
     search_default_limit: int
     max_search_limit: int
+    always_visible: frozenset[str] = frozenset()
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
@@ -115,6 +116,12 @@ class ToolSearchConfig:
         max_search_limit = max(1, min(50, _safe_int(raw.get("max_search_limit"), 20)))
         search_default_limit = max(1, min(max_search_limit,
                                           _safe_int(raw.get("search_default_limit"), 5)))
+        raw_always_visible = raw.get("always_visible")
+        always_visible = frozenset(
+            str(name).strip()
+            for name in raw_always_visible
+            if isinstance(name, str) and name.strip()
+        ) if isinstance(raw_always_visible, list) else frozenset()
 
         return cls(
             enabled=enabled,
@@ -122,6 +129,7 @@ class ToolSearchConfig:
             threshold_tokens=threshold_tokens,
             search_default_limit=search_default_limit,
             max_search_limit=max_search_limit,
+            always_visible=always_visible,
         )
 
 
@@ -197,13 +205,18 @@ def is_deferrable_tool_name(name: str) -> bool:
         return False
 
 
-def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def classify_tools(
+    tool_defs: List[Dict[str, Any]],
+    *,
+    always_visible: Iterable[str] = (),
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Split a tool-defs list into (visible, deferrable).
 
     ``visible`` retains every tool that must stay in the model-facing array:
     every core tool, plus any tool we can't classify. ``deferrable`` is the
     candidate set for catalog entry.
     """
+    pinned = frozenset(always_visible)
     visible: List[Dict[str, Any]] = []
     deferrable: List[Dict[str, Any]] = []
     for td in tool_defs:
@@ -212,6 +225,9 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
         if name in BRIDGE_TOOL_NAMES:
             # Should never happen — bridge tools are added after classification —
             # but be defensive.
+            continue
+        if name in pinned:
+            visible.append(td)
             continue
         if is_deferrable_tool_name(name):
             deferrable.append(td)
@@ -635,7 +651,10 @@ def assemble_tool_defs(
     incoming = [td for td in tool_defs
                 if (td.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES]
 
-    visible, deferrable = classify_tools(incoming)
+    visible, deferrable = classify_tools(
+        incoming,
+        always_visible=config.always_visible,
+    )
     if not deferrable:
         return AssemblyResult(tool_defs=incoming, activated=False)
 

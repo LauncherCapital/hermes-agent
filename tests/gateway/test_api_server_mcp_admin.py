@@ -243,11 +243,26 @@ class TestAdminConfig:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post(
                 "/admin/config",
-                json={"tools": {"tool_search": {"enabled": "auto"}}},
+                json={
+                    "tools": {
+                        "tool_search": {
+                            "enabled": "auto",
+                            "always_visible": ["mcp_ringo_ie_send_message"],
+                        }
+                    },
+                    "agent": {"host_managed_prompt": True},
+                },
             )
             assert resp.status == 200
-            assert (await resp.json())["applied"]["tool_search"] == "auto"
-            assert load_config()["tools"]["tool_search"]["enabled"] == "auto"
+            applied = (await resp.json())["applied"]
+            assert applied["tool_search"] == "auto"
+            assert applied["host_managed_prompt"] is True
+            config = load_config()
+            assert config["tools"]["tool_search"]["enabled"] == "auto"
+            assert config["tools"]["tool_search"]["always_visible"] == [
+                "mcp_ringo_ie_send_message"
+            ]
+            assert config["agent"]["host_managed_prompt"] is True
 
             resp = await cli.post(
                 "/admin/config",

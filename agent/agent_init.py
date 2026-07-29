@@ -1203,6 +1203,12 @@ def init_agent(
     if not isinstance(_agent_section, dict):
         _agent_section = {}
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
+    # A host-managed prompt owns identity, routing, safety, and output policy.
+    # Hermes still contributes SOUL/context files and the skill index, but
+    # omits its generic behavioral layers to avoid conflicts and token waste.
+    agent._host_managed_prompt = bool(
+        _agent_section.get("host_managed_prompt", False)
+    )
 
     # Universal task-completion guidance toggle.  Default True.  Surfaced
     # as a separate flag from tool_use_enforcement because the guidance

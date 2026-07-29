@@ -2110,6 +2110,10 @@ DEFAULT_CONFIG = {
             "search_default_limit": 5,
             # Hard upper bound the model can request via ``limit``. Range 1..50.
             "max_search_limit": 20,
+            # Exact provider-facing names that stay directly callable after
+            # the ordinary toolset and ACL filters run. This is for hot-path
+            # tools whose extra search round-trip would hurt every turn.
+            "always_visible": [],
         },
     },
 

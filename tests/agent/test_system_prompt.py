@@ -15,6 +15,7 @@ def _make_agent(**overrides):
         _tool_use_enforcement=False,
         _environment_probe=False,
         _kanban_worker_guidance="",
+        _host_managed_prompt=False,
         _memory_store=None,
         _memory_manager=None,
         model="",
@@ -55,3 +56,34 @@ class TestContextFileCwd:
     def test_configured_dir_when_terminal_cwd_set(self, monkeypatch, tmp_path):
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         assert _captured_context_cwd(_make_agent()) == tmp_path
+
+
+def test_host_managed_prompt_keeps_soul_context_and_compact_skills():
+    agent = _make_agent(
+        _host_managed_prompt=True,
+        valid_tool_names={"skill_view"},
+        platform="api_server",
+        model="openai/gpt-5",
+    )
+
+    with (
+        patch("run_agent.load_soul_md", return_value="SOUL"),
+        patch("run_agent.build_nous_subscription_prompt", return_value="NOUS"),
+        patch("run_agent.build_environment_hints", return_value="ENV"),
+        patch("run_agent.build_context_files_prompt", return_value="AGENTS"),
+        patch(
+            "run_agent.build_skills_system_prompt",
+            return_value="<available_skills>INDEX</available_skills>",
+        ) as skills,
+    ):
+        parts = build_system_prompt_parts(agent)
+
+    assert "SOUL" in parts["stable"]
+    assert "AGENTS" in parts["context"]
+    assert "<available_skills>INDEX</available_skills>" in parts["stable"]
+    assert "NOUS" not in parts["stable"]
+    assert "ENV" not in parts["stable"]
+    assert "Do not use markdown" not in parts["stable"]
+    assert "Conversation started:" not in parts["volatile"]
+    skills.assert_called_once()
+    assert skills.call_args.kwargs["compact"] is True
