@@ -23,6 +23,7 @@ from hermes_constants import get_hermes_home
 from .crypto import KEY_VERSION, ensure_project_encryption_key
 from .database import EncryptedDatabase
 from .file_processing import (
+    CAPTION_PROMPT_VERSION,
     FileProcessingError,
     cleanup_stale_temp_files,
     embed_text,
@@ -66,6 +67,7 @@ FILE_SEARCH_HOSTED_RERANK_TOP_N = 5
 FILE_SEARCH_HOSTED_RERANK_TIMEOUT_SECONDS = 3.0
 FILE_SEARCH_HOSTED_RERANK_MAX_DOCUMENT_CHARS = 4_000
 FILE_SEARCH_IMAGE_INSPECT_LIMIT = 3
+FILE_SEARCH_RESULT_DESCRIPTION_CHARS = 600
 FILE_SEARCH_MIN_SEMANTIC_SCORE = 0.80
 FILE_SEARCH_MIN_PARENT_SEMANTIC_SCORE = 0.25
 FILE_SEARCH_RRF_K = 60
@@ -2167,6 +2169,12 @@ class MessageStore:
             ).fetchone()
         if row is None:
             return None
+        if (
+            mime_type.lower().startswith("image/")
+            and str(row["caption_prompt_version"] or "")
+            != CAPTION_PROMPT_VERSION
+        ):
+            return None
         try:
             text_embedding = json.loads(
                 row["text_content_embedding_json"] or "null"
@@ -3129,7 +3137,11 @@ class MessageStore:
             for item in reranked
             if str(item.get("mimetype") or "").startswith("image/")
         ][:FILE_SEARCH_IMAGE_INSPECT_LIMIT]
-        if access_token and inspectable:
+        if (
+            bool(request.get("visual_verification"))
+            and access_token
+            and inspectable
+        ):
             with ThreadPoolExecutor(max_workers=len(inspectable)) as pool:
                 futures = {
                     pool.submit(
@@ -3189,7 +3201,10 @@ class MessageStore:
                     }
                 }
                 | {
-                    "description": description[:2_000] or None,
+                    "description": (
+                        description[:FILE_SEARCH_RESULT_DESCRIPTION_CHARS]
+                        or None
+                    ),
                     "why_matched": " | ".join(evidence)[:320]
                     or (
                         "recent file in selected scope"

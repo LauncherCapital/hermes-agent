@@ -798,6 +798,8 @@ async def vision_analyze_tool(
     image_url: str,
     user_prompt: str,
     model: str = None,
+    *,
+    max_tokens: int = 2000,
 ) -> str:
     """
     Analyze an image from a URL or local file path using vision AI.
@@ -815,6 +817,7 @@ async def vision_analyze_tool(
                          Accepts http://, https:// URLs or absolute/relative file paths.
         user_prompt (str): The pre-formatted prompt for the vision model
         model (str): The vision model to use (default: google/gemini-3-flash-preview)
+        max_tokens (int): Maximum output tokens for this analysis (default: 2000)
     
     Returns:
         str: JSON string containing the analysis results with the following structure:
@@ -964,7 +967,7 @@ async def vision_analyze_tool(
             "task": "vision",
             "messages": messages,
             "temperature": vision_temperature,
-            "max_tokens": 2000,
+            "max_tokens": max(1, min(int(max_tokens), 2000)),
             "timeout": vision_timeout,
         }
         if model:
