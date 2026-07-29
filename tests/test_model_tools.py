@@ -66,6 +66,17 @@ class TestHandleFunctionCall:
                 api_request_id="",
             ),
             call(
+                "transform_tool_args",
+                tool_name="web_search",
+                args={"q": "test"},
+                trusted_runtime_metadata={},
+                task_id="task-1",
+                session_id="session-1",
+                tool_call_id="call-1",
+                turn_id="",
+                api_request_id="",
+            ),
+            call(
                 "post_tool_call",
                 tool_name="web_search",
                 args={"q": "test"},

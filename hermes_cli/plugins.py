@@ -140,6 +140,7 @@ _install_plugin_debug_handler()
 VALID_HOOKS: Set[str] = {
     "pre_tool_call",
     "post_tool_call",
+    "transform_tool_args",
     "transform_terminal_output",
     "transform_tool_result",
     # Transform LLM output before it's returned to the user.
@@ -1794,6 +1795,48 @@ async def invoke_plugin_action(action: str, **kwargs: Any) -> Any:
 def has_hook(hook_name: str) -> bool:
     """Return True when a hook has registered callbacks."""
     return get_plugin_manager().has_hook(hook_name)
+
+
+def get_transformed_tool_args(
+    tool_name: str,
+    args: Optional[Dict[str, Any]],
+    *,
+    trusted_runtime_metadata: Optional[Dict[str, str]] = None,
+    task_id: str = "",
+    session_id: str = "",
+    tool_call_id: str = "",
+    turn_id: str = "",
+    api_request_id: str = "",
+) -> Dict[str, Any]:
+    """Return a dispatch-only copy of tool arguments transformed by plugins.
+
+    The caller must keep using the original arguments for transcript,
+    observer, and approval events. This seam is intended for trusted runtime
+    context that must reach a tool without becoming model-visible.
+    """
+    transformed = dict(args) if isinstance(args, dict) else {}
+    if not has_hook("transform_tool_args"):
+        return transformed
+
+    hook_results = invoke_hook(
+        "transform_tool_args",
+        tool_name=tool_name,
+        args=dict(transformed),
+        trusted_runtime_metadata=(
+            dict(trusted_runtime_metadata)
+            if isinstance(trusted_runtime_metadata, dict)
+            else {}
+        ),
+        task_id=task_id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+        turn_id=turn_id,
+        api_request_id=api_request_id,
+    )
+    for result in hook_results:
+        if isinstance(result, dict):
+            transformed = dict(result)
+    return transformed
 
 
 _thread_tool_whitelist = threading.local()

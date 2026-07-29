@@ -1764,6 +1764,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             skip_pre_tool_call_hook=True,
             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            trusted_runtime_metadata=getattr(
+                agent, "_trusted_runtime_metadata", None
+            ),
         )
 
 

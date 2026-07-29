@@ -1122,6 +1122,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skip_pre_tool_call_hook=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    trusted_runtime_metadata=getattr(
+                        agent, "_trusted_runtime_metadata", None
+                    ),
                 )
                 _spinner_result = function_result
             except KeyboardInterrupt:
@@ -1161,6 +1164,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skip_pre_tool_call_hook=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    trusted_runtime_metadata=getattr(
+                        agent, "_trusted_runtime_metadata", None
+                    ),
                 )
             except KeyboardInterrupt:
                 _emit_cancelled_terminal_post_tool_call(

@@ -873,6 +873,7 @@ def handle_function_call(
     skip_pre_tool_call_hook: bool = False,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    trusted_runtime_metadata: Optional[Dict[str, str]] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -894,6 +895,8 @@ def handle_function_call(
                        matching ``get_tool_definitions`` semantics.
         disabled_toolsets: The session's disabled toolsets, applied as a
                        subtraction when scoping the bridge catalog.
+        trusted_runtime_metadata: Server-validated context available only to
+                       dispatch-time plugin argument transforms.
 
     Returns:
         Function result as a JSON string.
@@ -974,6 +977,7 @@ def handle_function_call(
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                trusted_runtime_metadata=trusted_runtime_metadata,
             )
 
     try:
@@ -1086,7 +1090,22 @@ def handle_function_call(
                         task_id=task_id,
                         user_task=user_task,
                     )
-            result = _dispatch(function_args)
+            dispatch_args = function_args
+            try:
+                from hermes_cli.plugins import get_transformed_tool_args
+                dispatch_args = get_transformed_tool_args(
+                    function_name,
+                    function_args,
+                    trusted_runtime_metadata=trusted_runtime_metadata,
+                    task_id=task_id or "",
+                    session_id=session_id or "",
+                    tool_call_id=tool_call_id or "",
+                    turn_id=turn_id or "",
+                    api_request_id=api_request_id or "",
+                )
+            except Exception as _hook_err:
+                logger.debug("transform_tool_args hook error: %s", _hook_err)
+            result = _dispatch(dispatch_args)
         finally:
             if _approval_tokens is not None and reset_current_observability_context is not None:
                 try:
