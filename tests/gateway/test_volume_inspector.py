@@ -89,6 +89,21 @@ def test_depth_and_node_caps_are_enforced(tmp_path):
     assert len(node_limited["nodes"]) == 3
 
 
+def test_node_cap_does_not_hide_root_files_behind_large_directory(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for index in range(10):
+        (cache / f"entry-{index}.txt").write_text(str(index))
+    (tmp_path / "state.db").write_bytes(b"sqlite")
+
+    result = inspect_volume(tmp_path, max_nodes=4)
+    paths = {node["path"] for node in result["nodes"]}
+
+    assert "cache" in paths
+    assert "state.db" in paths
+    assert result["truncated"] is True
+
+
 @pytest.mark.parametrize(
     "path",
     [
