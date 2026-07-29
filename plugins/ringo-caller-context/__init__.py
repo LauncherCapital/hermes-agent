@@ -14,6 +14,10 @@ logger = logging.getLogger(__name__)
 _RINGO_CALLER_TOOLSETS = {"mcp-ringo_ie", "mcp-ringo_admin"}
 _RINGO_MCP_SERVERS = {"ringo_ie", "ringo_admin"}
 _CURRENT_SLACK_DESTINATION_TOOLS = {"send_message", "slack_upload_file"}
+_CURRENT_SLACK_HISTORY_TOOLS = {
+    "slack_fetch_history": "channel",
+    "message_fetch_history": "conversation_id",
+}
 
 
 def _transform_tool_args(
@@ -39,6 +43,37 @@ def _transform_tool_args(
         supplied_channel = str(transformed.get("channel") or "").strip()
         current_channel = str(runtime.get("channel_id") or "").strip()
         if not supplied_channel and current_channel:
+            transformed["channel"] = current_channel
+            changed = True
+            if not str(transformed.get("thread_ts") or "").strip():
+                reply_target = str(runtime.get("reply_target_ts") or "").strip()
+                if reply_target:
+                    transformed["thread_ts"] = reply_target
+    elif remote_tool in _CURRENT_SLACK_HISTORY_TOOLS:
+        destination_argument = _CURRENT_SLACK_HISTORY_TOOLS[remote_tool]
+        supplied_channel = str(
+            transformed.get(destination_argument) or ""
+        ).strip()
+        current_channel = str(runtime.get("channel_id") or "").strip()
+        if not supplied_channel and current_channel:
+            transformed[destination_argument] = current_channel
+            changed = True
+    elif remote_tool == "slack_watch_channel":
+        supplied_channel = str(transformed.get("channel_id") or "").strip()
+        current_channel = str(runtime.get("channel_id") or "").strip()
+        channel_type = str(runtime.get("channel_type") or "").strip()
+        if (
+            not supplied_channel
+            and current_channel
+            and channel_type in {"channel", "group"}
+        ):
+            transformed["channel_id"] = current_channel
+            changed = True
+    elif remote_tool == "nudge_create":
+        supplied_channel = str(transformed.get("channel") or "").strip()
+        supplied_target = str(transformed.get("target") or "").strip()
+        current_channel = str(runtime.get("channel_id") or "").strip()
+        if not supplied_channel and not supplied_target and current_channel:
             transformed["channel"] = current_channel
             changed = True
             if not str(transformed.get("thread_ts") or "").strip():
