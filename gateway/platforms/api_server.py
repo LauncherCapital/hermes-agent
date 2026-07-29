@@ -1459,7 +1459,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self,
         request: "web.Request",
     ) -> "web.Response":
-        """Decrypt one explicitly allowlisted canonical channel SKILL.md."""
+        """Preview one safe text file, decrypting canonical channel skills."""
         body, error = await self._volume_request(request, allow_path=True)
         if error is not None:
             return error
@@ -1467,11 +1467,16 @@ class APIServerAdapter(BasePlatformAdapter):
 
         from gateway.volume_inspector import (
             VolumeInspectorError,
+            read_preview_file,
             validate_preview_target,
         )
 
         try:
-            validate_preview_target(body.get("path"))
+            target, channel_id = validate_preview_target(body.get("path"))
+            if channel_id is None:
+                return web.json_response(
+                    read_preview_file(target, body["path"])
+                )
         except VolumeInspectorError as exc:
             return web.json_response(
                 {"error": {"code": exc.code, "message": str(exc)}},

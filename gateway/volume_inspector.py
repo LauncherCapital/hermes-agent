@@ -28,11 +28,6 @@ _LEGACY_CHANNEL_PATH = re.compile(
 )
 _LOCKED_ROOTS = frozenset(
     {
-        "sessions",
-        "session",
-        "state",
-        "trajectories",
-        "checkpoints",
         "credentials",
         "auth",
     }
@@ -53,7 +48,23 @@ _LOCKED_SUFFIXES = frozenset(
     }
 )
 _TEXT_SUFFIXES = frozenset(
-    {".json", ".log", ".md", ".txt", ".yaml", ".yml"}
+    {
+        ".cfg",
+        ".csv",
+        ".html",
+        ".ini",
+        ".json",
+        ".jsonl",
+        ".log",
+        ".md",
+        ".py",
+        ".sh",
+        ".toml",
+        ".txt",
+        ".xml",
+        ".yaml",
+        ".yml",
+    }
 )
 
 
@@ -146,16 +157,16 @@ def classify_path(
     if legacy:
         return {
             "category": "legacy_channel_memory",
-            "status": "metadata_only",
+            "status": "previewable",
             "provenance": "legacy",
-            "previewable": False,
+            "previewable": True,
         }
     if Path(relative_path).suffix.casefold() in _TEXT_SUFFIXES:
         return {
             "category": "human_readable",
-            "status": "metadata_only",
+            "status": "previewable",
             "provenance": provenance,
-            "previewable": False,
+            "previewable": True,
         }
     return {
         "category": "binary_or_state",
@@ -287,11 +298,17 @@ def _relative_parts(raw_path: object) -> tuple[str, ...]:
 def validate_preview_target(
     raw_path: object,
     home: Path | None = None,
-) -> tuple[Path, str]:
+) -> tuple[Path, str | None]:
     parts = _relative_parts(raw_path)
     relative = "/".join(parts)
     match = _CANONICAL_CHANNEL_SKILL.fullmatch(relative)
-    if match is None:
+    if (
+        _is_locked(relative)
+        or (
+            match is None
+            and Path(relative).suffix.casefold() not in _TEXT_SUFFIXES
+        )
+    ):
         raise VolumeInspectorError(
             "preview_locked",
             "preview is not allowed for this file",
@@ -336,7 +353,48 @@ def validate_preview_target(
             "preview path escapes Hermes home",
             status=403,
         ) from exc
-    return current, match.group("channel_id")
+    return current, match.group("channel_id") if match is not None else None
+
+
+def read_preview_file(
+    target: Path,
+    relative_path: str,
+    max_bytes: int = MAX_PREVIEW_BYTES,
+) -> dict[str, Any]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, flags)
+        with os.fdopen(descriptor, "rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise VolumeInspectorError(
+                    "preview_locked",
+                    "preview is not allowed for this entry",
+                    status=403,
+                )
+            encoded = stream.read(max_bytes + 1)
+    except VolumeInspectorError:
+        raise
+    except (FileNotFoundError, PermissionError, OSError) as exc:
+        raise VolumeInspectorError(
+            "file_unavailable",
+            "preview file is unavailable",
+            status=503,
+        ) from exc
+
+    bounded = encoded[:max_bytes]
+    if b"\x00" in bounded:
+        raise VolumeInspectorError(
+            "preview_locked",
+            "preview is not allowed for binary content",
+            status=403,
+        )
+    return {
+        "path": relative_path,
+        "content": bounded.decode("utf-8", errors="ignore"),
+        "encoding": "utf-8",
+        "truncated": len(encoded) > max_bytes,
+    }
 
 
 def truncate_utf8(
