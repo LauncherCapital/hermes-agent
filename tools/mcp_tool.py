@@ -1129,10 +1129,16 @@ def _tools_signature(tools) -> frozenset:
             schema_key = json.dumps(schema, sort_keys=True, default=str)
         except (TypeError, ValueError):
             schema_key = str(schema)
+        meta = getattr(tool, "meta", None)
+        try:
+            meta_key = json.dumps(meta, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            meta_key = str(meta)
         sig.add((
             getattr(tool, "name", "") or "",
             getattr(tool, "description", "") or "",
             schema_key,
+            meta_key,
         ))
     return frozenset(sig)
 
@@ -2728,9 +2734,36 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
 
+        call_meta = {}
+        try:
+            from hermes_cli.plugins import get_mcp_call_meta
+
+            call_meta = get_mcp_call_meta(
+                (
+                    f"mcp_{sanitize_mcp_name_component(server_name)}_"
+                    f"{sanitize_mcp_name_component(tool_name)}"
+                ),
+                server_name=server_name,
+                remote_tool_name=tool_name,
+                trusted_runtime_metadata=kwargs.get(
+                    "trusted_runtime_metadata"
+                ),
+                task_id=str(kwargs.get("task_id") or ""),
+                session_id=str(kwargs.get("session_id") or ""),
+                tool_call_id=str(kwargs.get("tool_call_id") or ""),
+                turn_id=str(kwargs.get("turn_id") or ""),
+                api_request_id=str(kwargs.get("api_request_id") or ""),
+            )
+        except Exception as exc:
+            logger.debug("MCP call metadata hook failed: %s", exc)
+
         async def _call():
             async with server._rpc_lock:
-                result = await server.session.call_tool(tool_name, arguments=args)
+                result = await server.session.call_tool(
+                    tool_name,
+                    arguments=args,
+                    meta=call_meta or None,
+                )
             # MCP CallToolResult has .content (list of content blocks) and .isError
             if result.isError:
                 error_text = ""
@@ -3230,10 +3263,61 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     safe_tool_name = sanitize_mcp_name_component(mcp_tool.name)
     safe_server_name = sanitize_mcp_name_component(server_name)
     prefixed_name = f"mcp_{safe_server_name}_{safe_tool_name}"
+    parameters = _normalize_mcp_input_schema(
+        getattr(mcp_tool, "inputSchema", None)
+    )
+    hidden_arguments = _mcp_hidden_arguments(mcp_tool)
+    if hidden_arguments:
+        properties = dict(parameters.get("properties") or {})
+        for argument in hidden_arguments:
+            properties.pop(argument, None)
+        parameters = {**parameters, "properties": properties}
+        required = [
+            name
+            for name in parameters.get("required") or []
+            if name not in hidden_arguments
+        ]
+        if required:
+            parameters["required"] = required
+        else:
+            parameters.pop("required", None)
     return {
         "name": prefixed_name,
         "description": mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}",
-        "parameters": _normalize_mcp_input_schema(getattr(mcp_tool, "inputSchema", None)),
+        "parameters": parameters,
+    }
+
+
+def _mcp_hidden_arguments(mcp_tool) -> tuple[str, ...]:
+    """Return server-declared arguments that must not reach the model schema."""
+    raw_meta = getattr(mcp_tool, "meta", None)
+    if hasattr(raw_meta, "model_dump"):
+        raw_meta = raw_meta.model_dump(by_alias=True, exclude_none=True)
+    if not isinstance(raw_meta, dict):
+        return ()
+    raw_names = raw_meta.get("hermes/hidden-arguments")
+    if not isinstance(raw_names, list):
+        return ()
+    return tuple(
+        str(name).strip()
+        for name in raw_names
+        if isinstance(name, str) and str(name).strip()
+    )
+
+
+def _mcp_tool_metadata(server_name: str, mcp_tool) -> dict:
+    """Internal MCP provenance and server-declared metadata.
+
+    This is intentionally stored outside the provider-facing function schema.
+    """
+    raw_meta = getattr(mcp_tool, "meta", None)
+    if hasattr(raw_meta, "model_dump"):
+        raw_meta = raw_meta.model_dump(by_alias=True, exclude_none=True)
+    return {
+        "mcp_server": server_name,
+        "mcp_remote_tool": str(getattr(mcp_tool, "name", "") or ""),
+        "mcp_meta": dict(raw_meta) if isinstance(raw_meta, dict) else {},
+        "mcp_hidden_arguments": list(_mcp_hidden_arguments(mcp_tool)),
     }
 
 
@@ -3517,6 +3601,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=_make_check_fn(name),
             is_async=False,
             description=schema["description"],
+            metadata=_mcp_tool_metadata(name, mcp_tool),
         )
         _track_mcp_tool_server(tool_name_prefixed, name)
         registered_names.append(tool_name_prefixed)

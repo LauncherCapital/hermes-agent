@@ -757,6 +757,56 @@ class TestRegression_ToolsetScoping:
         assert parsed["total_available"] == 1
         assert {match["name"] for match in parsed["matches"]} == {"mcp_scope_kept_op"}
 
+    def test_caller_policy_scopes_search_and_deferred_call(
+        self,
+        monkeypatch,
+    ):
+        import model_tools
+
+        self._register("mcp_policy_visible", "mcp-policy")
+        self._register("mcp_policy_hidden", "mcp-policy")
+
+        def filter_defs(definitions, **_):
+            return [
+                item
+                for item in definitions
+                if item["function"]["name"] != "mcp_policy_hidden"
+            ]
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.filter_tool_definitions",
+            filter_defs,
+        )
+        result = json.loads(
+            model_tools.handle_function_call(
+                function_name="tool_search",
+                function_args={"query": "mcp_policy", "limit": 5},
+                enabled_toolsets=["mcp-policy"],
+                trusted_runtime_metadata={
+                    "tool_policy_fingerprint": "policy-1",
+                },
+            )
+        )
+        assert result["total_available"] == 1
+        assert {
+            match["name"] for match in result["matches"]
+        } == {"mcp_policy_visible"}
+
+        rejected = json.loads(
+            model_tools.handle_function_call(
+                function_name="tool_call",
+                function_args={
+                    "name": "mcp_policy_hidden",
+                    "arguments": {},
+                },
+                enabled_toolsets=["mcp-policy"],
+                trusted_runtime_metadata={
+                    "tool_policy_fingerprint": "policy-1",
+                },
+            )
+        )
+        assert "not available in this session" in rejected["error"]
+
     def test_tool_call_rejects_out_of_scope_tool(self):
         import model_tools
 

@@ -80,6 +80,69 @@ def test_no_hook_returns_distinct_copy():
     assert transformed is not original
 
 
+def test_mcp_call_meta_merges_plugin_results(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: True)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda hook_name, **_: (
+            [{"trace": "a"}, {"ringo/caller_grant": "trusted-token"}]
+            if hook_name == "build_mcp_call_meta"
+            else []
+        ),
+    )
+
+    assert plugins_mod.get_mcp_call_meta(
+        "mcp_ringo_ie_memory_search",
+        server_name="ringo_ie",
+        remote_tool_name="memory_search",
+        trusted_runtime_metadata={"slack_caller_token": "trusted-token"},
+    ) == {
+        "trace": "a",
+        "ringo/caller_grant": "trusted-token",
+    }
+
+
+def test_tool_definition_filters_can_only_remove_names(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: True)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda hook_name, **_: (
+            [["allowed", "not-in-base"]]
+            if hook_name == "filter_tool_names"
+            else []
+        ),
+    )
+    definitions = [
+        {"type": "function", "function": {"name": "allowed"}},
+        {"type": "function", "function": {"name": "hidden"}},
+    ]
+
+    assert plugins_mod.filter_tool_definitions(definitions) == [
+        {"type": "function", "function": {"name": "allowed"}},
+    ]
+
+
+def test_hidden_tool_is_blocked_before_registry_dispatch(monkeypatch):
+    from tools.registry import registry
+
+    dispatch = Mock(return_value='{"ok": true}')
+    monkeypatch.setattr(registry, "dispatch", dispatch)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.is_tool_exposed",
+        lambda *_args, **_kwargs: False,
+    )
+
+    result = model_tools.handle_function_call(
+        "hidden_tool",
+        {"value": 1},
+        trusted_runtime_metadata={"tool_policy_fingerprint": "policy-1"},
+        skip_pre_tool_call_hook=True,
+    )
+
+    assert "not available in the current caller context" in result
+    dispatch.assert_not_called()
+
+
 def test_concurrent_agent_path_forwards_trusted_runtime_metadata():
     runtime = {"slack_caller_token": "trusted-token"}
     dispatch = Mock(return_value='{"ok": true}')

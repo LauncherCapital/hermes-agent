@@ -56,6 +56,11 @@ class TestHandleFunctionCall:
         assert result == '{"ok":true}'
         assert mock_invoke_hook.call_args_list == [
             call(
+                "filter_tool_names",
+                tool_names=("web_search",),
+                trusted_runtime_metadata={},
+            ),
+            call(
                 "pre_tool_call",
                 tool_name="web_search",
                 args={"q": "test"},

@@ -141,6 +141,8 @@ VALID_HOOKS: Set[str] = {
     "pre_tool_call",
     "post_tool_call",
     "transform_tool_args",
+    "build_mcp_call_meta",
+    "filter_tool_names",
     "transform_terminal_output",
     "transform_tool_result",
     # Transform LLM output before it's returned to the user.
@@ -1837,6 +1839,113 @@ def get_transformed_tool_args(
         if isinstance(result, dict):
             transformed = dict(result)
     return transformed
+
+
+def get_mcp_call_meta(
+    tool_name: str,
+    *,
+    server_name: str,
+    remote_tool_name: str,
+    trusted_runtime_metadata: Optional[Dict[str, str]] = None,
+    task_id: str = "",
+    session_id: str = "",
+    tool_call_id: str = "",
+    turn_id: str = "",
+    api_request_id: str = "",
+) -> Dict[str, Any]:
+    """Build out-of-band metadata for one MCP ``tools/call`` request.
+
+    Metadata returned here is transport context, not a model-authored tool
+    argument. Plugins must scope secrets to the exact MCP server that needs
+    them. Multiple plugin results are merged in registration order.
+    """
+    if not has_hook("build_mcp_call_meta"):
+        return {}
+
+    merged: Dict[str, Any] = {}
+    hook_results = invoke_hook(
+        "build_mcp_call_meta",
+        tool_name=tool_name,
+        server_name=server_name,
+        remote_tool_name=remote_tool_name,
+        trusted_runtime_metadata=(
+            dict(trusted_runtime_metadata)
+            if isinstance(trusted_runtime_metadata, dict)
+            else {}
+        ),
+        task_id=task_id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+        turn_id=turn_id,
+        api_request_id=api_request_id,
+    )
+    for result in hook_results:
+        if isinstance(result, dict):
+            merged.update(result)
+    return merged
+
+
+def filter_tool_definitions(
+    tool_definitions: Optional[List[Dict[str, Any]]],
+    *,
+    trusted_runtime_metadata: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    """Apply plugin exposure policies as intersection-only filters.
+
+    Plugins return tool-name iterables. Each result may only remove names from
+    the current set; it can never grant a tool that the base toolset omitted.
+    """
+    definitions = list(tool_definitions or [])
+    if not definitions or not has_hook("filter_tool_names"):
+        return definitions
+
+    allowed = {
+        item.get("function", {}).get("name")
+        for item in definitions
+        if isinstance(item, dict)
+    }
+    allowed.discard(None)
+    hook_results = invoke_hook(
+        "filter_tool_names",
+        tool_names=tuple(sorted(allowed)),
+        trusted_runtime_metadata=(
+            dict(trusted_runtime_metadata)
+            if isinstance(trusted_runtime_metadata, dict)
+            else {}
+        ),
+    )
+    for result in hook_results:
+        if isinstance(result, (list, tuple, set, frozenset)):
+            allowed.intersection_update(str(name) for name in result)
+    return [
+        item
+        for item in definitions
+        if item.get("function", {}).get("name") in allowed
+    ]
+
+
+def is_tool_exposed(
+    tool_name: str,
+    *,
+    trusted_runtime_metadata: Optional[Dict[str, str]] = None,
+) -> bool:
+    """Return whether exposure plugins allow an already-registered tool."""
+    if not has_hook("filter_tool_names"):
+        return True
+    allowed = {tool_name}
+    hook_results = invoke_hook(
+        "filter_tool_names",
+        tool_names=(tool_name,),
+        trusted_runtime_metadata=(
+            dict(trusted_runtime_metadata)
+            if isinstance(trusted_runtime_metadata, dict)
+            else {}
+        ),
+    )
+    for result in hook_results:
+        if isinstance(result, (list, tuple, set, frozenset)):
+            allowed.intersection_update(str(name) for name in result)
+    return tool_name in allowed
 
 
 _thread_tool_whitelist = threading.local()

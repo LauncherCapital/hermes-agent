@@ -201,6 +201,12 @@ def _tool_search_scoped_names(agent) -> frozenset:
         getattr(_registry, "_generation", 0),
         frozenset(enabled) if enabled is not None else None,
         frozenset(disabled) if disabled is not None else None,
+        str(
+            (
+                getattr(agent, "_trusted_runtime_metadata", None) or {}
+            ).get("tool_policy_fingerprint")
+            or ""
+        ),
     )
     cached = getattr(agent, "_tool_search_scope_cache", None)
     if cached is not None and cached[0] == cache_key:
@@ -212,6 +218,16 @@ def _tool_search_scoped_names(agent) -> frozenset:
             quiet_mode=True,
             skip_tool_search_assembly=True,
         ) or []
+        from hermes_cli.plugins import filter_tool_definitions
+
+        scoped_defs = filter_tool_definitions(
+            scoped_defs,
+            trusted_runtime_metadata=getattr(
+                agent,
+                "_trusted_runtime_metadata",
+                None,
+            ),
+        )
         names = _ts.scoped_deferrable_names(scoped_defs)
     except Exception:
         names = frozenset()
