@@ -70,9 +70,14 @@ def test_result_unchanged_for_none_hook_return(monkeypatch):
 
 
 def test_result_ignores_non_string_hook_returns(monkeypatch):
+    def _hook(hook_name, **_kw):
+        if hook_name == "transform_tool_result":
+            return [{"bad": True}, 123, ["nope"]]
+        return []
+
     out = _run_handle_function_call(
         monkeypatch,
-        invoke_hook=lambda hook_name, **kw: [{"bad": True}, 123, ["nope"]],
+        invoke_hook=_hook,
     )
     assert out == '{"output": "original"}'
 

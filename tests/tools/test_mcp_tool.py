@@ -17,7 +17,12 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_mcp_tool(name="read_file", description="Read a file", input_schema=None):
+def _make_mcp_tool(
+    name="read_file",
+    description="Read a file",
+    input_schema=None,
+    meta=None,
+):
     """Create a fake MCP Tool object matching the SDK interface."""
     tool = SimpleNamespace()
     tool.name = name
@@ -29,6 +34,7 @@ def _make_mcp_tool(name="read_file", description="Read a file", input_schema=Non
         },
         "required": ["path"],
     }
+    tool.meta = meta
     return tool
 
 
@@ -96,6 +102,50 @@ class TestSchemaConversion:
         assert schema["name"] == "mcp_filesystem_read_file"
         assert schema["description"] == "Read a file"
         assert "properties" in schema["parameters"]
+
+    def test_mcp_meta_is_internal_and_not_in_provider_schema(self):
+        from tools.mcp_tool import _convert_mcp_schema, _mcp_tool_metadata
+
+        mcp_tool = _make_mcp_tool(
+            name="private_read",
+            meta={
+                "ringo/access": {
+                    "version": 1,
+                    "caller": "required",
+                    "capability": "profile",
+                },
+            },
+        )
+
+        schema = _convert_mcp_schema("ringo_ie", mcp_tool)
+        metadata = _mcp_tool_metadata("ringo_ie", mcp_tool)
+
+        assert "ringo/access" not in json.dumps(schema)
+        assert metadata["mcp_server"] == "ringo_ie"
+        assert metadata["mcp_meta"]["ringo/access"]["caller"] == "required"
+
+    def test_server_hidden_arguments_are_removed_from_provider_schema(self):
+        from tools.mcp_tool import _convert_mcp_schema, _mcp_tool_metadata
+
+        mcp_tool = _make_mcp_tool(
+            name="private_read",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "caller_token": {"type": "string"},
+                },
+                "required": ["query", "caller_token"],
+            },
+            meta={"hermes/hidden-arguments": ["caller_token"]},
+        )
+
+        schema = _convert_mcp_schema("ringo_ie", mcp_tool)
+        metadata = _mcp_tool_metadata("ringo_ie", mcp_tool)
+
+        assert set(schema["parameters"]["properties"]) == {"query"}
+        assert schema["parameters"]["required"] == ["query"]
+        assert metadata["mcp_hidden_arguments"] == ["caller_token"]
 
     def test_empty_input_schema_gets_default(self):
         from tools.mcp_tool import _convert_mcp_schema
@@ -498,9 +548,50 @@ class TestToolHandler:
             with self._patch_mcp_loop():
                 result = json.loads(handler({"name": "world"}))
             assert result["result"] == "hello world"
-            mock_session.call_tool.assert_called_once_with("greet", arguments={"name": "world"})
+            mock_session.call_tool.assert_called_once_with(
+                "greet",
+                arguments={"name": "world"},
+                meta=None,
+            )
         finally:
             _servers.pop("test_srv", None)
+
+    def test_call_metadata_is_out_of_band(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("ok", is_error=False)
+        )
+        server = _make_mock_server("ringo_ie", session=mock_session)
+        _servers["ringo_ie"] = server
+
+        try:
+            handler = _make_tool_handler("ringo_ie", "memory_search", 120)
+            with (
+                self._patch_mcp_loop(),
+                patch(
+                    "hermes_cli.plugins.get_mcp_call_meta",
+                    return_value={"ringo/caller_grant": "trusted-token"},
+                ) as build_meta,
+            ):
+                result = json.loads(
+                    handler(
+                        {"query": "x"},
+                        trusted_runtime_metadata={
+                            "slack_caller_token": "trusted-token",
+                        },
+                    )
+                )
+            assert result["result"] == "ok"
+            mock_session.call_tool.assert_called_once_with(
+                "memory_search",
+                arguments={"query": "x"},
+                meta={"ringo/caller_grant": "trusted-token"},
+            )
+            build_meta.assert_called_once()
+        finally:
+            _servers.pop("ringo_ie", None)
 
     def test_mcp_error_result(self):
         from tools.mcp_tool import _make_tool_handler, _servers
@@ -751,6 +842,52 @@ class TestDiscoverAndRegister:
         assert entry.toolset == "mcp-srv"
 
         _servers.pop("srv", None)
+
+    def test_registered_tool_preserves_internal_mcp_metadata(self):
+        from tools.registry import ToolRegistry
+        from tools.mcp_tool import (
+            MCPServerTask,
+            _discover_and_register_server,
+            _servers,
+        )
+
+        mock_registry = ToolRegistry()
+        mock_tools = [
+            _make_mcp_tool(
+                "private_read",
+                "Private read",
+                meta={
+                    "hermes/hidden-arguments": ["caller_token"],
+                    "ringo/access": {
+                        "version": 1,
+                        "caller": "required",
+                        "capability": "profile",
+                    },
+                },
+            )
+        ]
+        mock_session = MagicMock()
+
+        async def fake_connect(name, config):
+            server = MCPServerTask(name)
+            server.session = mock_session
+            server._tools = mock_tools
+            return server
+
+        with (
+            patch("tools.mcp_tool._connect_server", side_effect=fake_connect),
+            patch("tools.registry.registry", mock_registry),
+        ):
+            asyncio.run(
+                _discover_and_register_server("ringo_ie", {"command": "test"})
+            )
+
+        metadata = mock_registry.get_metadata(
+            "mcp_ringo_ie_private_read"
+        )
+        assert metadata["mcp_meta"]["ringo/access"]["capability"] == "profile"
+        assert metadata["mcp_hidden_arguments"] == ["caller_token"]
+        _servers.pop("ringo_ie", None)
 
 
 # ---------------------------------------------------------------------------

@@ -442,6 +442,9 @@ async def test_chat_completions_session_syncs_explicit_context(
                         "principal_id": "",
                         "team_slug": "",
                         "slack_caller_token": "signed-channel-context",
+                        "caller_mode": "interactive",
+                        "caller_capabilities": '["caller"]',
+                        "tool_policy_fingerprint": "policy-1",
                     },
                 },
                 headers={
@@ -459,6 +462,43 @@ async def test_chat_completions_session_syncs_explicit_context(
         kwargs["trusted_runtime_metadata"]["slack_caller_token"]
         == "signed-channel-context"
     )
+    assert (
+        kwargs["trusted_runtime_metadata"]["tool_policy_fingerprint"]
+        == "policy-1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_preserves_legacy_runtime_field_absence(
+    adapter,
+    session_db,
+):
+    session_id = session_db.create_session("legacy-runtime-session", "api_server")
+    captured_kwargs = {}
+
+    async def fake_run(**kwargs):
+        captured_kwargs.update(kwargs)
+        return {"final_response": "ok", "session_id": session_id}, {
+            "total_tokens": 1
+        }
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={
+                    "message": "legacy request",
+                    "trusted_runtime_metadata": {
+                        "slack_caller_token": "signed-channel-context",
+                    },
+                },
+            )
+            assert resp.status == 200, await resp.text()
+
+    assert captured_kwargs["trusted_runtime_metadata"] == {
+        "slack_caller_token": "signed-channel-context",
+    }
 
 
 @pytest.mark.asyncio

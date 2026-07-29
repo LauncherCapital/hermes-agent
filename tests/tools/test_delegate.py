@@ -390,6 +390,49 @@ class TestDelegateTask(unittest.TestCase):
 
         self.assertIs(mock_child._print_fn, sink)
 
+    def test_child_inherits_and_applies_parent_tool_exposure_policy(self):
+        parent = _make_mock_parent(depth=0)
+        parent._trusted_runtime_metadata = {
+            "caller_mode": "scheduled",
+            "caller_capabilities": "[]",
+            "tool_policy_fingerprint": "policy-1",
+        }
+        visible = {"type": "function", "function": {"name": "visible"}}
+        hidden = {"type": "function", "function": {"name": "hidden"}}
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch(
+                "hermes_cli.plugins.filter_tool_definitions",
+                return_value=[visible],
+            ) as filter_tools,
+        ):
+            mock_child = MagicMock()
+            mock_child.tools = [visible, hidden]
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="Keep caller boundary",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(
+            mock_child._trusted_runtime_metadata,
+            parent._trusted_runtime_metadata,
+        )
+        self.assertEqual(mock_child.tools, [visible])
+        self.assertEqual(mock_child.valid_tool_names, {"visible"})
+        filter_tools.assert_called_once_with(
+            [visible, hidden],
+            trusted_runtime_metadata=parent._trusted_runtime_metadata,
+        )
+
     def test_child_uses_thinking_callback_when_progress_callback_available(self):
         parent = _make_mock_parent(depth=0)
         parent.tool_progress_callback = MagicMock()

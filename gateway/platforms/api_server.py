@@ -566,6 +566,9 @@ _TRUSTED_RUNTIME_FIELDS = {
     "principal_id",
     "team_slug",
     "slack_caller_token",
+    "caller_mode",
+    "caller_capabilities",
+    "tool_policy_fingerprint",
 }
 
 
@@ -581,7 +584,13 @@ def _trusted_runtime_metadata(
         or any(
             not isinstance(item, str)
             or len(item)
-            > (8192 if key == "slack_caller_token" else 256)
+            > (
+                8192
+                if key == "slack_caller_token"
+                else 2048
+                if key == "caller_capabilities"
+                else 256
+            )
             or re.search(r"[\r\n\x00]", item)
             for key, item in value.items()
         )
@@ -593,7 +602,11 @@ def _trusted_runtime_metadata(
             ),
             status=400,
         )
-    return {key: value.get(key, "") for key in _TRUSTED_RUNTIME_FIELDS}, None
+    return {
+        key: value[key]
+        for key in _TRUSTED_RUNTIME_FIELDS
+        if key in value
+    }, None
 
 
 def check_api_server_requirements() -> bool:
@@ -5121,6 +5134,33 @@ class APIServerAdapter(BasePlatformAdapter):
                 if trusted_runtime_metadata is not None
                 else None
             )
+            try:
+                from hermes_cli.plugins import filter_tool_definitions
+
+                base_tools = list(agent.tools or [])
+                agent.tools = filter_tool_definitions(
+                    base_tools,
+                    trusted_runtime_metadata=agent._trusted_runtime_metadata,
+                )
+                agent.valid_tool_names = {
+                    item["function"]["name"] for item in (agent.tools or [])
+                }
+                runtime = agent._trusted_runtime_metadata or {}
+                logger.info(
+                    "[api_server] tool exposure policy=%s mode=%s "
+                    "total=%d visible=%d hidden=%d",
+                    str(runtime.get("tool_policy_fingerprint") or "legacy"),
+                    str(runtime.get("caller_mode") or "legacy"),
+                    len(base_tools),
+                    len(agent.tools),
+                    len(base_tools) - len(agent.tools),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[api_server] tool exposure policy failed; "
+                    "keeping base tool set: %s",
+                    exc,
+                )
             if agent_ref is not None:
                 agent_ref[0] = agent
             effective_task_id = session_id or str(uuid.uuid4())

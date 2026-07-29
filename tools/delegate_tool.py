@@ -1138,6 +1138,24 @@ def _build_child_agent(
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
     )
+    child._trusted_runtime_metadata = dict(
+        getattr(parent_agent, "_trusted_runtime_metadata", None) or {}
+    )
+    try:
+        from hermes_cli.plugins import filter_tool_definitions
+
+        child.tools = filter_tool_definitions(
+            child.tools,
+            trusted_runtime_metadata=child._trusted_runtime_metadata,
+        )
+        child.valid_tool_names = {
+            item["function"]["name"] for item in (child.tools or [])
+        }
+    except Exception:
+        logger.debug(
+            "failed to apply parent tool exposure policy to subagent",
+            exc_info=True,
+        )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth

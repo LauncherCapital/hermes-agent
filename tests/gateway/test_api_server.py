@@ -486,6 +486,44 @@ class TestAgentExecution:
             task_id="session-123",
         )
 
+    @pytest.mark.asyncio
+    async def test_run_agent_applies_exposure_policy_before_model_call(
+        self,
+        adapter,
+    ):
+        visible = {"type": "function", "function": {"name": "visible"}}
+        hidden = {"type": "function", "function": {"name": "hidden"}}
+        mock_agent = MagicMock()
+        mock_agent.tools = [visible, hidden]
+        mock_agent.valid_tool_names = {"visible", "hidden"}
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+
+        runtime = {
+            "caller_mode": "scheduled",
+            "caller_capabilities": "[]",
+            "tool_policy_fingerprint": "policy-1",
+        }
+        with (
+            patch.object(adapter, "_create_agent", return_value=mock_agent),
+            patch(
+                "hermes_cli.plugins.filter_tool_definitions",
+                return_value=[visible],
+            ) as filter_tools,
+        ):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="session-123",
+                trusted_runtime_metadata=runtime,
+            )
+
+        assert mock_agent.tools == [visible]
+        assert mock_agent.valid_tool_names == {"visible"}
+        filter_tools.assert_called_once_with(
+            [visible, hidden],
+            trusted_runtime_metadata=runtime,
+        )
+
 
 # ---------------------------------------------------------------------------
 # /health endpoint

@@ -1,7 +1,9 @@
 name: ringo-caller-context
 version: "0.1.0"
 kind: service
-description: "Injects trusted Slack caller identity into Ringo MCP calls."
+description: "Binds trusted Slack caller identity to Ringo MCP calls."
 author: "LauncherCapital"
 hooks:
   - transform_tool_args
+  - build_mcp_call_meta
+  - filter_tool_names

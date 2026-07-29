@@ -937,6 +937,12 @@ def handle_function_call(
                 disabled_toolsets=disabled_toolsets,
                 quiet_mode=True, skip_tool_search_assembly=True,
             ) or []
+            from hermes_cli.plugins import filter_tool_definitions
+
+            current_defs = filter_tool_definitions(
+                current_defs,
+                trusted_runtime_metadata=trusted_runtime_metadata,
+            )
         except Exception:
             current_defs = []
         if function_name == _ts_mod.TOOL_SEARCH_NAME:
@@ -983,6 +989,25 @@ def handle_function_call(
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
+
+        try:
+            from hermes_cli.plugins import is_tool_exposed
+
+            if not is_tool_exposed(
+                function_name,
+                trusted_runtime_metadata=trusted_runtime_metadata,
+            ):
+                return json.dumps(
+                    {
+                        "error": (
+                            "This tool is not available in the current "
+                            "caller context."
+                        )
+                    },
+                    ensure_ascii=False,
+                )
+        except Exception as _hook_err:
+            logger.debug("tool exposure hook error: %s", _hook_err)
 
         # Check plugin hooks for a block directive (unless caller already
         # checked — e.g. run_agent._invoke_tool passes skip=True to
@@ -1082,6 +1107,11 @@ def handle_function_call(
                         function_name, next_args,
                         task_id=task_id,
                         enabled_tools=sandbox_enabled,
+                        trusted_runtime_metadata=trusted_runtime_metadata,
+                        session_id=session_id,
+                        tool_call_id=tool_call_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
@@ -1089,6 +1119,11 @@ def handle_function_call(
                         function_name, next_args,
                         task_id=task_id,
                         user_task=user_task,
+                        trusted_runtime_metadata=trusted_runtime_metadata,
+                        session_id=session_id,
+                        tool_call_id=tool_call_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
                     )
             dispatch_args = function_args
             try:
