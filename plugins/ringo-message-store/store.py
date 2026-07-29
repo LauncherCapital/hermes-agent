@@ -4275,6 +4275,9 @@ class MessageStore:
             len(conversations) != 1 or (allowed is not None and len(allowed) != 1)
         ):
             raise ValueError("fetch_history requires one authorized conversation")
+        allow_partial = (
+            operation == "fetch_history" and request.get("allow_partial") is True
+        )
         snapshot_keys: set[tuple[str, str]] = set()
         if operation == "fetch_snapshot":
             raw_keys = request.get("provider_message_keys")
@@ -4376,7 +4379,7 @@ class MessageStore:
                     or str(row["contiguous_since"]) > start
                     for row in coverage_rows
                 ):
-                    if operation != "search":
+                    if operation != "search" and not allow_partial:
                         return {
                             "messages": [],
                             "coverage_complete": False,
@@ -4639,11 +4642,14 @@ class MessageStore:
                     "reason": "snapshot_missing" if missing else "snapshot_exact",
                     "last_sequence": int(cursor[0]) if cursor else 0,
                 }
-            floor = max(str(row["contiguous_since"]) for row in coverage_rows)
+            floors = [
+                str(row["contiguous_since"])
+                for row in coverage_rows
+                if row["contiguous_since"]
+            ]
             result = {
                 "messages": messages,
-                "coverage_complete": True,
-                "covered_since": floor,
+                "coverage_complete": coverage_complete,
                 "last_sequence": max(
                     int(row["last_sequence"] or 0)
                     for row in conn.execute(
@@ -4652,6 +4658,10 @@ class MessageStore:
                     ).fetchall()
                 ),
             }
+            if floors:
+                result["covered_since"] = max(floors)
+            if coverage_reason:
+                result["reason"] = coverage_reason
             if operation == "ingest_window" and len(rows) == limit:
                 last = rows[-1]
                 result["next_cursor"] = {
