@@ -84,6 +84,7 @@ MESSAGE_SEARCH_CANDIDATE_LIMIT = 200
 MESSAGE_SEARCH_CONTEXT_ROW_LIMIT = 5_000
 MESSAGE_SEARCH_MAX_ROWS_PER_ROOT = 100
 MESSAGE_SEARCH_MIN_FEATURE_COVERAGE = 0.30
+MESSAGE_SEARCH_MIN_SEGMENT_COVERAGE = 0.50
 MESSAGE_SEARCH_MAX_QUERY_TERMS = 96
 
 
@@ -214,6 +215,12 @@ def _rank_message_rows(
     normalized_query = normalize_search_text(query)
     total_query_features = sum(query_features.values())
     for index, unit in enumerate(units):
+        core_text = normalize_search_text(
+            " ".join(_row_search_text(row) for row in unit["core"])
+        )
+        context_text = normalize_search_text(
+            " ".join(_row_search_text(row) for row in unit["context"])
+        )
         matched_feature_count = sum(
             min(count, document_features[index][feature])
             for feature, count in query_features.items()
@@ -223,7 +230,14 @@ def _rank_message_rows(
             if total_query_features
             else 0.0
         )
-        if feature_coverage < MESSAGE_SEARCH_MIN_FEATURE_COVERAGE:
+        segment_coverage = (
+            sum(segment in context_text for segment in query_words)
+            / len(query_words)
+        )
+        if (
+            feature_coverage < MESSAGE_SEARCH_MIN_FEATURE_COVERAGE
+            and segment_coverage < MESSAGE_SEARCH_MIN_SEGMENT_COVERAGE
+        ):
             continue
         score = 0.0
         for feature, query_count in query_features.items():
@@ -240,12 +254,6 @@ def _rank_message_rows(
             score += (
                 inverse_frequency * (term_frequency * 2.2 / denominator) * query_count
             )
-        core_text = normalize_search_text(
-            " ".join(_row_search_text(row) for row in unit["core"])
-        )
-        context_text = normalize_search_text(
-            " ".join(_row_search_text(row) for row in unit["context"])
-        )
         if normalized_query in core_text:
             score += 2.0
         elif normalized_query in context_text:

@@ -3637,7 +3637,7 @@ def test_message_search_recovers_price_change_thread_without_cross_thread_noise(
         "allowed_source_ids": ["slack:T1:C099U109ZM4", "slack:T1:COTHER"],
         "limit": 10,
     }
-    regression = store.query({**scoped, "query": "가격"})
+    regression = store.query({**scoped, "query": "월문당 가격"})
     direct = store.query({**scoped, "query": "31,900원"})
     reply = store.query({**scoped, "query": "Stripe 신규 Price"})
     unrelated = store.query({**scoped, "query": "다른 서비스 가격 변경"})
@@ -3720,7 +3720,7 @@ def test_message_search_returns_partial_hits_when_coverage_is_incomplete(
     result = store.query(
         {
             "operation": "search",
-            "query": "가격",
+            "query": "월문당 가격",
             "start": "2026-07-21T00:00:00+00:00",
             "end": "2026-07-28T00:00:00+00:00",
             "providers": ["slack"],
