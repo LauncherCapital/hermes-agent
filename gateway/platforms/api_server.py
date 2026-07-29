@@ -2359,6 +2359,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     config_dirty = True
                 applied["max_turns"] = max_turns
 
+            if isinstance(agent_spec, dict) and "host_managed_prompt" in agent_spec:
+                host_managed_prompt = agent_spec.get("host_managed_prompt")
+                if not isinstance(host_managed_prompt, bool):
+                    return web.json_response(
+                        _openai_error("host_managed_prompt must be a boolean"),
+                        status=400,
+                    )
+                agent_cfg = config.get("agent")
+                if not isinstance(agent_cfg, dict):
+                    agent_cfg = {}
+                if agent_cfg.get("host_managed_prompt") is not host_managed_prompt:
+                    agent_cfg["host_managed_prompt"] = host_managed_prompt
+                    config["agent"] = agent_cfg
+                    config_dirty = True
+                applied["host_managed_prompt"] = host_managed_prompt
+
             for section, field in (
                 ("skills", "creation_nudge_interval"),
                 ("memory", "nudge_interval"),
@@ -2478,6 +2494,31 @@ class APIServerAdapter(BasePlatformAdapter):
                     tools_cfg["tool_search"] = tool_search_cfg
                     config["tools"] = tools_cfg
                     config_dirty = True
+                if "always_visible" in tool_search_spec:
+                    raw_always_visible = tool_search_spec.get("always_visible")
+                    if (
+                        not isinstance(raw_always_visible, list)
+                        or not all(
+                            isinstance(name, str) and name.strip()
+                            for name in raw_always_visible
+                        )
+                    ):
+                        return web.json_response(
+                            _openai_error(
+                                "tools.tool_search.always_visible must be a list "
+                                "of non-empty tool names"
+                            ),
+                            status=400,
+                        )
+                    always_visible = list(dict.fromkeys(
+                        name.strip() for name in raw_always_visible
+                    ))
+                    if tool_search_cfg.get("always_visible") != always_visible:
+                        tool_search_cfg["always_visible"] = always_visible
+                        tools_cfg["tool_search"] = tool_search_cfg
+                        config["tools"] = tools_cfg
+                        config_dirty = True
+                    applied["tool_search_always_visible"] = always_visible
                 applied["tool_search"] = enabled
 
             ringo_spec = body.get("ringo")

@@ -117,6 +117,14 @@ class TestConfigParsing:
         assert cfg.max_search_limit == 50
         assert cfg.search_default_limit <= cfg.max_search_limit
 
+    def test_always_visible_names_are_cleaned(self):
+        from tools.tool_search import ToolSearchConfig
+        cfg = ToolSearchConfig.from_raw({
+            "enabled": "on",
+            "always_visible": [" mcp_ringo_ie_send_message ", "", 123],
+        })
+        assert cfg.always_visible == frozenset({"mcp_ringo_ie_send_message"})
+
 
 # ---------------------------------------------------------------------------
 # Classification — the hard invariant: core tools NEVER defer.
@@ -400,6 +408,37 @@ class TestRetrieval:
 
 
 class TestAssembly:
+    def test_pinned_mcp_tool_stays_visible_after_activation(self):
+        from tools.registry import registry
+        from tools.tool_search import ToolSearchConfig, assemble_tool_defs
+
+        pinned = "mcp_ringo_ie_send_message"
+        deferred = "mcp_ringo_ie_slack_watch_channel"
+        for name in (pinned, deferred):
+            registry.register(
+                name=name,
+                handler=lambda args, **kwargs: json.dumps({"ok": True}),
+                schema=_td(name, "fixture")["function"],
+                toolset="mcp-ringo_ie",
+            )
+        try:
+            result = assemble_tool_defs(
+                [_td(pinned), _td(deferred)],
+                context_length=200_000,
+                config=ToolSearchConfig.from_raw({
+                    "enabled": "on",
+                    "always_visible": [pinned],
+                }),
+            )
+        finally:
+            registry.deregister(pinned)
+            registry.deregister(deferred)
+
+        names = {td["function"]["name"] for td in result.tool_defs}
+        assert result.activated
+        assert pinned in names
+        assert deferred not in names
+        assert "tool_search" in names
     def test_auto_activates_for_production_scale_catalog(
         self,
         production_scale_mcp_catalog,
