@@ -3961,7 +3961,7 @@ def test_message_edit_preserves_history_time_and_order(tmp_path, monkeypatch):
     assert history["messages"][1]["edited_at"] == "2026-07-21T00:30:00+00:00"
 
 
-def test_bounded_query_falls_back_when_coverage_does_not_reach_requested_start(
+def test_fetch_history_returns_known_thread_when_coverage_is_incomplete(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -3983,21 +3983,58 @@ def test_bounded_query_falls_back_when_coverage_does_not_reach_requested_start(
         },
         "coverage-late-hash",
     )
-
-    result = store.query(
+    store.record_envelope(
         {
-            "operation": "fetch_history",
-            "start": "2026-07-21T00:00:00+00:00",
-            "end": "2026-07-21T01:00:00+00:00",
-            "allowed_source_ids": ["slack:T1:C1"],
-        }
+            "project_id": project_id,
+            "provider": "slack",
+            "workspace_id": "T1",
+            "delivery_id": "known-thread",
+            "sequence": 2,
+            "event_type": "events.batch",
+            "events": [
+                {
+                    "event_type": "message.created",
+                    "conversation_id": "C1",
+                    "message_id": "ROOT",
+                    "text": "known root",
+                    "occurred_at": "2026-07-21T00:40:00+00:00",
+                    "provider_version": "0001",
+                },
+                {
+                    "event_type": "message.created",
+                    "conversation_id": "C1",
+                    "message_id": "REPLY",
+                    "parent_message_id": "ROOT",
+                    "text": "known reply",
+                    "occurred_at": "2026-07-21T00:41:00+00:00",
+                    "provider_version": "0002",
+                },
+            ],
+        },
+        "known-thread-hash",
     )
 
-    assert result == {
+    request = {
+        "operation": "fetch_history",
+        "start": "2026-07-21T00:00:00+00:00",
+        "end": "2026-07-21T01:00:00+00:00",
+        "allowed_source_ids": ["slack:T1:C1"],
+        "parent_message_id": "ROOT",
+    }
+    strict = store.query(request)
+    result = store.query({**request, "allow_partial": True})
+
+    assert strict == {
         "messages": [],
         "coverage_complete": False,
         "reason": "coverage_incomplete",
     }
+    assert result["coverage_complete"] is False
+    assert result["reason"] == "coverage_incomplete"
+    assert [item["provider_message_id"] for item in result["messages"]] == [
+        "REPLY",
+        "ROOT",
+    ]
 
 
 def test_ingest_window_uses_stable_changed_at_cursor(tmp_path, monkeypatch):
