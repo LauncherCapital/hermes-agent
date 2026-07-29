@@ -66,6 +66,7 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["session_chat_streaming"] is True
     assert features["session_context_messages"] is True
     assert features["standard_session_messages"] is True
+    assert features["trusted_slack_turn_context"] is True
     assert features["session_fork"] is True
     assert features["admin_config_rw"] is False
     assert features["memory_write_api"] is False
@@ -431,6 +432,7 @@ async def test_chat_completions_session_syncs_explicit_context(
                     "model": "hermes-agent",
                     "messages": [{"role": "user", "content": "check the DB"}],
                     "context_messages": context_messages,
+                    "persist_user_message": "check the DB",
                     "persist_user_message_id": "slack:102.000",
                     "trusted_runtime_metadata": {
                         "project_id": "11111111-1111-1111-1111-111111111111",
@@ -441,6 +443,9 @@ async def test_chat_completions_session_syncs_explicit_context(
                         "user_id": "U1",
                         "principal_id": "",
                         "team_slug": "",
+                        "message_ts": "102.000",
+                        "thread_ts": "100.000",
+                        "reply_target_ts": "100.000",
                         "slack_caller_token": "signed-channel-context",
                         "caller_mode": "interactive",
                         "caller_capabilities": '["caller"]',
@@ -456,6 +461,7 @@ async def test_chat_completions_session_syncs_explicit_context(
 
     _, kwargs = mock_run.call_args
     assert kwargs["conversation_history"] == context_messages
+    assert kwargs["persist_user_message"] == "check the DB"
     assert kwargs["persist_user_message_id"] == "slack:102.000"
     assert kwargs["trusted_runtime_metadata"]["channel_id"] == "C1"
     assert (
@@ -466,6 +472,28 @@ async def test_chat_completions_session_syncs_explicit_context(
         kwargs["trusted_runtime_metadata"]["tool_policy_fingerprint"]
         == "policy-1"
     )
+    assert kwargs["trusted_runtime_metadata"]["reply_target_ts"] == "100.000"
+
+
+@pytest.mark.asyncio
+async def test_session_chat_rejects_invalid_persist_user_message(
+    adapter,
+    session_db,
+):
+    session_id = session_db.create_session("invalid-persist-message", "api_server")
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/chat",
+            json={
+                "message": "hello",
+                "persist_user_message": {"not": "text"},
+            },
+        )
+        payload = await resp.json()
+
+    assert resp.status == 400
+    assert payload["error"]["code"] == "invalid_persist_user_message"
 
 
 @pytest.mark.asyncio

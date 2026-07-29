@@ -438,6 +438,28 @@ def auth_adapter():
 
 class TestAgentExecution:
     @pytest.mark.asyncio
+    async def test_run_agent_forwards_clean_persisted_user_message(self, adapter):
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="synthetic provider prompt",
+                conversation_history=[],
+                session_id="session-123",
+                persist_user_message="actual Slack text",
+                persist_user_message_id="slack:123.456",
+            )
+
+        mock_agent.run_conversation.assert_called_once_with(
+            user_message="synthetic provider prompt",
+            conversation_history=[],
+            task_id="session-123",
+            persist_user_message="actual Slack text",
+            persist_user_message_id="slack:123.456",
+        )
+
+    @pytest.mark.asyncio
     async def test_run_agent_uses_session_id_as_task_id(self, adapter):
         mock_agent = MagicMock()
         mock_agent.run_conversation.return_value = {"final_response": "ok"}

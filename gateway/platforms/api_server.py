@@ -535,6 +535,28 @@ def _session_chat_persist_user_message_id(
     return message_id.strip(), None
 
 
+def _session_chat_persist_user_message(
+    body: Dict[str, Any],
+) -> tuple[Optional[str], Optional["web.Response"]]:
+    """Parse the clean user text that should be written to session history."""
+    message = body.get("persist_user_message")
+    if message is None:
+        return None, None
+    if (
+        not isinstance(message, str)
+        or len(message) > MAX_NORMALIZED_TEXT_LENGTH
+        or "\x00" in message
+    ):
+        return None, web.json_response(
+            _openai_error(
+                "persist_user_message is invalid",
+                code="invalid_persist_user_message",
+            ),
+            status=400,
+        )
+    return message, None
+
+
 def _session_chat_max_iterations(
     body: Dict[str, Any],
 ) -> tuple[Optional[int], Optional["web.Response"]]:
@@ -565,6 +587,9 @@ _TRUSTED_RUNTIME_FIELDS = {
     "user_id",
     "principal_id",
     "team_slug",
+    "message_ts",
+    "thread_ts",
+    "reply_target_ts",
     "slack_caller_token",
     "caller_mode",
     "caller_capabilities",
@@ -1957,6 +1982,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_streaming": True,
                 "session_context_messages": True,
                 "standard_session_messages": True,
+                "trusted_slack_turn_context": True,
                 "session_fork": True,
                 "plugin_actions": True,
                 "admin_config_rw": False,
@@ -2938,6 +2964,9 @@ class APIServerAdapter(BasePlatformAdapter):
         persist_user_message_id, err = _session_chat_persist_user_message_id(body)
         if err is not None:
             return err
+        persist_user_message, err = _session_chat_persist_user_message(body)
+        if err is not None:
+            return err
         max_iterations, err = _session_chat_max_iterations(body)
         if err is not None:
             return err
@@ -2959,6 +2988,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            persist_user_message=persist_user_message,
             persist_user_message_id=persist_user_message_id,
             trusted_runtime_metadata=trusted_runtime,
             max_iterations=max_iterations,
@@ -3016,6 +3046,9 @@ class APIServerAdapter(BasePlatformAdapter):
             if err is not None:
                 return err
         persist_user_message_id, err = _session_chat_persist_user_message_id(body)
+        if err is not None:
+            return err
+        persist_user_message, err = _session_chat_persist_user_message(body)
         if err is not None:
             return err
         max_iterations, err = _session_chat_max_iterations(body)
@@ -3088,6 +3121,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
+                    persist_user_message=persist_user_message,
                     persist_user_message_id=persist_user_message_id,
                     trusted_runtime_metadata=trusted_runtime,
                     max_iterations=max_iterations,
@@ -3192,6 +3226,11 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if message_id_err is not None:
             return message_id_err
+        persist_user_message, persist_message_err = (
+            _session_chat_persist_user_message(body)
+        )
+        if persist_message_err is not None:
+            return persist_message_err
         max_iterations, max_iterations_err = _session_chat_max_iterations(body)
         if max_iterations_err is not None:
             return max_iterations_err
@@ -3427,6 +3466,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                persist_user_message=persist_user_message,
                 persist_user_message_id=persist_user_message_id,
                 trusted_runtime_metadata=trusted_runtime,
                 max_iterations=max_iterations,
@@ -3449,6 +3489,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                persist_user_message=persist_user_message,
                 persist_user_message_id=persist_user_message_id,
                 trusted_runtime_metadata=trusted_runtime,
                 max_iterations=max_iterations,
@@ -3462,6 +3503,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "model",
                     "messages",
                     "context_messages",
+                    "persist_user_message",
                     "persist_user_message_id",
                     "max_iterations",
                     "tools",
@@ -5101,6 +5143,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        persist_user_message: Optional[str] = None,
         persist_user_message_id: Optional[str] = None,
         trusted_runtime_metadata: Optional[Dict[str, str]] = None,
         max_iterations: Optional[int] = None,
@@ -5169,6 +5212,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "conversation_history": conversation_history,
                 "task_id": effective_task_id,
             }
+            if persist_user_message is not None:
+                run_kwargs["persist_user_message"] = persist_user_message
             if persist_user_message_id is not None:
                 run_kwargs["persist_user_message_id"] = persist_user_message_id
             result = agent.run_conversation(

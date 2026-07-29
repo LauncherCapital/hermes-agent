@@ -28,6 +28,7 @@ def _register_tool(
     toolset: str,
     caller_token: bool,
     access: dict | None = None,
+    remote_tool: str | None = None,
 ) -> None:
     properties = {"value": {"type": "string"}}
     if caller_token:
@@ -45,7 +46,8 @@ def _register_tool(
             "mcp_hidden_arguments": (
                 ["caller_token"] if caller_token else []
             ),
-        } if access or caller_token else None,
+            "mcp_remote_tool": remote_tool or "",
+        } if access or caller_token or remote_tool else None,
     )
 
 
@@ -116,6 +118,68 @@ def test_injects_hidden_legacy_argument_not_visible_in_provider_schema():
         args={"value": "x"},
         trusted_runtime_metadata={"slack_caller_token": "trusted-token"},
     ) == {"value": "x", "caller_token": "trusted-token"}
+
+
+def test_injects_current_slack_destination_when_model_omits_it():
+    plugin = _load_plugin()
+    for remote_tool in ("send_message", "slack_upload_file"):
+        name = f"mcp_ringo_ie_{remote_tool}"
+        _register_tool(
+            name,
+            toolset="mcp-ringo_ie",
+            caller_token=False,
+            remote_tool=remote_tool,
+        )
+
+        assert plugin._transform_tool_args(
+            tool_name=name,
+            args={"value": "x"},
+            trusted_runtime_metadata={
+                "channel_id": "D_CURRENT",
+                "reply_target_ts": "123.456",
+            },
+        ) == {
+            "value": "x",
+            "channel": "D_CURRENT",
+            "thread_ts": "123.456",
+        }
+
+
+def test_explicit_slack_destination_is_never_overwritten_or_threaded():
+    plugin = _load_plugin()
+    name = "mcp_ringo_ie_send_message"
+    _register_tool(
+        name,
+        toolset="mcp-ringo_ie",
+        caller_token=False,
+        remote_tool="send_message",
+    )
+
+    assert plugin._transform_tool_args(
+        tool_name=name,
+        args={"channel": "C_OTHER", "value": "x"},
+        trusted_runtime_metadata={
+            "channel_id": "D_CURRENT",
+            "reply_target_ts": "123.456",
+        },
+    ) is None
+
+
+def test_missing_trusted_destination_fails_closed_without_forging_arguments():
+    plugin = _load_plugin()
+    name = "mcp_ringo_ie_slack_upload_file"
+    _register_tool(
+        name,
+        toolset="mcp-ringo_ie",
+        caller_token=False,
+        remote_tool="slack_upload_file",
+    )
+
+    assert plugin._transform_tool_args(
+        tool_name=name,
+        args={"filename": "report.md"},
+        trusted_runtime_metadata={},
+    ) is None
 
 
 def test_builds_out_of_band_meta_only_for_ringo_servers():

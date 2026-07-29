@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 _RINGO_CALLER_TOOLSETS = {"mcp-ringo_ie", "mcp-ringo_admin"}
 _RINGO_MCP_SERVERS = {"ringo_ie", "ringo_admin"}
+_CURRENT_SLACK_DESTINATION_TOOLS = {"send_message", "slack_upload_file"}
 
 
 def _transform_tool_args(
@@ -25,21 +26,36 @@ def _transform_tool_args(
     if registry.get_toolset_for_tool(tool_name) not in _RINGO_CALLER_TOOLSETS:
         return None
 
+    runtime = trusted_runtime_metadata or {}
     schema = registry.get_schema(tool_name) or {}
     properties = (schema.get("parameters") or {}).get("properties") or {}
     metadata = registry.get_metadata(tool_name)
     hidden_arguments = metadata.get("mcp_hidden_arguments") or ()
-    if (
-        "caller_token" not in properties
-        and "caller_token" not in hidden_arguments
-    ):
-        return None
-
     transformed = dict(args)
-    transformed["caller_token"] = str(
-        (trusted_runtime_metadata or {}).get("slack_caller_token") or ""
-    ).strip()
-    return transformed
+    changed = False
+
+    remote_tool = str(metadata.get("mcp_remote_tool") or "").strip()
+    if remote_tool in _CURRENT_SLACK_DESTINATION_TOOLS:
+        supplied_channel = str(transformed.get("channel") or "").strip()
+        current_channel = str(runtime.get("channel_id") or "").strip()
+        if not supplied_channel and current_channel:
+            transformed["channel"] = current_channel
+            changed = True
+            if not str(transformed.get("thread_ts") or "").strip():
+                reply_target = str(runtime.get("reply_target_ts") or "").strip()
+                if reply_target:
+                    transformed["thread_ts"] = reply_target
+
+    has_caller_token_argument = (
+        "caller_token" in properties
+        or "caller_token" in hidden_arguments
+    )
+    if has_caller_token_argument:
+        transformed["caller_token"] = str(
+            runtime.get("slack_caller_token") or ""
+        ).strip()
+        changed = True
+    return transformed if changed else None
 
 
 def _build_mcp_call_meta(
