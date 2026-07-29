@@ -3732,10 +3732,56 @@ def test_message_search_returns_partial_hits_when_coverage_is_incomplete(
 
     assert result["coverage_complete"] is False
     assert result["reason"] == "coverage_incomplete"
+    assert result["coverage_gap_conversation_ids"] == ["C1"]
     assert result["hits"][0]["message"]["provider_message_id"] == "1784869920.846569"
     assert {
         item["provider_message_id"] for item in result["hits"][0]["context"]
     } == {"1784869142.677289", "1784869920.846569"}
+
+
+def test_message_search_identifies_only_missing_conversations(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO coverage(project_id, provider, workspace_id, "
+            "conversation_id, contiguous_since, last_sequence, last_event_at, state) "
+            "VALUES (?, 'slack', 'T1', 'C1', '2026-07-20T00:00:00+00:00', "
+            "6673, '2026-07-28T00:00:00+00:00', 'COLLECTING')",
+            (project_id,),
+        )
+        conn.execute(
+            "INSERT INTO messages(project_id, provider, workspace_id, "
+            "conversation_id, provider_message_id, sender_id, text, "
+            "provider_payload_json, occurred_at, inserted_at, updated_at) "
+            "VALUES (?, 'slack', 'T1', 'C1', 'M1', 'U1', 'github issue 551', "
+            "'{}', '2026-07-24T04:59:02+00:00', "
+            "'2026-07-24T04:59:02+00:00', '2026-07-24T04:59:02+00:00')",
+            (project_id,),
+        )
+
+    result = store.query(
+        {
+            "operation": "search",
+            "query": "github 551",
+            "start": "2026-07-21T00:00:00+00:00",
+            "end": "2026-07-28T00:00:00+00:00",
+            "providers": ["slack"],
+            "workspace_ids": ["T1"],
+            "allowed_source_ids": ["slack:T1:C1", "slack:T1:C2"],
+            "limit": 10,
+        }
+    )
+
+    assert result["coverage_complete"] is False
+    assert result["reason"] == "coverage_missing"
+    assert result["coverage_gap_conversation_ids"] == ["C2"]
+    assert result["hits"][0]["message"]["conversation_id"] == "C1"
 
 
 def test_message_search_supports_unicode_scripts_without_language_dictionaries(

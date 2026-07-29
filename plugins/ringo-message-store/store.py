@@ -4314,6 +4314,7 @@ class MessageStore:
         with self._writer_lock, self._connect() as conn:
             coverage_complete = True
             coverage_reason: str | None = None
+            coverage_gap_conversation_ids: set[str] = set()
 
             def mark_incomplete(reason: str) -> None:
                 nonlocal coverage_complete, coverage_reason
@@ -4331,6 +4332,7 @@ class MessageStore:
                         "reason": "delivery_gap",
                     }
                 mark_incomplete("delivery_gap")
+                coverage_gap_conversation_ids.update(conversations)
             coverage_rows = []
             if operation != "fetch_snapshot":
                 coverage_sql = (
@@ -4356,6 +4358,12 @@ class MessageStore:
                     for row in coverage_rows
                 }
                 if allowed is not None and covered_sources != allowed:
+                    coverage_gap_conversation_ids.update(
+                        conversation_id
+                        for _provider, _workspace_id, conversation_id in (
+                            allowed - covered_sources
+                        )
+                    )
                     if operation != "search":
                         return {
                             "messages": [],
@@ -4366,6 +4374,9 @@ class MessageStore:
                 if allowed is None and conversations:
                     covered_ids = {item[2] for item in covered_sources}
                     if covered_ids != conversations:
+                        coverage_gap_conversation_ids.update(
+                            conversations - covered_ids
+                        )
                         if operation != "search":
                             return {
                                 "messages": [],
@@ -4374,6 +4385,7 @@ class MessageStore:
                             }
                         mark_incomplete("coverage_missing")
                 if not coverage_rows:
+                    coverage_gap_conversation_ids.update(conversations)
                     if operation != "search":
                         return {
                             "messages": [],
@@ -4387,6 +4399,13 @@ class MessageStore:
                     or str(row["contiguous_since"]) > start
                     for row in coverage_rows
                 ):
+                    coverage_gap_conversation_ids.update(
+                        str(row["conversation_id"])
+                        for row in coverage_rows
+                        if row["state"] != "COLLECTING"
+                        or not row["contiguous_since"]
+                        or str(row["contiguous_since"]) > start
+                    )
                     if operation != "search" and not allow_partial:
                         return {
                             "messages": [],
@@ -4509,6 +4528,10 @@ class MessageStore:
                     result["covered_since"] = max(floors)
                 if coverage_reason:
                     result["reason"] = coverage_reason
+                if not coverage_complete and coverage_gap_conversation_ids:
+                    result["coverage_gap_conversation_ids"] = sorted(
+                        coverage_gap_conversation_ids
+                    )
                 return result
             sql += " LIMIT ?"
             params.append(
