@@ -860,7 +860,7 @@ def test_file_index_processes_raw_file_outside_transaction_without_storing_token
             "text_content_embedding": [0.1, 0.2],
             "image_embedding": [0.1, 0.2],
             "caption_model": "vision-test",
-            "caption_prompt_version": "file-index-v1",
+            "caption_prompt_version": "file-index-v2-compact",
             "text_embedding_model": "embedding-test",
             "text_embedding_dimension": 2,
             "image_embedding_model": "caption-text:embedding-test",
@@ -1000,6 +1000,74 @@ def test_file_processing_deletes_transient_bytes_on_success_and_failure(
         "processing_status": "metadata_only",
         "last_error_code": "slack_file_info_failed",
     }
+
+
+def test_image_hash_reuse_requires_current_compact_caption(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    processing = sys.modules[module.MessageStore.apply_file_command.__globals__[
+        "process_slack_file"
+    ].__module__]
+
+    for index, (file_id, digest, prompt_version) in enumerate(
+        (
+            ("F-legacy", "legacy-sha", "file-index-v1"),
+            (
+                "F-compact",
+                "compact-sha",
+                processing.CAPTION_PROMPT_VERSION,
+            ),
+        ),
+        start=1,
+    ):
+        store.apply_file_command(
+            {
+                "project_id": project_id,
+                "store_generation": store.store_generation,
+                "provider": "slack",
+                "workspace_id": "T1",
+                "operation": "upsert_share",
+                "file_id": file_id,
+                "conversation_id": "C1",
+                "provider_message_id": f"M{index}",
+                "source_version": index,
+                "content_version": index,
+                "context_version": index,
+                "content_sha256": digest,
+                "file_name": f"{file_id}.png",
+                "mime_type": "image/png",
+                "processing_status": "indexed",
+                "caption_ocr": f"caption for {file_id}",
+                "caption_prompt_version": prompt_version,
+                "text_content_embedding": [0.1, 0.2],
+                "image_embedding": [0.1, 0.2],
+            }
+        )
+
+    assert (
+        store._derived_content_by_hash(
+            provider="slack",
+            workspace_id="T1",
+            file_id="F-new",
+            content_sha256="legacy-sha",
+            mime_type="image/png",
+        )
+        is None
+    )
+    reused = store._derived_content_by_hash(
+        provider="slack",
+        workspace_id="T1",
+        file_id="F-new",
+        content_sha256="compact-sha",
+        mime_type="image/png",
+    )
+    assert reused is not None
+    assert reused["caption_prompt_version"] == processing.CAPTION_PROMPT_VERSION
 
 
 def test_file_embedding_profile_truncates_to_managed_dimension(
@@ -1180,8 +1248,8 @@ def test_image_caption_neuters_async_client_destructor_before_analysis(
     def fake_neuter():
         calls.append("neuter")
 
-    async def fake_vision(_path, _prompt, _model):
-        calls.append("vision")
+    async def fake_vision(_path, prompt, _model, *, max_tokens):
+        calls.append(("vision", prompt, max_tokens))
         return json.dumps({"success": True, "analysis": "yellow profile icon"})
 
     monkeypatch.setattr(auxiliary_client, "neuter_async_httpx_del", fake_neuter)
@@ -1190,7 +1258,10 @@ def test_image_caption_neuters_async_client_destructor_before_analysis(
     result = processing._caption_image(tmp_path / "profile.png")
 
     assert result == ("yellow profile icon", "auxiliary-default")
-    assert calls == ["neuter", "vision"]
+    assert calls[0] == "neuter"
+    assert calls[1][0] == "vision"
+    assert "600 characters" in calls[1][1]
+    assert calls[1][2] == 256
 
 
 def test_image_inspection_neuters_async_client_destructor_before_analysis(
@@ -1227,8 +1298,8 @@ def test_image_inspection_neuters_async_client_destructor_before_analysis(
     def fake_neuter():
         calls.append("neuter")
 
-    async def fake_vision(_path, _prompt, _model):
-        calls.append("vision")
+    async def fake_vision(_path, prompt, _model, *, max_tokens):
+        calls.append(("vision", prompt, max_tokens))
         return json.dumps({"success": True, "analysis": "yellow profile icon"})
 
     monkeypatch.setattr(processing, "_download", fake_download)
@@ -1238,7 +1309,10 @@ def test_image_inspection_neuters_async_client_destructor_before_analysis(
     result = processing.inspect_slack_image("F1", "xoxb-secret", "profile")
 
     assert result == "yellow profile icon"
-    assert calls == ["neuter", "vision"]
+    assert calls[0] == "neuter"
+    assert calls[1][0] == "vision"
+    assert "500 characters" in calls[1][1]
+    assert calls[1][2] == 256
     assert not downloaded.exists()
 
 
@@ -1640,7 +1714,7 @@ def test_file_search_applies_acl_and_inspects_ranked_thread_files(
             "Screenshot 2026-05-15 at 11.00.31 AM.png",
             "C1",
             "링고 리브랜딩 프로필 사진 올립니다",
-            "yellow Ringo profile logo",
+            "yellow Ringo profile logo " + ("visual detail " * 50),
         ),
         (
             "F1",
@@ -1753,20 +1827,25 @@ def test_file_search_applies_acl_and_inspects_ranked_thread_files(
         )
         conn.commit()
 
+    request = {
+        "project_id": project_id,
+        "store_generation": store.store_generation,
+        "provider": "slack",
+        "workspace_id": "T1",
+        "query": "링고 리브랜딩 관련 프로필 사진 올린 거",
+        "allowed_source_ids": ["slack:T1:C1"],
+        "allowed_scope_revision": "scope-1",
+        "limit": 20,
+        "provider_access_token": "xoxb-transient",
+    }
+    unverified = store.search_file_index(request)
     result = store.search_file_index(
-        {
-            "project_id": project_id,
-            "store_generation": store.store_generation,
-            "provider": "slack",
-            "workspace_id": "T1",
-            "query": "링고 리브랜딩 관련 프로필 사진 올린 거",
-            "allowed_source_ids": ["slack:T1:C1"],
-            "allowed_scope_revision": "scope-1",
-            "limit": 20,
-            "provider_access_token": "xoxb-transient",
-        }
+        {**request, "visual_verification": True}
     )
 
+    assert unverified["inspected_image_count"] == 0
+    assert not any(item["image_inspected"] for item in unverified["files"])
+    assert len(unverified["files"][0]["description"]) == 600
     assert result["coverage_complete"] is True
     assert result["retrieve_count"] == 14
     assert result["rerank_count"] == 1

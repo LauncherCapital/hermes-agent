@@ -23,7 +23,8 @@ logger = logging.getLogger(__name__)
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 MAX_TEXT_CHARS = 100_000
 STALE_TEMP_SECONDS = 6 * 60 * 60
-CAPTION_PROMPT_VERSION = "file-index-v1"
+CAPTION_PROMPT_VERSION = "file-index-v2-compact"
+FILE_IMAGE_ANALYSIS_MAX_TOKENS = 256
 DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small"
 LEGACY_EMBEDDING_PROFILE = {
     "model": DEFAULT_EMBEDDING_MODEL,
@@ -199,11 +200,21 @@ def _caption_image(path: Path) -> tuple[str, str]:
     neuter_async_httpx_del()
     model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
     prompt = (
-        "Describe this workplace file precisely for search. Include all visible "
-        "text (OCR), names, product or project terms, logos, colors, layout, and "
-        "what the image is for. Return concise plain text only."
+        "Create a compact search caption for this workplace image. Preserve exact "
+        "distinctive text such as names, titles, product or project terms, dates, "
+        "IDs, and filenames. Summarize repeated navigation and generic UI labels "
+        "instead of transcribing everything. Mention the main visual subject, "
+        "logo, colors, layout, and purpose only when useful for finding the file. "
+        "Return plain text in at most five short sentences and 600 characters."
     )
-    raw = asyncio.run(vision_analyze_tool(str(path), prompt, model))
+    raw = asyncio.run(
+        vision_analyze_tool(
+            str(path),
+            prompt,
+            model,
+            max_tokens=FILE_IMAGE_ANALYSIS_MAX_TOKENS,
+        )
+    )
     try:
         result = json.loads(raw)
     except json.JSONDecodeError:
@@ -442,12 +453,21 @@ def inspect_slack_image(
         # Keep the user query out of the shared vision tool's debug/log surface.
         # The caller compares this fresh, generic inspection with the query.
         prompt = (
-            "Describe the visible workplace-search evidence in this image, "
-            "including OCR text, names, logos, colors, layout, and purpose. "
-            "Return concise plain text and do not speculate."
+            "Briefly verify the visible workplace-search evidence in this image. "
+            "Preserve exact distinctive text, names, dates, IDs, logos, colors, "
+            "layout, and purpose that help distinguish this file. Summarize "
+            "generic UI labels. Return plain text in at most four short sentences "
+            "and 500 characters; do not speculate."
         )
         model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-        raw = asyncio.run(vision_analyze_tool(str(path), prompt, model))
+        raw = asyncio.run(
+            vision_analyze_tool(
+                str(path),
+                prompt,
+                model,
+                max_tokens=FILE_IMAGE_ANALYSIS_MAX_TOKENS,
+            )
+        )
         try:
             result = json.loads(raw)
         except json.JSONDecodeError:

@@ -392,11 +392,19 @@ class TestVisionConfig:
                 return_value=mock_response,
             ) as mock_llm,
         ):
-            result = json.loads(await vision_analyze_tool(str(img), "describe this", "test/model"))
+            result = json.loads(
+                await vision_analyze_tool(
+                    str(img),
+                    "describe this",
+                    "test/model",
+                    max_tokens=256,
+                )
+            )
 
         assert result["success"] is True
         assert mock_llm.await_args.kwargs["temperature"] == 1.0
         assert mock_llm.await_args.kwargs["timeout"] == 77.0
+        assert mock_llm.await_args.kwargs["max_tokens"] == 256
 
     @pytest.mark.asyncio
     async def test_vision_defaults_temperature_when_config_omits_it(self, tmp_path):
