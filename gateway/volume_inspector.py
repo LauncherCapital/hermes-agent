@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import stat
+from collections import deque
 from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
@@ -201,12 +202,16 @@ def inspect_volume(
     nodes: list[dict[str, Any]] = []
     truncated = False
 
-    def visit(directory: Path, depth: int) -> None:
-        nonlocal truncated
+    pending: deque[tuple[Path, int]] = deque()
+    if root.is_dir():
+        pending.append((root, 1))
+
+    while pending:
+        directory, depth = pending.popleft()
         remaining = max_nodes - len(nodes)
         if remaining <= 0:
             truncated = True
-            return
+            break
         try:
             with os.scandir(directory) as scan:
                 entries = [
@@ -214,7 +219,7 @@ def inspect_volume(
                     for entry in islice(scan, remaining + 1)
                 ]
         except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
-            return
+            continue
         if len(entries) > remaining:
             truncated = True
             entries = entries[:remaining]
@@ -226,10 +231,8 @@ def inspect_volume(
                 is_dir = False
             return (not is_dir, path.name.casefold())
 
+        child_directories: list[Path] = []
         for entry in sorted(entries, key=sort_key):
-            if len(nodes) >= max_nodes:
-                truncated = True
-                return
             try:
                 metadata = entry.lstat()
                 relative = entry.relative_to(root).as_posix()
@@ -256,12 +259,11 @@ def inspect_volume(
             if depth >= max_depth:
                 truncated = True
                 continue
-            visit(entry, depth + 1)
-            if len(nodes) >= max_nodes:
-                return
+            child_directories.append(entry)
+        pending.extend((child, depth + 1) for child in child_directories)
 
-    if root.is_dir():
-        visit(root, 1)
+    if pending:
+        truncated = True
     return {
         "root": "HERMES_HOME",
         "nodes": nodes,

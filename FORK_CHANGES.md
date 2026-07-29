@@ -22,5 +22,6 @@ absorbed and update the base version above.
 | `ceb36aa7f` | **feat(admin)**: config live-sync — no-reboot reconfiguration from ie: keepalive tool-diff refresh + api_server MCP admin endpoints; /admin/config accepts `agent.reasoning_effort` and `mcp_servers` tools include/exclude |
 | `42a09a080` | **fix(resilience)**: one bad tool schema can't 400 the whole agent — schema sanitizer passes JSON-Schema data keywords (`dependentRequired`/`const`/`default`) through untouched; drop-and-retry on provider schema rejection |
 | `e39f7298d` | **fix(mcp)**: reconnect loop never permanently gives up; stable sessions reset the retry budget (remote MCP redeploys used to kill the connection for good until process restart) |
-| (this PR) | **feat(volume)**: let project-bound volume diagnostics preview safe text files while keeping credentials, tokens, databases, binary content, and symlinks locked |
+| `2140617bc` | **feat(volume)**: let project-bound volume diagnostics preview safe text files while keeping credentials, tokens, databases, binary content, and symlinks locked |
+| (this PR) | **fix(volume)**: inspect breadth-first so large nested directories cannot consume the node budget before root-level databases and sibling files are listed |
 | (this commit) | **chore(fork)**: map suho@launcher.capital in AUTHOR_MAP + this catalog |
