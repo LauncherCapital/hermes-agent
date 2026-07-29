@@ -165,6 +165,122 @@ def test_explicit_slack_destination_is_never_overwritten_or_threaded():
     ) is None
 
 
+def test_injects_current_conversation_for_history_without_forcing_thread():
+    plugin = _load_plugin()
+    for remote_tool, argument in (
+        ("slack_fetch_history", "channel"),
+        ("message_fetch_history", "conversation_id"),
+    ):
+        name = f"mcp_ringo_ie_{remote_tool}"
+        _register_tool(
+            name,
+            toolset="mcp-ringo_ie",
+            caller_token=False,
+            remote_tool=remote_tool,
+        )
+
+        assert plugin._transform_tool_args(
+            tool_name=name,
+            args={},
+            trusted_runtime_metadata={
+                "channel_id": "D_CURRENT",
+                "reply_target_ts": "123.456",
+            },
+        ) == {argument: "D_CURRENT"}
+
+
+def test_watch_injects_current_channel_but_never_current_dm():
+    plugin = _load_plugin()
+    name = "mcp_ringo_ie_slack_watch_channel"
+    _register_tool(
+        name,
+        toolset="mcp-ringo_ie",
+        caller_token=False,
+        remote_tool="slack_watch_channel",
+    )
+
+    assert plugin._transform_tool_args(
+        tool_name=name,
+        args={},
+        trusted_runtime_metadata={
+            "channel_id": "C_CURRENT",
+            "channel_type": "channel",
+        },
+    ) == {"channel_id": "C_CURRENT"}
+    assert plugin._transform_tool_args(
+        tool_name=name,
+        args={},
+        trusted_runtime_metadata={
+            "channel_id": "D_CURRENT",
+            "channel_type": "im",
+        },
+    ) is None
+
+
+def test_nudge_injects_current_conversation_and_reply_target():
+    plugin = _load_plugin()
+    name = "mcp_ringo_ie_nudge_create"
+    _register_tool(
+        name,
+        toolset="mcp-ringo_ie",
+        caller_token=False,
+        remote_tool="nudge_create",
+    )
+
+    assert plugin._transform_tool_args(
+        tool_name=name,
+        args={"name": "follow up"},
+        trusted_runtime_metadata={
+            "channel_id": "D_CURRENT",
+            "reply_target_ts": "123.456",
+        },
+    ) == {
+        "name": "follow up",
+        "channel": "D_CURRENT",
+        "thread_ts": "123.456",
+    }
+
+
+def test_explicit_other_nudge_channel_does_not_inherit_current_thread():
+    plugin = _load_plugin()
+    name = "mcp_ringo_ie_nudge_create_explicit"
+    _register_tool(
+        name,
+        toolset="mcp-ringo_ie",
+        caller_token=False,
+        remote_tool="nudge_create",
+    )
+
+    assert plugin._transform_tool_args(
+        tool_name=name,
+        args={"channel": "C_OTHER"},
+        trusted_runtime_metadata={
+            "channel_id": "D_CURRENT",
+            "reply_target_ts": "123.456",
+        },
+    ) is None
+
+
+def test_person_nudge_does_not_inherit_current_conversation():
+    plugin = _load_plugin()
+    name = "mcp_ringo_ie_nudge_create_person"
+    _register_tool(
+        name,
+        toolset="mcp-ringo_ie",
+        caller_token=False,
+        remote_tool="nudge_create",
+    )
+
+    assert plugin._transform_tool_args(
+        tool_name=name,
+        args={"target": "slack:U_OTHER"},
+        trusted_runtime_metadata={
+            "channel_id": "D_CURRENT",
+            "reply_target_ts": "123.456",
+        },
+    ) is None
+
+
 def test_missing_trusted_destination_fails_closed_without_forging_arguments():
     plugin = _load_plugin()
     name = "mcp_ringo_ie_slack_upload_file"
