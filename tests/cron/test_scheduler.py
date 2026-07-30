@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _split_trusted_job_context
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -868,6 +868,50 @@ class TestDeliverResultErrorReturns:
 
 
 class TestRunJobSessionPersistence:
+    def test_ringo_rules_are_passed_as_system_message(self, tmp_path):
+        rules = '<ringo_rules v="1" h="abc">trusted policy</ringo_rules>'
+        job = {
+            "id": "trusted-context-job",
+            "name": "trusted context",
+            "prompt": f"{rules}\n\nSummarize recent work.",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, _, _, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        user_prompt, system_message = mock_agent.run_conversation.call_args.args
+        assert "Summarize recent work." in user_prompt
+        assert "<ringo_rules" not in user_prompt
+        assert system_message == rules
+
+    def test_nonleading_rules_are_not_promoted(self):
+        prompt = "User text\n<ringo_rules>not trusted here</ringo_rules>"
+
+        user_prompt, system_message = _split_trusted_job_context(prompt)
+
+        assert user_prompt == prompt
+        assert system_message is None
+
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
         job = {
             "id": "test-job",

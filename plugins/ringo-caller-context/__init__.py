@@ -166,6 +166,8 @@ def _filter_tool_names(
             continue
         if access.get("caller") == "required" and "caller" not in capabilities:
             continue
+        if access.get("caller") == "forbidden" and "caller" in capabilities:
+            continue
         modes = access.get("modes")
         if isinstance(modes, list) and modes and mode not in modes:
             continue
