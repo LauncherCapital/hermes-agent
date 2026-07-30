@@ -3784,6 +3784,149 @@ def test_message_search_identifies_only_missing_conversations(
     assert result["hits"][0]["message"]["conversation_id"] == "C1"
 
 
+def test_message_search_retrieves_channel_author_id_and_file_metadata(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO conversations(project_id, provider, workspace_id, "
+            "conversation_id, title, updated_at) VALUES (?, 'slack', 'T1', "
+            "'C012ABC', 'mirai-release', '2026-07-28T00:00:00+00:00')",
+            (project_id,),
+        )
+        conn.execute(
+            "INSERT INTO identities(project_id, provider, workspace_id, "
+            "external_user_id, display_name, updated_at) VALUES (?, 'slack', "
+            "'T1', 'U012ABC', 'Suho Seok', '2026-07-28T00:00:00+00:00')",
+            (project_id,),
+        )
+        conn.execute(
+            "INSERT INTO coverage(project_id, provider, workspace_id, "
+            "conversation_id, contiguous_since, last_sequence, last_event_at, state) "
+            "VALUES (?, 'slack', 'T1', 'C012ABC', "
+            "'2026-07-20T00:00:00+00:00', 1, "
+            "'2026-07-28T00:00:00+00:00', 'COLLECTING')",
+            (project_id,),
+        )
+        occurred_at = "2026-07-27T00:00:00+00:00"
+        conn.execute(
+            "INSERT INTO messages(project_id, provider, workspace_id, "
+            "conversation_id, provider_message_id, sender_id, text, "
+            "provider_payload_json, occurred_at, inserted_at, updated_at) "
+            "VALUES (?, 'slack', 'T1', 'C012ABC', 'M1', 'U012ABC', "
+            "'ordinary update', ?, ?, ?, ?)",
+            (
+                project_id,
+                json.dumps(
+                    {
+                        "files": [
+                            {
+                                "id": "F012ABC",
+                                "name": "roadmap-final.pdf",
+                                "title": "Launch roadmap",
+                            }
+                        ]
+                    }
+                ),
+                occurred_at,
+                occurred_at,
+                occurred_at,
+            ),
+        )
+
+    request = {
+        "operation": "search",
+        "start": "2026-07-20T00:00:00+00:00",
+        "end": "2026-07-28T00:00:00+00:00",
+        "providers": ["slack"],
+        "workspace_ids": ["T1"],
+        "allowed_source_ids": ["slack:T1:C012ABC"],
+        "limit": 3,
+    }
+    for query in (
+        "mirai-release",
+        "Suho Seok",
+        "C012ABC",
+        "U012ABC",
+        "roadmap-final.pdf",
+        "F012ABC",
+    ):
+        result = store.query({**request, "query": query})
+        assert result["hits"], query
+        assert result["hits"][0]["message"]["provider_message_id"] == "M1"
+
+
+def test_message_search_fuses_candidate_lanes_with_rrf(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    with store._connect() as conn:
+        for channel_id, title in (
+            ("C_TEXT", "general"),
+            ("C_META", "fusionterm"),
+        ):
+            conn.execute(
+                "INSERT INTO conversations(project_id, provider, workspace_id, "
+                "conversation_id, title, updated_at) VALUES (?, 'slack', 'T1', "
+                "?, ?, '2026-07-28T00:00:00+00:00')",
+                (project_id, channel_id, title),
+            )
+        for channel_id, message_id, text, occurred_at in (
+            (
+                "C_TEXT",
+                "M_TEXT",
+                "fusionterm",
+                "2026-07-27T00:00:00+00:00",
+            ),
+            (
+                "C_META",
+                "M_META",
+                "ordinary update",
+                "2026-07-27T01:00:00+00:00",
+            ),
+        ):
+            conn.execute(
+                "INSERT INTO messages(project_id, provider, workspace_id, "
+                "conversation_id, provider_message_id, sender_id, text, "
+                "provider_payload_json, occurred_at, inserted_at, updated_at) "
+                "VALUES (?, 'slack', 'T1', ?, ?, 'U1', ?, '{}', ?, ?, ?)",
+                (
+                    project_id,
+                    channel_id,
+                    message_id,
+                    text,
+                    occurred_at,
+                    occurred_at,
+                    occurred_at,
+                ),
+            )
+        rowids = {
+            row["provider_message_id"]: int(row["rowid"])
+            for row in conn.execute(
+                "SELECT rowid, provider_message_id FROM messages"
+            ).fetchall()
+        }
+        candidates = store._message_search_candidate_rowids(
+            conn,
+            query="fusionterm",
+            start="2026-07-20T00:00:00+00:00",
+            end="2026-07-28T00:00:00+00:00",
+            providers={"slack"},
+            workspaces={"T1"},
+            conversations={"C_TEXT", "C_META"},
+            allowed=None,
+        )
+
+    assert candidates.index(rowids["M_TEXT"]) < candidates.index(rowids["M_META"])
+
+
 def test_message_search_supports_unicode_scripts_without_language_dictionaries(
     tmp_path, monkeypatch
 ):
