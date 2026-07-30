@@ -15,6 +15,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -44,6 +45,19 @@ from hermes_cli.config import load_config, _expand_env_vars
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+
+_TRUSTED_JOB_CONTEXT_RE = re.compile(
+    r"\A(?P<context><ringo_rules\b[^>]*>.*?</ringo_rules>)\s*",
+    re.DOTALL,
+)
+
+
+def _split_trusted_job_context(prompt: str) -> tuple[str, str | None]:
+    """Separate the host-baked cron policy from the model-visible user task."""
+    match = _TRUSTED_JOB_CONTEXT_RE.match(prompt or "")
+    if match is None:
+        return prompt, None
+    return (prompt[match.end() :].lstrip(), match.group("context"))
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -1524,8 +1538,12 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
             return True, silent_doc, SILENT_MARKER, None
 
+    job_prompt, trusted_job_context = _split_trusted_job_context(
+        str(job.get("prompt") or "")
+    )
+    prompt_job = {**job, "prompt": job_prompt}
     try:
-        prompt = _build_job_prompt(job, prerun_script=prerun_script)
+        prompt = _build_job_prompt(prompt_job, prerun_script=prerun_script)
     except CronPromptInjectionBlocked as block_exc:
         # Assembled prompt (user prompt + loaded skill content) tripped the
         # injection scanner. Refuse to run the agent this tick and surface
@@ -1853,7 +1871,19 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        if trusted_job_context:
+            _cron_future = _cron_pool.submit(
+                _cron_context.run,
+                agent.run_conversation,
+                prompt,
+                trusted_job_context,
+            )
+        else:
+            _cron_future = _cron_pool.submit(
+                _cron_context.run,
+                agent.run_conversation,
+                prompt,
+            )
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:

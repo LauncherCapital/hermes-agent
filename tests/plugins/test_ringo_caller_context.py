@@ -324,6 +324,7 @@ def test_filters_ringo_tools_by_caller_mode_and_capability():
     public = "mcp_ringo_ie_public"
     profile = "mcp_ringo_ie_profile_get"
     admin = "mcp_ringo_admin_admin_credit_usage"
+    system_only = "mcp_ringo_ie_nudge_list"
     other = "mcp_github_search"
     _register_tool(public, toolset="mcp-ringo_ie", caller_token=False)
     _register_tool(
@@ -348,18 +349,28 @@ def test_filters_ringo_tools_by_caller_mode_and_capability():
         },
     )
     _register_tool(other, toolset="mcp-github", caller_token=False)
+    _register_tool(
+        system_only,
+        toolset="mcp-ringo_ie",
+        caller_token=False,
+        access={
+            "version": 1,
+            "caller": "forbidden",
+            "modes": ["scheduled", "system"],
+        },
+    )
 
     scheduled = plugin._filter_tool_names(
-        tool_names=(public, profile, admin, other),
+        tool_names=(public, profile, admin, system_only, other),
         trusted_runtime_metadata={
             "caller_mode": "scheduled",
             "caller_capabilities": "[]",
         },
     )
-    assert set(scheduled) == {public, other}
+    assert set(scheduled) == {public, system_only, other}
 
     member = plugin._filter_tool_names(
-        tool_names=(public, profile, admin, other),
+        tool_names=(public, profile, admin, system_only, other),
         trusted_runtime_metadata={
             "caller_mode": "interactive",
             "caller_capabilities": '["caller"]',
@@ -368,7 +379,7 @@ def test_filters_ringo_tools_by_caller_mode_and_capability():
     assert set(member) == {public, profile, other}
 
     admin_member = plugin._filter_tool_names(
-        tool_names=(public, profile, admin, other),
+        tool_names=(public, profile, admin, system_only, other),
         trusted_runtime_metadata={
             "caller_mode": "interactive",
             "caller_capabilities": (
