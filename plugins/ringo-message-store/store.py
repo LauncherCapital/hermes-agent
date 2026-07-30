@@ -4362,7 +4362,8 @@ class MessageStore:
         ):
             raise ValueError("fetch_history requires one authorized conversation")
         allow_partial = (
-            operation == "fetch_history" and request.get("allow_partial") is True
+            operation in {"fetch_history", "recent_activity"}
+            and request.get("allow_partial") is True
         )
         snapshot_keys: set[tuple[str, str]] = set()
         if operation == "fetch_snapshot":
@@ -4403,7 +4404,7 @@ class MessageStore:
                 "SELECT 1 FROM delivery_gaps WHERE repaired_at IS NULL LIMIT 1"
             ).fetchone()
             if unresolved_gap is not None:
-                if operation != "search":
+                if operation != "search" and not allow_partial:
                     return {
                         "messages": [],
                         "coverage_complete": False,
@@ -4442,7 +4443,7 @@ class MessageStore:
                             allowed - covered_sources
                         )
                     )
-                    if operation != "search":
+                    if operation != "search" and not allow_partial:
                         return {
                             "messages": [],
                             "coverage_complete": False,
@@ -4455,7 +4456,7 @@ class MessageStore:
                         coverage_gap_conversation_ids.update(
                             conversations - covered_ids
                         )
-                        if operation != "search":
+                        if operation != "search" and not allow_partial:
                             return {
                                 "messages": [],
                                 "coverage_complete": False,
@@ -4464,7 +4465,7 @@ class MessageStore:
                         mark_incomplete("coverage_missing")
                 if not coverage_rows:
                     coverage_gap_conversation_ids.update(conversations)
-                    if operation != "search":
+                    if operation != "search" and not allow_partial:
                         return {
                             "messages": [],
                             "coverage_complete": False,
