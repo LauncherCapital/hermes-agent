@@ -86,6 +86,10 @@ MESSAGE_SEARCH_MAX_ROWS_PER_ROOT = 100
 MESSAGE_SEARCH_MIN_FEATURE_COVERAGE = 0.30
 MESSAGE_SEARCH_MIN_SEGMENT_COVERAGE = 0.50
 MESSAGE_SEARCH_MAX_QUERY_TERMS = 96
+MESSAGE_SEARCH_RRF_K = 60
+MESSAGE_SEARCH_FTS_LANE_WEIGHT = 1.0
+MESSAGE_SEARCH_TRIGRAM_LANE_WEIGHT = 0.7
+MESSAGE_SEARCH_METADATA_LANE_WEIGHT = 0.6
 
 
 def _search_words(text: str) -> list[str]:
@@ -97,12 +101,25 @@ def _search_features(text: str) -> Counter[str]:
 
 
 def _row_search_text(row: Any) -> str:
+    try:
+        provider_payload = json.loads(row["provider_payload_json"] or "{}")
+    except json.JSONDecodeError:
+        provider_payload = {}
+    file_text = " ".join(
+        str(file.get(field) or "")
+        for file in provider_payload.get("files") or []
+        if isinstance(file, dict)
+        for field in ("id", "name", "title", "mimetype")
+    )
     return " ".join(
         value
         for value in (
             str(row["text"] or ""),
             str(row["conversation_title"] or ""),
             str(row["sender_display_name"] or ""),
+            str(row["conversation_id"] or ""),
+            str(row["sender_id"] or ""),
+            file_text,
         )
         if value
     )
@@ -4077,7 +4094,14 @@ class MessageStore:
         segments = search_segments(query)
         ranked: dict[int, float] = {}
 
-        def collect_fts(table: str, match_query: str) -> None:
+        def collect_rows(rows: list[Any], weight: float) -> None:
+            for position, row in enumerate(rows, start=1):
+                rowid = int(row["message_rowid"])
+                ranked[rowid] = ranked.get(rowid, 0.0) + (
+                    weight / (MESSAGE_SEARCH_RRF_K + position)
+                )
+
+        def collect_fts(table: str, match_query: str, weight: float) -> None:
             if not match_query:
                 return
             sql = (
@@ -4099,23 +4123,74 @@ class MessageStore:
             )
             sql += f" ORDER BY bm25({table}), m.occurred_at DESC LIMIT ?"
             params.append(MESSAGE_SEARCH_CANDIDATE_LIMIT)
-            for row in conn.execute(sql, params).fetchall():
-                rowid = int(row["message_rowid"])
-                rank = float(row["search_rank"] or 0.0)
-                ranked[rowid] = min(ranked.get(rowid, rank), rank)
+            collect_rows(conn.execute(sql, params).fetchall(), weight)
 
         collect_fts(
             "message_search_fts",
             self._message_search_match_query(
                 [*segments, *search_index_terms(query)]
             ),
+            MESSAGE_SEARCH_FTS_LANE_WEIGHT,
         )
         collect_fts(
             "message_search_trigram",
             self._message_search_match_query(
                 [segment for segment in segments if len(segment) >= 3]
             ),
+            MESSAGE_SEARCH_TRIGRAM_LANE_WEIGHT,
         )
+
+        metadata_segments = list(dict.fromkeys(segments))[
+            :MESSAGE_SEARCH_MAX_QUERY_TERMS
+        ]
+        if metadata_segments:
+            metadata_clauses = []
+            metadata_params: list[Any] = []
+            for segment in metadata_segments:
+                metadata_clauses.append(
+                    "(instr(ringo_search_normalize(COALESCE(c.title, '')), ?) > 0 "
+                    "OR instr(ringo_search_normalize("
+                    "COALESCE(i.display_name, '')), ?) > 0 "
+                    "OR instr(ringo_search_normalize(m.conversation_id), ?) > 0 "
+                    "OR instr(ringo_search_normalize(COALESCE(m.sender_id, '')), ?) > 0 "
+                    "OR instr(ringo_search_normalize("
+                    "COALESCE(m.provider_payload_json, '')), ?) > 0)"
+                )
+                metadata_params.extend([segment] * 5)
+            sql = (
+                "SELECT DISTINCT m.rowid AS message_rowid FROM messages m "
+                "LEFT JOIN conversations c ON c.project_id=m.project_id AND "
+                "c.provider=m.provider AND c.workspace_id=m.workspace_id AND "
+                "c.conversation_id=m.conversation_id "
+                "LEFT JOIN identities i ON i.project_id=m.project_id AND "
+                "i.provider=m.provider AND i.workspace_id=m.workspace_id AND "
+                "i.external_user_id=m.sender_id "
+                "WHERE m.project_id=? AND m.occurred_at>=? AND m.occurred_at<=? "
+                "AND m.deleted_at IS NULL AND ("
+                + " OR ".join(metadata_clauses)
+                + ")"
+            )
+            params = [
+                self.project_id,
+                start,
+                end,
+                *metadata_params,
+            ]
+            sql, params = self._query_filters(
+                sql,
+                params,
+                providers=providers,
+                workspaces=workspaces,
+                conversations=conversations,
+                prefix="m.",
+                allowed=allowed,
+            )
+            sql += " ORDER BY m.occurred_at DESC LIMIT ?"
+            params.append(MESSAGE_SEARCH_CANDIDATE_LIMIT)
+            collect_rows(
+                conn.execute(sql, params).fetchall(),
+                MESSAGE_SEARCH_METADATA_LANE_WEIGHT,
+            )
 
         # Single-character substring search cannot be represented by either
         # trigrams or the language-neutral bigram terms.
@@ -4145,14 +4220,17 @@ class MessageStore:
             )
             sql += " ORDER BY m.occurred_at DESC LIMIT ?"
             params.append(MESSAGE_SEARCH_CANDIDATE_LIMIT)
-            for row in conn.execute(sql, params).fetchall():
-                ranked.setdefault(int(row["message_rowid"]), 1_000.0)
+            collect_rows(
+                conn.execute(sql, params).fetchall(),
+                MESSAGE_SEARCH_FTS_LANE_WEIGHT,
+            )
 
         return [
             rowid
             for rowid, _rank in sorted(
                 ranked.items(),
                 key=lambda item: (item[1], item[0]),
+                reverse=True,
             )[:MESSAGE_SEARCH_CANDIDATE_LIMIT]
         ]
 
