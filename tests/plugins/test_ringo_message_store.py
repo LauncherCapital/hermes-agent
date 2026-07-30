@@ -3739,6 +3739,54 @@ def test_message_search_returns_partial_hits_when_coverage_is_incomplete(
     } == {"1784869142.677289", "1784869920.846569"}
 
 
+def test_recent_activity_partial_mode_returns_candidates_when_coverage_is_incomplete(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    project_id = str(uuid.uuid4())
+    write_project_marker(project_id)
+    _manager, module = _load_service()
+    store = module.MessageStore(project_id)
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO coverage(project_id, provider, workspace_id, "
+            "conversation_id, contiguous_since, last_sequence, last_event_at, state) "
+            "VALUES (?, 'slack', 'T1', 'C1', NULL, 6673, "
+            "'2026-07-28T00:00:00+00:00', 'COLLECTING')",
+            (project_id,),
+        )
+        conn.execute(
+            "INSERT INTO messages(project_id, provider, workspace_id, "
+            "conversation_id, provider_message_id, sender_id, text, "
+            "provider_payload_json, occurred_at, inserted_at, updated_at) "
+            "VALUES (?, 'slack', 'T1', 'C1', 'M1', 'U1', 'recent update', "
+            "'{}', '2026-07-27T04:59:02+00:00', "
+            "'2026-07-27T04:59:02+00:00', '2026-07-27T04:59:02+00:00')",
+            (project_id,),
+        )
+
+    request = {
+        "operation": "recent_activity",
+        "start": "2026-07-27T00:00:00+00:00",
+        "end": "2026-07-28T00:00:00+00:00",
+        "providers": ["slack"],
+        "workspace_ids": ["T1"],
+        "allowed_source_ids": ["slack:T1:C1"],
+        "limit": 10,
+        "per_conversation": 1,
+    }
+    strict = store.query(request)
+    partial = store.query({**request, "allow_partial": True})
+
+    assert strict["coverage_complete"] is False
+    assert strict["messages"] == []
+    assert partial["coverage_complete"] is False
+    assert partial["reason"] == "coverage_incomplete"
+    assert [item["provider_message_id"] for item in partial["messages"]] == [
+        "M1"
+    ]
+
+
 def test_message_search_identifies_only_missing_conversations(
     tmp_path, monkeypatch
 ):
