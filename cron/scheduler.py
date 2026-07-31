@@ -711,6 +711,22 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
+def _cron_usage(agent) -> dict:
+    """Return the same canonical usage shape as the session chat API."""
+    return {
+        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+        "cache_read_tokens": getattr(agent, "session_cache_read_tokens", 0) or 0,
+        "cache_write_tokens": getattr(agent, "session_cache_write_tokens", 0) or 0,
+        "reasoning_tokens": getattr(agent, "session_reasoning_tokens", 0) or 0,
+        "estimated_cost_usd": getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0,
+        "cost_status": getattr(agent, "session_cost_status", "unknown") or "unknown",
+        "cost_source": getattr(agent, "session_cost_source", "none") or "none",
+        "api_call_count": getattr(agent, "session_api_calls", 0) or 0,
+    }
+
+
 def _push_completion_to_ie(job_id: str, output_summary: Optional[str] = None) -> None:
     """Best-effort: PUSH a finished cron run to ie so it need not poll /api/jobs.
 
@@ -739,6 +755,7 @@ def _push_completion_to_ie(job_id: str, output_summary: Optional[str] = None) ->
         "last_delivery_error": job.get("last_delivery_error"),
         "schedule_display": job.get("schedule_display"),
         "model": job.get("model"),
+        "usage": job.get("last_usage"),
     }
     if output_summary and output_summary.strip():
         payload["output_summary"] = output_summary.strip()[:2000]
@@ -1381,6 +1398,18 @@ def _scan_assembled_cron_prompt(assembled: str, job: dict, *, has_skills: bool =
 
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """Execute a single cron job, applying any per-job profile override."""
+    job["_runtime_usage"] = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "estimated_cost_usd": 0.0,
+        "cost_status": "unknown",
+        "cost_source": "none",
+        "api_call_count": 0,
+    }
     job_id = job["id"]
     with _job_profile_context(job_id, job.get("profile")):
         return _run_job_impl(job)
@@ -2041,6 +2070,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # until it hits EMFILE (#10200 / "too many open files").
         try:
             if agent is not None:
+                job["_runtime_usage"] = _cron_usage(agent)
                 agent.close()
         except (Exception, KeyboardInterrupt) as e:
             logger.debug("Job '%s': failed to close agent resources: %s", job_id, e)
@@ -2168,13 +2198,21 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     success = False
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                usage = job.pop("_runtime_usage", None)
+                mark_kwargs = {"delivery_error": delivery_error}
+                if usage is not None:
+                    mark_kwargs["usage"] = usage
+                mark_job_run(job["id"], success, error, **mark_kwargs)
                 _push_completion_to_ie(job["id"], output_summary=final_response if success else None)
                 return True
 
             except Exception as e:
                 logger.error("Error processing job %s: %s", job['id'], e)
-                mark_job_run(job["id"], False, str(e))
+                usage = job.pop("_runtime_usage", None)
+                if usage is None:
+                    mark_job_run(job["id"], False, str(e))
+                else:
+                    mark_job_run(job["id"], False, str(e), usage=usage)
                 _push_completion_to_ie(job["id"])
                 return False
 
