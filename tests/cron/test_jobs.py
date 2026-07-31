@@ -481,6 +481,19 @@ class TestMarkJobRun:
         assert updated["last_error"] is None
         assert updated["last_delivery_error"] == "platform 'telegram' not configured"
 
+    def test_usage_is_persisted_for_completion_push_and_backstop(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        usage = {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+            "api_call_count": 2,
+        }
+
+        mark_job_run(job["id"], success=True, usage=usage)
+
+        assert get_job(job["id"])["last_usage"] == usage
+
     def test_delivery_error_cleared_on_success(self, tmp_cron_dir):
         """Successful delivery clears the previous delivery error."""
         job = create_job(prompt="Report", schedule="every 1h")

@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -2477,6 +2478,61 @@ class TestParallelTick:
         end_s1 = [t for action, jid, t in call_times if action == "end" and jid == "s1"][0]
         start_s2 = [t for action, jid, t in call_times if action == "start" and jid == "s2"][0]
         assert start_s2 >= end_s1, "Jobs ran concurrently despite max_parallel=1"
+
+
+class TestCronUsage:
+    def test_usage_matches_session_chat_contract(self):
+        from cron.scheduler import _cron_usage
+
+        agent = SimpleNamespace(
+            session_prompt_tokens=100,
+            session_completion_tokens=20,
+            session_total_tokens=120,
+            session_cache_read_tokens=30,
+            session_cache_write_tokens=4,
+            session_reasoning_tokens=8,
+            session_estimated_cost_usd=0.012,
+            session_cost_status="estimated",
+            session_cost_source="model_table",
+            session_api_calls=3,
+        )
+
+        assert _cron_usage(agent) == {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+            "cache_read_tokens": 30,
+            "cache_write_tokens": 4,
+            "reasoning_tokens": 8,
+            "estimated_cost_usd": 0.012,
+            "cost_status": "estimated",
+            "cost_source": "model_table",
+            "api_call_count": 3,
+        }
+
+    def test_completion_push_includes_persisted_usage(self, monkeypatch):
+        from cron.scheduler import _push_completion_to_ie
+
+        usage = {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120}
+        job = {
+            "id": "job-1",
+            "name": "Reminder",
+            "last_run_at": "2026-07-31T06:00:00+00:00",
+            "last_status": "ok",
+            "last_usage": usage,
+        }
+        response = MagicMock(status_code=200)
+        monkeypatch.setenv(
+            "RINGO_IE_TASK_WEBHOOK_URL",
+            "https://ie.test/api/hermes/task-completed",
+        )
+        monkeypatch.setenv("RINGO_IE_MCP_KEY", "secret")
+
+        with patch("cron.scheduler.get_job", return_value=job), \
+             patch("httpx.post", return_value=response) as post:
+            _push_completion_to_ie("job-1")
+
+        assert post.call_args.kwargs["json"]["usage"] == usage
 
 
 class TestDeliverResultTimeoutCancelsFuture:

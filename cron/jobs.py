@@ -697,6 +697,7 @@ def create_job(
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
+        "last_usage": None,
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
@@ -908,7 +909,8 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 usage: Optional[Dict[str, Any]] = None):
     """
     Mark a job as having been run.
     
@@ -917,6 +919,9 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+    ``usage`` is the canonical token/cost summary for this run. Persisting it
+    lets both the immediate completion push and ie's polling backstop report
+    the same usage.
     """
     with _jobs_file_lock:
         jobs = load_jobs()
@@ -928,6 +933,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                job["last_usage"] = usage
                 
                 # Increment completed count
                 if job.get("repeat"):
