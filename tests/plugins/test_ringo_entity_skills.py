@@ -109,6 +109,8 @@ def test_registered_channel_skill_tools_expose_no_identity_arguments():
     assert set(tools) == {
         "channel_skill_search",
         "channel_skill_read",
+        "entity_skill_create",
+        "entity_skill_patch",
         "team_skill_bind",
     }
     assert set(tools["channel_skill_search"]["schema"]["parameters"]["properties"]) == {
@@ -117,6 +119,12 @@ def test_registered_channel_skill_tools_expose_no_identity_arguments():
     assert set(tools["channel_skill_read"]["schema"]["parameters"]["properties"]) == {
         "channel_id"
     }
+    assert set(
+        tools["entity_skill_create"]["schema"]["parameters"]["properties"]
+    ) == {"entity_ref", "content"}
+    assert set(
+        tools["entity_skill_patch"]["schema"]["parameters"]["properties"]
+    ) == {"entity_ref", "old_string", "new_string", "replace_all"}
 
 
 def test_prepare_binds_only_exact_runtime_entities(tmp_path):
@@ -137,6 +145,9 @@ def test_prepare_binds_only_exact_runtime_entities(tmp_path):
         ("channels", "C2"),
     }
     assert all(item["path"].endswith("/SKILL.md") for item in result["entities"])
+    assert [item["ref"] for item in result["entities"]] == [
+        f"e{index}" for index in range(1, len(result["entities"]) + 1)
+    ]
     assert all(item["exists"] is False for item in result["entities"])
     assert not any(path.exists() for path in map(
         lambda item: Path(item["path"]),
@@ -323,6 +334,47 @@ def test_missing_channel_bootstrap_unlocks_tools_after_exact_initial_write(
     assert result["status"] == "applied"
 
 
+def test_entity_ref_contract_bootstraps_the_bound_channel(tmp_path):
+    service_mod = _load_service_module()
+    service = _service(service_mod, tmp_path)
+    prepared = service.prepare(
+        request=_request(
+            user_id="",
+            include_organization=False,
+            public_channel_ids=["C1"],
+            bootstrap=True,
+            tool_contract="entity_refs_v1",
+        )
+    )
+    channel = prepared["entities"][0]
+
+    created = service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="entity_skill_create",
+        args={
+            "entity_ref": channel["ref"],
+            "content": (
+                "---\nname: channel-C1\n---\n\n"
+                "Observed state has not yet been established.\n"
+            ),
+        },
+    )
+    result = service.finish(
+        request={
+            "project_id": PROJECT_ID,
+            "payload": {
+                "session_id": SESSION_ID,
+                "turn_id": TURN_ID,
+                "success": True,
+                "require_change": True,
+            },
+        }
+    )
+
+    assert created["action"] == "handled"
+    assert result["status"] == "applied"
+
+
 def test_bound_review_can_only_read_or_edit_exact_skill_files(tmp_path):
     service_mod = _load_service_module()
     service = _service(service_mod, tmp_path)
@@ -406,6 +458,84 @@ def test_existing_skill_is_patch_only_and_mutates_once_per_review(tmp_path):
     )
     assert duplicate["action"] == "block"
     assert "one successful mutation" in duplicate["message"]
+
+
+def test_entity_ref_contract_blocks_file_tools_and_creates_without_a_path(
+    tmp_path,
+):
+    service_mod = _load_service_module()
+    service = _service(service_mod, tmp_path)
+    prepared = service.prepare(
+        request=_request(tool_contract="entity_refs_v1")
+    )
+    user = next(
+        item for item in prepared["entities"] if item["kind"] == "users"
+    )
+
+    blocked = service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="read_file",
+        args={"path": user["path"]},
+    )
+    assert blocked["action"] == "block"
+    assert "opaque-reference" in blocked["message"]
+
+    created = service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="entity_skill_create",
+        args={
+            "entity_ref": user["ref"],
+            "content": (
+                "---\nname: current speaker\n---\n\n"
+                "The user prefers to be addressed as Suho.\n"
+            ),
+        },
+    )
+
+    assert created["action"] == "handled"
+    result = json.loads(created["result"])
+    assert result["entity_ref"] == user["ref"]
+    assert "path" not in result
+    assert created["redact_args"] is True
+    content = service._document(PROJECT_ID, "users", "U1")
+    assert content is not None
+    assert "slack_id: U1" in content
+
+
+def test_entity_ref_contract_patches_existing_skill_once(tmp_path):
+    service_mod = _load_service_module()
+    service = _service(service_mod, tmp_path)
+    user_file = tmp_path / "skills/users/U1/SKILL.md"
+    _skill(user_file, "The user prefers concise Korean responses.")
+    prepared = service.prepare(
+        request=_request(tool_contract="entity_refs_v1")
+    )
+    user = next(
+        item for item in prepared["entities"] if item["kind"] == "users"
+    )
+
+    patched = service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="entity_skill_patch",
+        args={
+            "entity_ref": user["ref"],
+            "old_string": "concise Korean responses",
+            "new_string": "concise Korean responses and the name Suho",
+        },
+    )
+    invalid_ref = service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="entity_skill_patch",
+        args={
+            "entity_ref": "e999",
+            "old_string": "Suho",
+            "new_string": "Sooho",
+        },
+    )
+
+    assert patched["action"] == "handled"
+    assert invalid_ref["action"] == "block"
+    assert "outside this review" in invalid_ref["message"]
 
 
 def test_new_skill_rejects_placeholder_and_requires_canonical_identity(tmp_path):
@@ -576,6 +706,45 @@ def test_team_proposal_binds_new_skill_and_persists_memberships(tmp_path):
     }
 
 
+def test_entity_ref_contract_binds_and_creates_a_team_without_a_path(tmp_path):
+    service_mod = _load_service_module()
+    service = _service(service_mod, tmp_path)
+    service.prepare(
+        request=_request(
+            tool_contract="entity_refs_v1",
+            team_proposal_enabled=True,
+            allowed_team_member_ids=["U1", "U2"],
+        )
+    )
+
+    bound = service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="team_skill_bind",
+        args={
+            "team_slug": "launcher-platform",
+            "display_name": "Launcher Platform",
+            "member_ids": ["U1", "U2"],
+        },
+    )
+    result = json.loads(bound["result"])
+
+    assert result["entity_ref"].startswith("e")
+    assert "path" not in result
+    created = service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="entity_skill_create",
+        args={
+            "entity_ref": result["entity_ref"],
+            "content": (
+                "---\nteam_slug: launcher-platform\n"
+                "name: Launcher Platform\n---\n\n"
+                "This team maintains the Launcher platform.\n"
+            ),
+        },
+    )
+    assert created["action"] == "handled"
+
+
 def test_unbound_turn_cannot_scan_another_user_skill(tmp_path):
     service_mod = _load_service_module()
     service = _service(service_mod, tmp_path)
@@ -585,6 +754,11 @@ def test_unbound_turn_cannot_scan_another_user_skill(tmp_path):
         args={"path": tmp_path / "skills/users/U2/SKILL.md"},
     )
     assert blocked["action"] == "block"
+    assert service.authorize_tool(
+        session_id="ordinary-session",
+        tool_name="entity_skill_create",
+        args={"entity_ref": "e1", "content": "not authorized"},
+    )["action"] == "block"
 
 
 def test_pre_llm_loads_only_current_ids_and_language(tmp_path):
