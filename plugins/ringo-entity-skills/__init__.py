@@ -58,13 +58,84 @@ def register(ctx) -> None:
     ctx.register_hook("post_tool_call", _post_tool_call)
     ctx.register_hook("health_report", _health_report)
     ctx.register_tool(
+        name="entity_skill_create",
+        toolset="ringo_entity_skills",
+        schema={
+            "description": (
+                "Create one missing canonical entity skill bound to an opaque "
+                "reference in the current authorized review."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entity_ref": {
+                        "type": "string",
+                        "description": (
+                            "Opaque entity reference supplied by the review."
+                        ),
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": (
+                            "Complete SKILL.md content for the missing entity."
+                        ),
+                    },
+                },
+                "required": ["entity_ref", "content"],
+                "additionalProperties": False,
+            },
+        },
+        handler=_fail_closed_tool,
+        description="Create one bound canonical entity skill.",
+        emoji="✍️",
+    )
+    ctx.register_tool(
+        name="entity_skill_patch",
+        toolset="ringo_entity_skills",
+        schema={
+            "description": (
+                "Replace exact text in one existing canonical entity skill "
+                "bound to an opaque reference in the authorized review."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entity_ref": {
+                        "type": "string",
+                        "description": (
+                            "Opaque entity reference supplied by the review."
+                        ),
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact existing text to replace.",
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Replacement text.",
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every exact match when true.",
+                        "default": False,
+                    },
+                },
+                "required": ["entity_ref", "old_string", "new_string"],
+                "additionalProperties": False,
+            },
+        },
+        handler=_fail_closed_tool,
+        description="Patch one bound canonical entity skill.",
+        emoji="🩹",
+    )
+    ctx.register_tool(
         name="team_skill_bind",
         toolset="ringo_entity_skills",
         schema={
             "description": (
                 "Propose one AI-named durable team from explicit public group "
                 "and membership evidence. The server verifies members and "
-                "binds a new canonical team path."
+                "binds a new canonical team reference."
             ),
             "parameters": {
                 "type": "object",
@@ -88,7 +159,7 @@ def register(ctx) -> None:
             },
         },
         handler=_fail_closed_tool,
-        description="Bind one verified AI-named team skill path.",
+        description="Bind one verified AI-named team skill reference.",
         emoji="👥",
     )
     ctx.register_tool(

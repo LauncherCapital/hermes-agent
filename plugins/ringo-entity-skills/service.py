@@ -26,6 +26,7 @@ MAX_CHANNEL_INDEX_BYTES = 6_000
 MAX_CHANNEL_SEARCH_RESULTS = 5
 MAX_CHANNEL_SUMMARY_CHARS = 400
 ENTITY_KINDS = ("users", "channels", "teams", "organizations")
+ENTITY_REF_TOOL_CONTRACT = "entity_refs_v1"
 _COMPONENT = re.compile(r"^[A-Za-z0-9._%-]{1,128}$")
 _TEAM_SLUG = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 _LANGUAGE = re.compile(
@@ -406,6 +407,24 @@ class EntitySkillService:
                     "patch would remove too much existing durable context"
                 )
 
+    @staticmethod
+    def _bind_document_identity(
+        *,
+        kind: str,
+        entity_id: str,
+        content: str,
+    ) -> str:
+        if not content.startswith("---\n") or "\n---" not in content[4:]:
+            return content
+        identities = {
+            _frontmatter_value(content, key)
+            for key in _IDENTITY_KEYS[kind]
+        }
+        if entity_id in identities or any(identities):
+            return content
+        canonical_key = _IDENTITY_KEYS[kind][0]
+        return f"---\n{canonical_key}: {entity_id}\n{content[4:]}"
+
     def _migrate_one(
         self,
         *,
@@ -752,6 +771,9 @@ class EntitySkillService:
             or len(allowed_team_member_ids) > 20
         ):
             raise EntitySkillError("invalid allowed_team_member_ids")
+        tool_contract = str(payload.get("tool_contract") or "")
+        if tool_contract not in {"", ENTITY_REF_TOOL_CONTRACT}:
+            raise EntitySkillError("unsupported entity skill tool contract")
         self._encrypt_plaintext_context(
             project_id=project_id,
             workspace_id=workspace_id,
@@ -803,8 +825,12 @@ class EntitySkillService:
             for item in entities
         }
         entities = [
-            {**item, "exists": baseline[item["path"]] is not None}
-            for item in entities
+            {
+                **item,
+                "ref": f"e{index}",
+                "exists": baseline[item["path"]] is not None,
+            }
+            for index, item in enumerate(entities, start=1)
         ]
         required_initial_write_paths = [
             item["path"]
@@ -860,6 +886,7 @@ class EntitySkillService:
                 "workspace_id": workspace_id,
                 "principal_id": principal_id,
                 "slack_user_id": slack_user_id,
+                "tool_contract": tool_contract,
                 "team_proposal_enabled": (
                     payload.get("team_proposal_enabled") is True
                     and bool(user_id)
@@ -1516,16 +1543,28 @@ class EntitySkillService:
                     "team_slug already exists; it can only be edited from a bound member turn"
                 )
             live["team_proposal"] = proposal
+            entity_ref = f'e{len(live["entities"]) + 1}'
             live["entities"].append(
                 {
                     "kind": "teams",
                     "id": team_slug,
                     "path": str(path),
+                    "ref": entity_ref,
                     "exists": False,
                 }
             )
             live["baseline"][str(path)] = None
             self._save(manifest)
+        if binding.get("tool_contract") == ENTITY_REF_TOOL_CONTRACT:
+            return {
+                "ok": True,
+                "entity_ref": entity_ref,
+                "required_frontmatter": f"team_slug: {team_slug}",
+                "message": (
+                    "Team entity bound. Create it once with "
+                    "entity_skill_create, then finish [SILENT]."
+                ),
+            }
         return {
             "ok": True,
             "path": str(path),
@@ -1575,6 +1614,18 @@ class EntitySkillService:
             binding = manifest["bindings"].get(str(session_id or ""))
 
         if not isinstance(binding, dict):
+            if name in {
+                "entity_skill_create",
+                "entity_skill_patch",
+                "team_skill_bind",
+            }:
+                return {
+                    "action": "block",
+                    "message": (
+                        "Entity skill tools require an authorized review "
+                        "session."
+                    ),
+                }
             if path is not None and self._under_entity_root(path):
                 return {
                     "action": "block",
@@ -1594,46 +1645,101 @@ class EntitySkillService:
                     "message": f"Team proposal denied: {exc}",
                 }
             return self._handled_tool_result(result)
-        if name not in {"read_file", "write_file", "patch"}:
-            return {
-                "action": "block",
-                "message": "Entity review sessions only support bound SKILL.md tools.",
-            }
-        if path is None:
-            return {
-                "action": "block",
-                "message": "An exact bound entity SKILL.md path is required.",
-            }
-        entity = next(
-            (
-                item
-                for item in binding.get("entities") or []
-                if isinstance(item, dict)
-                and Path(str(item.get("path") or "")).resolve() == path
-            ),
-            None,
-        )
-        if entity is None:
-            return {
-                "action": "block",
-                "message": "Tool path is outside this review's bound entities.",
-            }
+        ref_contract = binding.get("tool_contract") == ENTITY_REF_TOOL_CONTRACT
+        entity_ref = ""
+        if ref_contract:
+            if name not in {"entity_skill_create", "entity_skill_patch"}:
+                return {
+                    "action": "block",
+                    "message": (
+                        "This entity review only supports opaque-reference "
+                        "entity skill tools."
+                    ),
+                }
+            entity_ref = str(arguments.get("entity_ref") or "")
+            entity = next(
+                (
+                    item
+                    for item in binding.get("entities") or []
+                    if isinstance(item, dict) and item.get("ref") == entity_ref
+                ),
+                None,
+            )
+            if entity is None:
+                return {
+                    "action": "block",
+                    "message": (
+                        "Entity reference is outside this review's binding."
+                    ),
+                }
+            path = Path(str(entity.get("path") or "")).resolve()
+            operation = (
+                "create" if name == "entity_skill_create" else "patch"
+            )
+        else:
+            if name not in {"read_file", "write_file", "patch"}:
+                return {
+                    "action": "block",
+                    "message": (
+                        "Entity review sessions only support bound SKILL.md "
+                        "tools."
+                    ),
+                }
+            if path is None:
+                return {
+                    "action": "block",
+                    "message": "An exact bound entity SKILL.md path is required.",
+                }
+            entity = next(
+                (
+                    item
+                    for item in binding.get("entities") or []
+                    if isinstance(item, dict)
+                    and Path(str(item.get("path") or "")).resolve() == path
+                ),
+                None,
+            )
+            if entity is None:
+                return {
+                    "action": "block",
+                    "message": (
+                        "Tool path is outside this review's bound entities."
+                    ),
+                }
+            operation = {
+                "read_file": "read",
+                "write_file": "create",
+                "patch": "patch",
+            }[name]
         pending_initial_writes = _pending_initial_write_paths(binding)
         if pending_initial_writes and (
-            name != "write_file" or str(path) not in pending_initial_writes
+            operation != "create" or str(path) not in pending_initial_writes
         ):
             return {
                 "action": "block",
                 "message": (
-                    "Initial channel bootstrap requires write_file for the "
-                    "missing exact channel SKILL.md before other tools."
+                    (
+                        "Initial channel bootstrap requires creating the missing "
+                        "bound channel SKILL.md before other tools."
+                    )
+                    if ref_contract
+                    else (
+                        "Initial channel bootstrap requires write_file for the "
+                        "missing exact channel SKILL.md before other tools."
+                    )
                 ),
             }
         pending_team_writes = _pending_team_write_paths(binding)
-        if str(path) in pending_team_writes and name != "write_file":
+        if str(path) in pending_team_writes and operation != "create":
             return {
                 "action": "block",
-                "message": "A newly bound team requires one exact write_file call.",
+                "message": (
+                    "A newly bound team requires one create call."
+                    if ref_contract
+                    else (
+                        "A newly bound team requires one exact write_file call."
+                    )
+                ),
             }
         try:
             if entity["kind"] == "channels":
@@ -1646,9 +1752,9 @@ class EntitySkillService:
                     principal_id=binding.get("principal_id", ""),
                     slack_user_id=binding.get("slack_user_id", ""),
                     session_id=str(session_id or ""),
-                    operation="read" if name == "read_file" else "write",
+                    operation="read" if operation == "read" else "write",
                 )
-            if name == "read_file":
+            if operation == "read":
                 return {
                     "action": "handled",
                     "result": json.dumps(
@@ -1667,7 +1773,7 @@ class EntitySkillService:
                 entity["kind"],
                 entity["id"],
             )
-            if name == "write_file":
+            if operation == "create":
                 if current is not None:
                     raise EntitySkillError(
                         "existing entity SKILL.md must be changed with patch"
@@ -1675,9 +1781,20 @@ class EntitySkillService:
                 content = arguments.get("content")
                 if not isinstance(content, str):
                     raise EntitySkillError("entity SKILL.md content is required")
-                updated = content
+                updated = (
+                    self._bind_document_identity(
+                        kind=entity["kind"],
+                        entity_id=entity["id"],
+                        content=content,
+                    )
+                    if ref_contract
+                    else content
+                )
             else:
-                if arguments.get("mode", "replace") != "replace":
+                if (
+                    not ref_contract
+                    and arguments.get("mode", "replace") != "replace"
+                ):
                     raise EntitySkillError("entity patch mode must be replace")
                 old = arguments.get("old_string")
                 new = arguments.get("new_string")
@@ -1751,19 +1868,16 @@ class EntitySkillService:
                 "message": f"Entity SKILL.md operation denied: {exc}",
             }
         self._health["status"] = "editing"
-        return {
-            "action": "handled",
-            "result": json.dumps(
-                {
-                    "ok": True,
-                    "message": (
-                        "Encrypted entity SKILL.md updated. Do not edit this "
-                        "path again in this review; finish [SILENT]."
-                    ),
-                }
+        result = {
+            "ok": True,
+            "message": (
+                "Encrypted entity SKILL.md updated. Do not edit this entity "
+                "again in this review; finish [SILENT]."
             ),
-            "redact_args": True,
         }
+        if ref_contract:
+            result["entity_ref"] = entity_ref
+        return self._handled_tool_result(result)
 
     def observe_tool(self, **_: object) -> None:
         return None
