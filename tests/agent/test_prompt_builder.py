@@ -792,6 +792,12 @@ class TestPromptBuilderConstants:
         assert "api_server" in PLATFORM_HINTS
         assert "webui" in PLATFORM_HINTS
 
+    def test_cron_hint_defers_to_job_delivery_guidance(self):
+        hint = PLATFORM_HINTS["cron"]
+
+        assert "job-specific delivery guidance" in hint
+        assert "automatically delivered" not in hint
+
     def test_cli_hint_does_not_suggest_media_tags(self):
         # Regression: MEDIA:/path tags are intercepted only by messaging
         # gateway platforms. On the CLI they render as literal text and
