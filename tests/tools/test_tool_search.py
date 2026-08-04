@@ -780,6 +780,35 @@ class TestRegression_ToolsetScoping:
         hit_names = {m["name"] for m in parsed["matches"]}
         assert "scoped_oos_plugin" not in hit_names
 
+    def test_request_scoped_direct_tool_bypasses_deferral_only_for_that_request(
+        self, monkeypatch
+    ):
+        import model_tools
+        from tools.tool_search import ToolSearchConfig
+
+        self._register("entity_skill_patch", "ringo_entity_skills")
+        self._register("other_entity_tool", "ringo_entity_skills")
+        monkeypatch.setattr(
+            "tools.tool_search.load_config",
+            lambda: ToolSearchConfig.from_raw({"enabled": "on"}),
+        )
+
+        direct = model_tools.get_tool_definitions(
+            enabled_toolsets=["ringo_entity_skills"],
+            quiet_mode=True,
+            direct_tool_names=["entity_skill_patch"],
+        )
+        ordinary = model_tools.get_tool_definitions(
+            enabled_toolsets=["ringo_entity_skills"],
+            quiet_mode=True,
+        )
+
+        direct_names = {item["function"]["name"] for item in direct}
+        ordinary_names = {item["function"]["name"] for item in ordinary}
+        assert "entity_skill_patch" in direct_names
+        assert "other_entity_tool" not in direct_names
+        assert "entity_skill_patch" not in ordinary_names
+
     def test_disabled_toolset_stays_out_of_deferred_catalog(self):
         import model_tools
 

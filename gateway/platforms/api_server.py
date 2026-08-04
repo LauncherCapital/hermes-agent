@@ -594,7 +594,38 @@ _TRUSTED_RUNTIME_FIELDS = {
     "caller_mode",
     "caller_capabilities",
     "tool_policy_fingerprint",
+    "direct_tool_names",
 }
+
+_DIRECT_TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$")
+_MAX_DIRECT_TOOL_NAMES = 16
+
+
+def _direct_tool_names(metadata: Optional[Dict[str, str]]) -> list[str]:
+    """Parse bounded request-scoped visibility hints from trusted metadata.
+
+    These names never add tools to an enabled toolset and never bypass tool
+    authorization; they only prevent already-enabled schemas from being
+    deferred behind progressive tool search for this request.
+    """
+    raw = (metadata or {}).get("direct_tool_names")
+    if not raw:
+        return []
+    try:
+        names = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if (
+        not isinstance(names, list)
+        or not names
+        or len(names) > _MAX_DIRECT_TOOL_NAMES
+        or any(
+            not isinstance(name, str) or not _DIRECT_TOOL_NAME_RE.fullmatch(name)
+            for name in names
+        )
+    ):
+        return []
+    return sorted(set(names))
 
 
 def _trusted_runtime_metadata(
@@ -627,6 +658,22 @@ def _trusted_runtime_metadata(
             ),
             status=400,
         )
+    if "direct_tool_names" in value:
+        try:
+            supplied_direct_names = json.loads(value["direct_tool_names"])
+        except (TypeError, json.JSONDecodeError):
+            supplied_direct_names = None
+        if (
+            not isinstance(supplied_direct_names, list)
+            or not _direct_tool_names(value)
+        ):
+            return None, web.json_response(
+                _openai_error(
+                    "trusted_runtime_metadata is invalid",
+                    code="invalid_runtime_metadata",
+                ),
+                status=400,
+            )
     return {
         key: value[key]
         for key in _TRUSTED_RUNTIME_FIELDS
@@ -5219,9 +5266,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 else None
             )
             try:
+                import model_tools
                 from hermes_cli.plugins import filter_tool_definitions
 
-                base_tools = list(agent.tools or [])
+                direct_tools = _direct_tool_names(agent._trusted_runtime_metadata)
+                base_tools = (
+                    model_tools.get_tool_definitions(
+                        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        quiet_mode=True,
+                        direct_tool_names=direct_tools,
+                    )
+                    if direct_tools
+                    else list(agent.tools or [])
+                )
                 agent.tools = filter_tool_definitions(
                     base_tools,
                     trusted_runtime_metadata=agent._trusted_runtime_metadata,
@@ -5231,10 +5289,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 }
                 runtime = agent._trusted_runtime_metadata or {}
                 logger.info(
-                    "[api_server] tool exposure policy=%s mode=%s "
+                    "[api_server] tool exposure policy=%s mode=%s direct=%d "
                     "total=%d visible=%d hidden=%d",
                     str(runtime.get("tool_policy_fingerprint") or "legacy"),
                     str(runtime.get("caller_mode") or "legacy"),
+                    len(direct_tools),
                     len(base_tools),
                     len(agent.tools),
                     len(base_tools) - len(agent.tools),
