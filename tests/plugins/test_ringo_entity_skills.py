@@ -72,8 +72,19 @@ def _service(service_mod, tmp_path):
 def _skill(path: Path, body: str, *, language: str = "") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     language_line = f"language_preference: {language}\n" if language else ""
+    kind = path.parents[1].name
+    identity_key = {
+        "users": "slack_id",
+        "channels": "channel_id",
+        "teams": "team_slug",
+        "organizations": "workspace_id",
+    }[kind]
+    entity_id = path.parent.name
     path.write_text(
-        f"---\nname: context\n{language_line}---\n\n{body}\n",
+        (
+            f"---\nname: context\n{identity_key}: {entity_id}\n"
+            f"{language_line}---\n\n{body}\n"
+        ),
         encoding="utf-8",
     )
 
@@ -95,7 +106,11 @@ def test_registered_channel_skill_tools_expose_no_identity_arguments():
 
     plugin.register(Context())
 
-    assert set(tools) == {"channel_skill_search", "channel_skill_read"}
+    assert set(tools) == {
+        "channel_skill_search",
+        "channel_skill_read",
+        "team_skill_bind",
+    }
     assert set(tools["channel_skill_search"]["schema"]["parameters"]["properties"]) == {
         "query"
     }
@@ -281,7 +296,10 @@ def test_missing_channel_bootstrap_unlocks_tools_after_exact_initial_write(
         tool_name="write_file",
         args={
             "path": channel_path,
-            "content": "---\nname: channel-C1\n---\n\nObserved state.\n",
+            "content": (
+                "---\nname: channel-C1\nchannel_id: C1\n---\n\n"
+                "Observed state has not yet been established.\n"
+            ),
         },
     )
     assert written["action"] == "handled"
@@ -323,7 +341,13 @@ def test_bound_review_can_only_read_or_edit_exact_skill_files(tmp_path):
     assert service.authorize_tool(
         session_id=SESSION_ID,
         tool_name="write_file",
-        args={"path": user_path, "content": "durable"},
+        args={
+            "path": user_path,
+            "content": (
+                "---\nname: user-U1\nslack_id: U1\n---\n\n"
+                "The user's durable preferences are not established yet.\n"
+            ),
+        },
     )["action"] == "handled"
     blocked = service.authorize_tool(
         session_id=SESSION_ID,
@@ -336,6 +360,220 @@ def test_bound_review_can_only_read_or_edit_exact_skill_files(tmp_path):
         tool_name="terminal",
         args={},
     )["action"] == "block"
+
+
+def test_existing_skill_is_patch_only_and_mutates_once_per_review(tmp_path):
+    service_mod = _load_service_module()
+    service = _service(service_mod, tmp_path)
+    user_file = tmp_path / "skills/users/U1/SKILL.md"
+    _skill(user_file, "The user prefers concise Korean responses.")
+    prepared = service.prepare(request=_request())
+    user_path = next(
+        item["path"]
+        for item in prepared["entities"]
+        if item["kind"] == "users"
+    )
+
+    overwrite = service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="write_file",
+        args={
+            "path": user_path,
+            "content": "---\nslack_id: U1\n---\n\nplaceholder\n",
+        },
+    )
+    assert overwrite["action"] == "block"
+    assert "must be changed with patch" in overwrite["message"]
+
+    patched = service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="patch",
+        args={
+            "path": user_path,
+            "old_string": "concise Korean responses",
+            "new_string": "concise Korean responses and the name Suho",
+        },
+    )
+    assert patched["action"] == "handled"
+    duplicate = service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="patch",
+        args={
+            "path": user_path,
+            "old_string": "the name Suho",
+            "new_string": "the preferred name Suho",
+        },
+    )
+    assert duplicate["action"] == "block"
+    assert "one successful mutation" in duplicate["message"]
+
+
+def test_new_skill_rejects_placeholder_and_requires_canonical_identity(tmp_path):
+    service_mod = _load_service_module()
+    service = _service(service_mod, tmp_path)
+    prepared = service.prepare(request=_request())
+    user_path = next(
+        item["path"]
+        for item in prepared["entities"]
+        if item["kind"] == "users"
+    )
+
+    placeholder = service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="write_file",
+        args={"path": user_path, "content": "placeholder"},
+    )
+    assert placeholder["action"] == "block"
+    assert "frontmatter" in placeholder["message"]
+
+    wrong_identity = service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="write_file",
+        args={
+            "path": user_path,
+            "content": (
+                "---\nslack_id: U2\n---\n\n"
+                "This is a substantive but incorrectly bound user document.\n"
+            ),
+        },
+    )
+    assert wrong_identity["action"] == "block"
+    assert "slack_id: U1" in wrong_identity["message"]
+
+
+def test_patch_rejects_a_duplicated_substantive_block(tmp_path):
+    service_mod = _load_service_module()
+    service = _service(service_mod, tmp_path)
+    paragraph = (
+        "The quality meeting uses one durable checklist for every release, "
+        "and the owner records the final decision in the public channel."
+    )
+    user_file = tmp_path / "skills/users/U1/SKILL.md"
+    _skill(user_file, paragraph)
+    prepared = service.prepare(request=_request())
+    user_path = next(
+        item["path"]
+        for item in prepared["entities"]
+        if item["kind"] == "users"
+    )
+
+    duplicated = service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="patch",
+        args={
+            "path": user_path,
+            "old_string": paragraph,
+            "new_string": f"{paragraph}\n\n{paragraph}",
+        },
+    )
+
+    assert duplicated["action"] == "block"
+    assert "duplicated substantive block" in duplicated["message"]
+
+
+def test_team_proposal_binds_new_skill_and_persists_memberships(tmp_path):
+    service_mod = _load_service_module()
+    service = _service(service_mod, tmp_path)
+    service.prepare(
+        request=_request(
+            team_proposal_enabled=True,
+            allowed_team_member_ids=["U1", "U2"],
+        )
+    )
+
+    bound = service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="team_skill_bind",
+        args={
+            "team_slug": "launcher-platform",
+            "display_name": "Launcher Platform",
+            "member_ids": ["U1", "U2"],
+        },
+    )
+    assert bound["action"] == "handled"
+    team_path = json.loads(bound["result"])["path"]
+    written = service.authorize_tool(
+        session_id=SESSION_ID,
+        tool_name="write_file",
+        args={
+            "path": team_path,
+            "content": (
+                "---\nteam_slug: launcher-platform\n"
+                "name: Launcher Platform\n---\n\n"
+                "This team maintains the Launcher platform.\n"
+            ),
+        },
+    )
+    assert written["action"] == "handled"
+    team_result = service.finish(
+        request={
+            "project_id": PROJECT_ID,
+            "payload": {
+                "session_id": SESSION_ID,
+                "turn_id": TURN_ID,
+                "success": True,
+            },
+        }
+    )
+    assert team_result["status"] == "applied"
+    assert team_result["changed_entities"] == [
+        {"kind": "teams", "id": "launcher-platform"}
+    ]
+
+    context = service.context(
+        request={
+            "project_id": PROJECT_ID,
+            "payload": {
+                "agent_id": AGENT_ID,
+                "workspace_id": "T1",
+                "user_id": "U2",
+                "session_id": "team-member-context",
+            },
+        }
+    )
+    assert any(
+        item["kind"] == "teams"
+        and item["id"] == "launcher-platform"
+        and "maintains the Launcher platform" in item["content"]
+        for item in context["documents"]
+    )
+
+    dm_turn = "44444444-4444-4444-4444-444444444444"
+    dm_prepared = service.prepare(
+        request=_request(
+            session_id="dm-review",
+            turn_id=dm_turn,
+            channel_id="D1",
+            channel_type="im",
+            include_organization=False,
+            include_team_skills=False,
+        )
+    )
+    assert {(item["kind"], item["id"]) for item in dm_prepared["entities"]} == {
+        ("users", "U1")
+    }
+    service.finish(
+        request={
+            "project_id": PROJECT_ID,
+            "payload": {
+                "session_id": "dm-review",
+                "turn_id": dm_turn,
+                "success": False,
+            },
+        }
+    )
+
+    public_prepared = service.prepare(
+        request=_request(
+            session_id="public-team-review",
+            turn_id="55555555-5555-5555-5555-555555555555",
+            include_team_skills=True,
+        )
+    )
+    assert ("teams", "launcher-platform") in {
+        (item["kind"], item["id"])
+        for item in public_prepared["entities"]
+    }
 
 
 def test_unbound_turn_cannot_scan_another_user_skill(tmp_path):
@@ -409,7 +647,7 @@ def test_finish_reports_only_actual_file_changes(tmp_path):
         if item["kind"] == "users"
     ))
     content = (
-        "---\nname: context\nlanguage_preference: ko\n---\n\n"
+        "---\nname: context\nslack_id: U1\nlanguage_preference: ko\n---\n\n"
         "Explicit preference: concise Korean.\n"
     )
     assert service.authorize_tool(
@@ -430,6 +668,7 @@ def test_finish_reports_only_actual_file_changes(tmp_path):
     )
     assert result["status"] == "applied"
     assert result["changed"] == [str(user_path)]
+    assert result["changed_entities"] == [{"kind": "users", "id": "U1"}]
     assert user_path.exists()
     encrypted = user_path.read_text()
     assert '"algorithm":"AES-256-GCM"' in encrypted
@@ -603,7 +842,10 @@ def test_restricted_channel_is_virtual_and_reauthorized_each_operation(tmp_path)
         tool_name="write_file",
         args={
             "path": channel_path,
-            "content": "---\nname: channel-G1\n---\n\nPRIVATE_CHANNEL_FACT\n",
+            "content": (
+                "---\nname: channel-G1\nchannel_id: G1\n---\n\n"
+                "PRIVATE_CHANNEL_FACT is a stable convention.\n"
+            ),
         },
     )["action"] == "handled"
     assert Path(channel_path).exists()
@@ -690,6 +932,7 @@ def test_dm_searches_then_reads_one_live_authorized_channel_skill(tmp_path):
             "content": (
                 "---\n"
                 "name: channel-G1\n"
+                "channel_id: G1\n"
                 "summary: Durable planning conventions.\n"
                 "---\n\n"
                 "The launch checklist uses PRIVATE_CHANNEL_CONTEXT.\n"
@@ -934,7 +1177,10 @@ def test_multi_user_channel_never_loads_another_private_channel(tmp_path):
         tool_name="write_file",
         args={
             "path": channel_path,
-            "content": "---\nname: private\n---\n\nPRIVATE_OTHER_CHANNEL\n",
+            "content": (
+                "---\nname: private\nchannel_id: G1\n---\n\n"
+                "PRIVATE_OTHER_CHANNEL is durable context.\n"
+            ),
         },
     )["action"] == "handled"
     service.finish(
