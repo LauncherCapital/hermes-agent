@@ -1998,16 +1998,42 @@ class TestBuildJobPromptSilentHint:
         result = _build_job_prompt(job)
         assert "[SILENT]" in result
 
-    def test_delivery_guidance_present(self):
-        """Cron hint tells agents their final response is auto-delivered."""
-        job = {"prompt": "Generate a report"}
+    def test_scheduler_delivery_guidance_present(self):
+        """Non-local jobs leave delivery to the scheduler."""
+        job = {
+            "prompt": "Generate a report",
+            "deliver": "origin",
+            "origin": {"platform": "slack", "chat_id": "C123"},
+        }
         result = _build_job_prompt(job)
         assert "do NOT use send_message" in result
         assert "automatically delivered" in result
 
+    def test_local_delivery_guidance_allows_explicit_delivery_tool(self):
+        """Local jobs may need a host-provided tool for user-visible delivery."""
+        job = {"prompt": "Send the reminder", "deliver": "local"}
+        result = _build_job_prompt(job)
+
+        assert "stored locally" in result
+        assert "not automatically sent" in result
+        assert "explicitly named delivery tool" in result
+        assert "do NOT use send_message" not in result
+        assert "automatically delivered" not in result
+
+    def test_missing_deliver_uses_local_guidance(self):
+        """The persisted default is local, including legacy jobs without the field."""
+        result = _build_job_prompt({"prompt": "Send the reminder"})
+
+        assert "stored locally" in result
+        assert "do NOT use send_message" not in result
+
     def test_delivery_guidance_precedes_user_prompt(self):
-        """System guidance appears before the user's prompt text."""
-        job = {"prompt": "My custom prompt"}
+        """Job-specific delivery guidance appears before the user's prompt text."""
+        job = {
+            "prompt": "My custom prompt",
+            "deliver": "origin",
+            "origin": {"platform": "slack", "chat_id": "C123"},
+        }
         result = _build_job_prompt(job)
         system_pos = result.index("do NOT use send_message")
         prompt_pos = result.index("My custom prompt")

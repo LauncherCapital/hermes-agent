@@ -1232,6 +1232,16 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 if not output_files:
                     continue  # silent skip — no output yet
                 latest_output = output_files[0].read_text(encoding="utf-8").strip()
+                # Saved agent runs contain the full prompt and response. Passing
+                # that wrapper back through context_from replays stale scheduler
+                # instructions and recursively nests prior prompts; continuity
+                # needs only the prior result. Plain/script output stays intact.
+                if latest_output.startswith("# Cron Job:"):
+                    for section in ("## Response", "## Error"):
+                        marker = f"\n{section}\n"
+                        if marker in latest_output:
+                            latest_output = latest_output.rsplit(marker, 1)[1].strip()
+                            break
                 # Truncate to 8K characters to avoid prompt bloat
                 _MAX_CONTEXT_CHARS = 8000
                 if len(latest_output) > _MAX_CONTEXT_CHARS:
@@ -1250,14 +1260,28 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 logger.warning("context_from: failed to read output for job %r: %s", source_job_id, e)
                 # silent skip — do not pollute the prompt with error messages
 
-    # Always prepend cron execution guidance so the agent knows how
-    # delivery works and can suppress delivery when appropriate.
+    # Prepend guidance for this job's actual delivery mode. Local jobs keep
+    # their final response as a job result and may use a host-provided delivery
+    # tool; non-local jobs leave delivery to the scheduler.
+    if _normalize_deliver_value(job.get("deliver", "local")) == "local":
+        delivery_hint = (
+            "DELIVERY MODE: LOCAL OUTPUT. Your final response is stored locally "
+            "as the job result and is not automatically sent to a user. Follow "
+            "the job's delivery instructions exactly. If user-visible delivery "
+            "is required, use the explicitly named delivery tool and destination; "
+            "do not assume the final response itself was delivered. "
+        )
+    else:
+        delivery_hint = (
+            "DELIVERY MODE: SCHEDULER. Your final response will be automatically "
+            "delivered to the job's configured destination — do NOT use "
+            "send_message or try to deliver the output yourself. Just produce "
+            "your report/output as your final response and the system handles "
+            "the rest. "
+        )
     cron_hint = (
         "[IMPORTANT: You are running as a scheduled cron job. "
-        "DELIVERY: Your final response will be automatically delivered "
-        "to the user — do NOT use send_message or try to deliver "
-        "the output yourself. Just produce your report/output as your "
-        "final response and the system handles the rest. "
+        f"{delivery_hint}"
         "SILENT: If there is genuinely nothing new to report, respond "
         "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
         "Never combine [SILENT] with content — either report your "

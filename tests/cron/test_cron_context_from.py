@@ -124,6 +124,73 @@ class TestBuildJobPromptContextFrom:
         assert "New output" in prompt
         assert "Old output" not in prompt
 
+    def test_saved_cron_context_injects_response_without_old_prompt(self, cron_env):
+        """Self-context must not replay stale scheduler guidance from prior runs."""
+        from cron.jobs import create_job, OUTPUT_DIR
+        from cron.scheduler import _build_job_prompt
+
+        job = create_job(
+            prompt="Find and send one automation proposal",
+            schedule="every 2h",
+            deliver="local",
+        )
+        output_dir = OUTPUT_DIR / job["id"]
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "2026-08-04_05-05-30.md").write_text(
+            """# Cron Job: Automation Proposals
+
+## Prompt
+
+[IMPORTANT: DELIVERY: automatically delivered; do NOT use send_message.]
+Old task instructions that must not be replayed.
+
+## Response
+
+Proposed an inbound lead follow-up automation.
+""",
+            encoding="utf-8",
+        )
+        job["context_from"] = [job["id"]]
+
+        prompt = _build_job_prompt(job)
+
+        assert "Proposed an inbound lead follow-up automation." in prompt
+        assert "Old task instructions" not in prompt
+        assert "do NOT use send_message" not in prompt
+
+    def test_failed_cron_context_injects_error_without_old_prompt(self, cron_env):
+        from cron.jobs import create_job, OUTPUT_DIR
+        from cron.scheduler import _build_job_prompt
+
+        source = create_job(prompt="Collect data", schedule="every 1h")
+        output_dir = OUTPUT_DIR / source["id"]
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "2026-08-04_05-05-30.md").write_text(
+            """# Cron Job: Collector (FAILED)
+
+## Prompt
+
+Old task instructions that must not be replayed.
+
+## Error
+
+```
+RuntimeError: upstream unavailable
+```
+""",
+            encoding="utf-8",
+        )
+        target = create_job(
+            prompt="Handle the collector result",
+            schedule="every 2h",
+            context_from=source["id"],
+        )
+
+        prompt = _build_job_prompt(target)
+
+        assert "RuntimeError: upstream unavailable" in prompt
+        assert "Old task instructions" not in prompt
+
     def test_graceful_when_no_output_yet(self, cron_env):
         from cron.jobs import create_job
         from cron.scheduler import _build_job_prompt

@@ -507,8 +507,10 @@ PLATFORM_HINTS = {
         "You are running as a scheduled cron job. There is no user present — you "
         "cannot ask questions, request clarification, or wait for follow-up. Execute "
         "the task fully and autonomously, making reasonable decisions where needed. "
-        "Your final response is automatically delivered to the job's configured "
-        "destination — put the primary content directly in your response."
+        "The job prompt contains job-specific delivery guidance; follow it because "
+        "some jobs are delivered by the scheduler while local-output jobs may require "
+        "an explicitly named delivery tool. Put the primary content directly in your "
+        "response."
     ),
     "cli": (
         "You are a CLI AI Agent. Try not to use markdown but simple text "
