@@ -17,7 +17,7 @@ import httpx
 from .storage import EncryptedSkillStore, EncryptedSkillStoreError
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LEASE_MINUTES = 15
 MAX_SKILL_BYTES = 30_000
 MAX_CONTEXT_BYTES = 60_000
@@ -39,6 +39,15 @@ _DETAIL_QUERY = re.compile(
 )
 _REFERENCES_HEADING = re.compile(r"(?mi)^##+\s+references?\s*$")
 _SEARCH_TERM = re.compile(r"[\w.%+-]+", re.UNICODE)
+_PLACEHOLDER_BODY = re.compile(
+    r"(?is)^\s*(?:placeholder|todo|tbd|unknown|none|n/?a)[.!?\s]*$"
+)
+_IDENTITY_KEYS = {
+    "users": ("slack_id", "user_id", "slack_user_id", "id"),
+    "channels": ("channel_id", "id"),
+    "teams": ("team_slug", "id"),
+    "organizations": ("workspace_id", "id"),
+}
 
 
 class EntitySkillError(RuntimeError):
@@ -141,6 +150,38 @@ def _pending_initial_write_paths(binding: dict[str, Any]) -> set[str]:
     return required - changed
 
 
+def _pending_team_write_paths(binding: dict[str, Any]) -> set[str]:
+    proposal = binding.get("team_proposal")
+    if not isinstance(proposal, dict):
+        return set()
+    path = proposal.get("path")
+    changed = {
+        item
+        for item in binding.get("changed") or []
+        if isinstance(item, str)
+    }
+    return {path} - changed if isinstance(path, str) else set()
+
+
+def _body(content: str) -> str:
+    if not content.startswith("---\n"):
+        return ""
+    end = content.find("\n---", 4)
+    return "" if end < 0 else content[end + 4 :].strip()
+
+
+def _has_duplicate_substantive_block(body: str) -> bool:
+    seen: set[str] = set()
+    for raw in re.split(r"\n\s*\n", body):
+        block = " ".join(raw.split())
+        if len(block) < 80:
+            continue
+        if block in seen:
+            return True
+        seen.add(block)
+    return False
+
+
 def _ie_rest_base_url() -> str:
     base = str(os.getenv("RINGO_IE_MCP_URL") or "").rstrip("/")
     if base.endswith("/mcp"):
@@ -181,6 +222,7 @@ class EntitySkillService:
                 "bindings": {},
                 "completed_turns": [],
                 "channel_visibilities": {},
+                "team_memberships": {},
             }
         except (OSError, TypeError, ValueError) as exc:
             raise EntitySkillError("entity skill manifest is malformed") from exc
@@ -199,6 +241,13 @@ class EntitySkillService:
                     if isinstance(item, str)
                 ][-MAX_COMPLETED_TURNS:],
                 "channel_visibilities": {},
+                "team_memberships": {},
+            }
+        elif isinstance(payload, dict) and payload.get("schema_version") == 2:
+            payload = {
+                **payload,
+                "schema_version": SCHEMA_VERSION,
+                "team_memberships": {},
             }
         if (
             not isinstance(payload, dict)
@@ -219,6 +268,19 @@ class EntitySkillService:
             )
         ):
             raise EntitySkillError("unsupported entity skill manifest")
+        memberships = payload.setdefault("team_memberships", {})
+        if not isinstance(memberships, dict):
+            raise EntitySkillError("unsupported entity skill manifest")
+        for user_id, slugs in memberships.items():
+            if (
+                not isinstance(user_id, str)
+                or _COMPONENT.fullmatch(user_id) is None
+                or user_id in {".", ".."}
+                or not isinstance(slugs, list)
+            ):
+                raise EntitySkillError("unsupported entity skill manifest")
+            for slug in slugs:
+                self._team_slug(slug)
         return payload
 
     def _save(self, manifest: dict[str, Any]) -> None:
@@ -308,6 +370,42 @@ class EntitySkillService:
         except EncryptedSkillStoreError as exc:
             raise EntitySkillError("encrypted entity skill store unavailable") from exc
 
+    @staticmethod
+    def _validate_document(
+        *,
+        kind: str,
+        entity_id: str,
+        content: str,
+        current: str | None,
+    ) -> None:
+        if not content.startswith("---\n") or "\n---" not in content[4:]:
+            raise EntitySkillError("canonical YAML frontmatter is required")
+        identities = {
+            _frontmatter_value(content, key)
+            for key in _IDENTITY_KEYS[kind]
+        }
+        if entity_id not in identities:
+            canonical_key = _IDENTITY_KEYS[kind][0]
+            raise EntitySkillError(
+                f"frontmatter must contain {canonical_key}: {entity_id}"
+            )
+        body = _body(content)
+        if len(body) < 20 or _PLACEHOLDER_BODY.fullmatch(body):
+            raise EntitySkillError("entity SKILL.md needs a substantive body")
+        if _has_duplicate_substantive_block(body):
+            raise EntitySkillError(
+                "entity SKILL.md contains a duplicated substantive block"
+            )
+        if current is not None:
+            if content == current:
+                raise EntitySkillError("entity SKILL.md is unchanged")
+            current_size = len(current.encode("utf-8"))
+            updated_size = len(content.encode("utf-8"))
+            if current_size >= 200 and updated_size < int(current_size * 0.6):
+                raise EntitySkillError(
+                    "patch would remove too much existing durable context"
+                )
+
     def _migrate_one(
         self,
         *,
@@ -353,7 +451,12 @@ class EntitySkillService:
                 entity_id=user_id,
             )
 
-    def _entities(self, payload: dict[str, Any]) -> list[dict[str, str]]:
+    def _entities(
+        self,
+        payload: dict[str, Any],
+        *,
+        persisted_team_slugs: tuple[str, ...] = (),
+    ) -> list[dict[str, str]]:
         workspace_id = _component(payload.get("workspace_id"), "workspace_id")
         entities: list[dict[str, str]] = []
 
@@ -438,7 +541,19 @@ class EntitySkillService:
             ):
                 raise EntitySkillError("team binding lacks explicit membership")
             add("teams", self._team_slug(team_slug))
+        for persisted_slug in persisted_team_slugs:
+            add("teams", self._team_slug(persisted_slug))
         return entities
+
+    def _persisted_team_slugs(
+        self,
+        manifest: dict[str, Any],
+        user_id: str,
+    ) -> tuple[str, ...]:
+        if not user_id:
+            return ()
+        slugs = manifest.get("team_memberships", {}).get(user_id, [])
+        return tuple(self._team_slug(item) for item in slugs)
 
     @staticmethod
     def _prune(manifest: dict[str, Any]) -> None:
@@ -623,12 +738,44 @@ class EntitySkillService:
         principal_id = _optional_uuid(payload.get("principal_id"), "principal_id")
         session_id = _component(payload.get("session_id"), "session_id")
         turn_id = _component(payload.get("turn_id"), "turn_id")
+        current_channel = _optional_component(
+            payload.get("channel_id"),
+            "channel_id",
+        )
+        restricted_channel = _optional_component(
+            payload.get("restricted_channel_id"),
+            "restricted_channel_id",
+        )
+        allowed_team_member_ids = payload.get("allowed_team_member_ids") or []
+        if (
+            not isinstance(allowed_team_member_ids, list)
+            or len(allowed_team_member_ids) > 20
+        ):
+            raise EntitySkillError("invalid allowed_team_member_ids")
         self._encrypt_plaintext_context(
             project_id=project_id,
             workspace_id=workspace_id,
             user_id=user_id,
         )
-        entities = self._entities(payload)
+        with self._lock:
+            manifest = self._load()
+            self._bind_identity(
+                manifest,
+                project_id=project_id,
+                agent_id=agent_id,
+                workspace_id=workspace_id,
+            )
+            self._prune(manifest)
+            persisted_team_slugs = (
+                self._persisted_team_slugs(manifest, user_id)
+                if payload.get("include_team_skills") is True
+                else ()
+            )
+            self._save(manifest)
+        entities = self._entities(
+            payload,
+            persisted_team_slugs=persisted_team_slugs,
+        )
         paths = {item["path"] for item in entities}
         for item in entities:
             if item["kind"] == "channels":
@@ -713,6 +860,23 @@ class EntitySkillService:
                 "workspace_id": workspace_id,
                 "principal_id": principal_id,
                 "slack_user_id": slack_user_id,
+                "team_proposal_enabled": (
+                    payload.get("team_proposal_enabled") is True
+                    and bool(user_id)
+                    and not bool(restricted_channel)
+                    and current_channel in {
+                        item["id"]
+                        for item in entities
+                        if item["kind"] == "channels"
+                        and item.get("visibility") == "public"
+                    }
+                ),
+                "allowed_team_member_ids": sorted(
+                    {
+                        _component(item, "team member id")
+                        for item in allowed_team_member_ids
+                    }
+                ),
             }
             self._save(manifest)
             self._health.update(
@@ -750,11 +914,30 @@ class EntitySkillService:
                 for path in binding.get("changed") or []
                 if isinstance(path, str)
             ]
+            changed_entities = [
+                {"kind": item.get("kind"), "id": item.get("id")}
+                for path in changed
+                for item in binding.get("entities") or []
+                if isinstance(item, dict) and item.get("path") == path
+            ]
             change_required = success and (
                 (require_change and not changed)
                 or bool(_pending_initial_write_paths(binding))
+                or bool(_pending_team_write_paths(binding))
             )
             if success and not change_required:
+                proposal = binding.get("team_proposal")
+                if isinstance(proposal, dict) and proposal.get("path") in changed:
+                    slug = self._team_slug(proposal.get("team_slug"))
+                    memberships = manifest["team_memberships"]
+                    for raw_user_id in proposal.get("member_ids") or []:
+                        member_id = _component(raw_user_id, "team member id")
+                        current = [
+                            item
+                            for item in memberships.get(member_id, [])
+                            if isinstance(item, str) and item != slug
+                        ]
+                        memberships[member_id] = [*current, slug]
                 completed = [
                     item
                     for item in manifest["completed_turns"]
@@ -788,6 +971,7 @@ class EntitySkillService:
             ),
             "turn_id": turn_id,
             "changed": changed,
+            "changed_entities": changed_entities,
         }
 
     def _context_payload(
@@ -811,6 +995,15 @@ class EntitySkillService:
         requested = [("organizations", workspace_id)]
         if user_id:
             requested.append(("users", user_id))
+            with self._lock:
+                manifest = self._load()
+                persisted_team_slugs = self._persisted_team_slugs(
+                    manifest,
+                    user_id,
+                )
+            requested.extend(
+                ("teams", slug) for slug in persisted_team_slugs
+            )
         if channel_id and channel_type not in {"im", "dm"}:
             access = self._check_channel_access(
                 project_id=project_id,
@@ -828,6 +1021,8 @@ class EntitySkillService:
             requested.append(("channels", channel_id))
         if team_slug:
             requested.append(("teams", self._team_slug(team_slug)))
+
+        requested = list(dict.fromkeys(requested))
 
         documents: list[dict[str, str]] = []
         total = 0
@@ -1257,6 +1452,87 @@ class EntitySkillService:
             "content": content,
         }
 
+    def _bind_team_proposal(
+        self,
+        *,
+        session_id: str,
+        binding: dict[str, Any],
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        if binding.get("team_proposal_enabled") is not True:
+            raise EntitySkillError("team proposals require verified public evidence")
+        if isinstance(binding.get("team_proposal"), dict):
+            raise EntitySkillError("only one team proposal is allowed per review")
+        team_slug = self._team_slug(arguments.get("team_slug"))
+        display_name = str(arguments.get("display_name") or "").strip()
+        member_ids = arguments.get("member_ids")
+        if (
+            not display_name
+            or len(display_name) > 100
+            or re.search(r"[\r\n\x00]", display_name)
+        ):
+            raise EntitySkillError("a concise team display name is required")
+        if not isinstance(member_ids, list) or not member_ids or len(member_ids) > 20:
+            raise EntitySkillError("team member_ids are invalid")
+        normalized_members = sorted(
+            {_component(item, "team member id") for item in member_ids}
+        )
+        allowed = set(binding.get("allowed_team_member_ids") or [])
+        if (
+            binding.get("slack_user_id") not in normalized_members
+            or not set(normalized_members).issubset(allowed)
+        ):
+            raise EntitySkillError("team membership was not server verified")
+        path = self._path("teams", team_slug)
+        proposal = {
+            "team_slug": team_slug,
+            "display_name": display_name,
+            "member_ids": normalized_members,
+            "path": str(path),
+        }
+        with self._lock:
+            manifest = self._load()
+            live = manifest["bindings"].get(session_id)
+            if (
+                not isinstance(live, dict)
+                or live.get("turn_id") != binding.get("turn_id")
+                or isinstance(live.get("team_proposal"), dict)
+            ):
+                raise EntitySkillError("entity review binding expired")
+            if any(
+                str(item.get("path") or "") == str(path)
+                for other_session_id, other in manifest["bindings"].items()
+                if other_session_id != session_id and isinstance(other, dict)
+                for item in other.get("entities") or []
+                if isinstance(item, dict)
+            ):
+                raise EntitySkillError("team_slug is being reviewed elsewhere")
+            if self._document(
+                binding["project_id"],
+                "teams",
+                team_slug,
+            ) is not None:
+                raise EntitySkillError(
+                    "team_slug already exists; it can only be edited from a bound member turn"
+                )
+            live["team_proposal"] = proposal
+            live["entities"].append(
+                {
+                    "kind": "teams",
+                    "id": team_slug,
+                    "path": str(path),
+                    "exists": False,
+                }
+            )
+            live["baseline"][str(path)] = None
+            self._save(manifest)
+        return {
+            "ok": True,
+            "path": str(path),
+            "required_frontmatter": f"team_slug: {team_slug}",
+            "message": "Team path bound. Create it once with write_file, then finish [SILENT].",
+        }
+
     def authorize_tool(
         self,
         *,
@@ -1305,6 +1581,19 @@ class EntitySkillService:
                     "message": "Entity SKILL.md requires an exact authorized session.",
                 }
             return None
+        if name == "team_skill_bind":
+            try:
+                result = self._bind_team_proposal(
+                    session_id=str(session_id or ""),
+                    binding=binding,
+                    arguments=arguments,
+                )
+            except EntitySkillError as exc:
+                return {
+                    "action": "block",
+                    "message": f"Team proposal denied: {exc}",
+                }
+            return self._handled_tool_result(result)
         if name not in {"read_file", "write_file", "patch"}:
             return {
                 "action": "block",
@@ -1340,6 +1629,12 @@ class EntitySkillService:
                     "missing exact channel SKILL.md before other tools."
                 ),
             }
+        pending_team_writes = _pending_team_write_paths(binding)
+        if str(path) in pending_team_writes and name != "write_file":
+            return {
+                "action": "block",
+                "message": "A newly bound team requires one exact write_file call.",
+            }
         try:
             if entity["kind"] == "channels":
                 self._check_channel_access(
@@ -1373,6 +1668,10 @@ class EntitySkillService:
                 entity["id"],
             )
             if name == "write_file":
+                if current is not None:
+                    raise EntitySkillError(
+                        "existing entity SKILL.md must be changed with patch"
+                    )
                 content = arguments.get("content")
                 if not isinstance(content, str):
                     raise EntitySkillError("entity SKILL.md content is required")
@@ -1398,6 +1697,23 @@ class EntitySkillService:
                     new,
                     -1 if arguments.get("replace_all") is True else 1,
                 )
+            self._validate_document(
+                kind=entity["kind"],
+                entity_id=entity["id"],
+                content=updated,
+                current=current,
+            )
+            proposal = binding.get("team_proposal")
+            if (
+                entity["kind"] == "teams"
+                and isinstance(proposal, dict)
+                and proposal.get("path") == str(path)
+                and _frontmatter_value(updated, "name")
+                != proposal.get("display_name")
+            ):
+                raise EntitySkillError(
+                    "team frontmatter name must match the verified display name"
+                )
             with self._lock:
                 manifest = self._load()
                 live = manifest["bindings"].get(str(session_id or ""))
@@ -1406,6 +1722,14 @@ class EntitySkillService:
                     or live.get("turn_id") != binding.get("turn_id")
                 ):
                     raise EntitySkillError("entity review binding expired")
+                if str(path) in {
+                    item
+                    for item in live.get("changed") or []
+                    if isinstance(item, str)
+                }:
+                    raise EntitySkillError(
+                        "only one successful mutation is allowed per entity per review"
+                    )
                 self._put_document(
                     binding["project_id"],
                     entity["kind"],
@@ -1421,16 +1745,22 @@ class EntitySkillService:
                     changed.append(str(path))
                 live["changed"] = changed
                 self._save(manifest)
-        except EntitySkillError:
+        except EntitySkillError as exc:
             return {
                 "action": "block",
-                "message": "Entity SKILL.md operation denied.",
+                "message": f"Entity SKILL.md operation denied: {exc}",
             }
         self._health["status"] = "editing"
         return {
             "action": "handled",
             "result": json.dumps(
-                {"ok": True, "message": "Encrypted entity SKILL.md updated."}
+                {
+                    "ok": True,
+                    "message": (
+                        "Encrypted entity SKILL.md updated. Do not edit this "
+                        "path again in this review; finish [SILENT]."
+                    ),
+                }
             ),
             "redact_args": True,
         }

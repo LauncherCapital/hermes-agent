@@ -45,7 +45,7 @@ def _health_report(**_: object) -> dict:
 
 
 def _fail_closed_tool(*_: object, **__: object) -> str:
-    return json.dumps({"error": "channel_skill_access_denied"})
+    return json.dumps({"error": "entity_skill_access_denied"})
 
 
 def register(ctx) -> None:
@@ -57,6 +57,40 @@ def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", _pre_tool_call)
     ctx.register_hook("post_tool_call", _post_tool_call)
     ctx.register_hook("health_report", _health_report)
+    ctx.register_tool(
+        name="team_skill_bind",
+        toolset="ringo_entity_skills",
+        schema={
+            "description": (
+                "Propose one AI-named durable team from explicit public group "
+                "and membership evidence. The server verifies members and "
+                "binds a new canonical team path."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "team_slug": {
+                        "type": "string",
+                        "description": "Concise lower-case ASCII canonical slug.",
+                    },
+                    "display_name": {
+                        "type": "string",
+                        "description": "Concise name grounded in the stated function.",
+                    },
+                    "member_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Only server-allowed Slack member IDs.",
+                    },
+                },
+                "required": ["team_slug", "display_name", "member_ids"],
+                "additionalProperties": False,
+            },
+        },
+        handler=_fail_closed_tool,
+        description="Bind one verified AI-named team skill path.",
+        emoji="👥",
+    )
     ctx.register_tool(
         name="channel_skill_search",
         toolset="ringo_entity_skills",
