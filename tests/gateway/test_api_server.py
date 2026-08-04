@@ -33,6 +33,7 @@ from gateway.platforms.api_server import (
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
+    _trusted_runtime_metadata,
 )
 
 
@@ -48,6 +49,34 @@ class TestCheckRequirements:
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", False)
     def test_returns_false_without_aiohttp(self):
         assert check_api_server_requirements() is False
+
+
+class TestTrustedRuntimeMetadata:
+    def test_allows_bounded_well_formed_direct_tools(self):
+        metadata, error = _trusted_runtime_metadata(
+            {
+                "trusted_runtime_metadata": {
+                    "direct_tool_names": json.dumps(
+                        ["entity_skill_create", "entity_skill_patch"]
+                    )
+                }
+            }
+        )
+
+        assert error is None
+        assert metadata is not None
+
+    def test_rejects_malformed_direct_tool_name(self):
+        metadata, error = _trusted_runtime_metadata(
+            {
+                "trusted_runtime_metadata": {
+                    "direct_tool_names": json.dumps(["../../terminal"])
+                }
+            }
+        )
+
+        assert metadata is None
+        assert error is not None
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +574,49 @@ class TestAgentExecution:
             [visible, hidden],
             trusted_runtime_metadata=runtime,
         )
+
+    @pytest.mark.asyncio
+    async def test_run_agent_reassembles_request_scoped_direct_tools(
+        self,
+        adapter,
+    ):
+        direct = {
+            "type": "function",
+            "function": {"name": "entity_skill_patch"},
+        }
+        mock_agent = MagicMock()
+        mock_agent.tools = []
+        mock_agent.enabled_toolsets = ["ringo_entity_skills"]
+        mock_agent.disabled_toolsets = None
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        runtime = {
+            "direct_tool_names": json.dumps(["entity_skill_patch"]),
+        }
+
+        with (
+            patch.object(adapter, "_create_agent", return_value=mock_agent),
+            patch(
+                "model_tools.get_tool_definitions",
+                return_value=[direct],
+            ) as get_defs,
+            patch(
+                "hermes_cli.plugins.filter_tool_definitions",
+                return_value=[direct],
+            ),
+        ):
+            await adapter._run_agent(
+                user_message="review",
+                conversation_history=[],
+                trusted_runtime_metadata=runtime,
+            )
+
+        get_defs.assert_called_once_with(
+            enabled_toolsets=["ringo_entity_skills"],
+            disabled_toolsets=None,
+            quiet_mode=True,
+            direct_tool_names=["entity_skill_patch"],
+        )
+        assert mock_agent.valid_tool_names == {"entity_skill_patch"}
 
 
 # ---------------------------------------------------------------------------

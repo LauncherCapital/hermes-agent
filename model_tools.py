@@ -27,6 +27,7 @@ import asyncio
 import logging
 import threading
 import time
+from dataclasses import replace
 from typing import Dict, Any, List, Optional, Tuple
 
 from hermes_cli.plugins import HandledToolResult
@@ -267,6 +268,7 @@ def get_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    direct_tool_names: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -282,6 +284,10 @@ def get_tool_definitions(
             tool_search / tool_describe bridge handlers so they can read the
             real catalog, not the already-collapsed one. Public callers should
             leave this False.
+        direct_tool_names: Enabled tools that remain directly visible for this
+            one assembly instead of being deferred behind tool search. This
+            changes visibility only; toolset filtering and call-time hooks still
+            decide availability and authorization.
 
     Returns:
         Filtered list of OpenAI-format tool definitions.
@@ -309,6 +315,7 @@ def get_tool_definitions(
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
+            tuple(sorted(set(direct_tool_names or []))),
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
@@ -320,8 +327,13 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+    result = _compute_tool_definitions(
+        enabled_toolsets,
+        disabled_toolsets,
+        quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+        direct_tool_names=direct_tool_names,
+    )
     if quiet_mode:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -340,6 +352,7 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    direct_tool_names: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -505,6 +518,11 @@ def _compute_tool_definitions(
     try:
         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
         ts_cfg = _load_ts_config()
+        if direct_tool_names:
+            ts_cfg = replace(
+                ts_cfg,
+                always_visible=ts_cfg.always_visible | frozenset(direct_tool_names),
+            )
         if not skip_tool_search_assembly and ts_cfg.enabled != "off":
             context_length = _resolve_active_context_length()
             assembly = assemble_tool_defs(
